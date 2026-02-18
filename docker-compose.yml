@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: agent_redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: agent_postgres
+    environment:
+      POSTGRES_DB: agent_db
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: localdev_only
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+
+  opa:
+    image: openpolicyagent/opa:latest
+    container_name: agent_opa
+    ports:
+      - "8181:8181"
+    volumes:
+      - ./policies:/policies
+    command: >
+      run --server --addr=0.0.0.0:8181 /policies
+    restart: unless-stopped
+
+  vault:
+    image: hashicorp/vault:1.15
+    container_name: agent_vault
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "localdev-root-token"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    ports:
+      - "8200:8200"
+    cap_add:
+      - IPC_LOCK
+    restart: unless-stopped
+
