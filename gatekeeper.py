@@ -1,41 +1,95 @@
 import requests
+import uuid
+import datetime
 import json
-import sys
+import psycopg
 
-OPA_URL = "http://localhost:8181/v1/data/infrastructure/allow"
+OPA_BASE = "http://localhost:8181/v1/data/infrastructure"
 TIMEOUT_SECONDS = 2
+
+DB_CONFIG = {
+    "dbname": "agent_db",
+    "user": "agent",
+    "password": "localdev_only",
+    "host": "localhost",
+    "port": 5432,
+}
 
 
 def evaluate(input_data):
-    # Fail-closed default
     decision = "DENIED"
+    reasons = []
 
     try:
-        response = requests.post(
-            OPA_URL,
+        allow_response = requests.post(
+            f"{OPA_BASE}/allow",
             json={"input": input_data},
             timeout=TIMEOUT_SECONDS,
         )
+        allow_response.raise_for_status()
+        allow_result = allow_response.json().get("result", False)
 
-        response.raise_for_status()
-
-        data = response.json()
-
-        if data.get("result") is True:
+        if allow_result:
             decision = "APPROVED"
+            return decision, reasons
+
+        violation_response = requests.post(
+            f"{OPA_BASE}/violation",
+            json={"input": input_data},
+            timeout=TIMEOUT_SECONDS,
+        )
+        violation_response.raise_for_status()
+
+        violations = violation_response.json().get("result", {})
+        reasons = list(violations.keys())
 
     except Exception as e:
-        print(f"[GATEKEEPER ERROR] {type(e).__name__}: {e}")
+        reasons = [f"OPA unreachable – fail closed ({type(e).__name__})"]
 
-    return decision
+    return decision, reasons
+
+
+def log_decision(decision_id, timestamp, input_payload, decision, reasons):
+    try:
+        with psycopg.connect(**DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO decisions
+                    (decision_id, timestamp, input_payload, decision, violation_reasons)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        decision_id,
+                        timestamp,
+                        json.dumps(input_payload),
+                        decision,
+                        json.dumps(reasons),
+                    ),
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"[AUDIT ERROR] {e}")
 
 
 if __name__ == "__main__":
     test_input = {
-        "instance_type": "t3.micro",
-        "security_groups": [{"cidr": "10.0.0.0/16"}],
+        "instance_type": "t2.micro",
+        "security_groups": [{"cidr": "0.0.0.0/0"}],
     }
 
-    result = evaluate(test_input)
-    print(f"Decision: {result}")
+    decision_id = str(uuid.uuid4())
+    timestamp = datetime.datetime.now(datetime.UTC)
 
+    decision, reasons = evaluate(test_input)
+
+    log_decision(decision_id, timestamp, test_input, decision, reasons)
+
+    print("Decision ID:", decision_id)
+    print("Timestamp:", timestamp.isoformat())
+    print("Decision:", decision)
+
+    if decision == "DENIED":
+        print("Reasons:")
+        for r in reasons:
+            print(" -", r)

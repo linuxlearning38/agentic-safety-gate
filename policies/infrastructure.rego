@@ -8,18 +8,30 @@ allowed_instance_types := {
     "t3.medium",
 }
 
-instance_type_allowed if {
-    input.instance_type != ""
-    input.instance_type in allowed_instance_types
+############################
+# Violations
+############################
+
+violation[msg] if {
+    input.instance_type == ""
+    msg := "Instance type must be specified"
 }
 
-ssh_not_public if {
-    some i
-    input.security_groups[i].cidr != "0.0.0.0/0"
+violation[msg] if {
+    not input.instance_type in allowed_instance_types
+    msg := sprintf("Instance type '%s' is not allowed", [input.instance_type])
 }
+
+violation[msg] if {
+    some i
+    input.security_groups[i].cidr == "0.0.0.0/0"
+    msg := "Security group exposes SSH to the public internet"
+}
+
+############################
+# Allow Rule
+############################
 
 allow if {
-    instance_type_allowed
-    ssh_not_public
+    count(violation) == 0
 }
-
