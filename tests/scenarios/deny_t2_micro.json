@@ -1,0 +1,11 @@
+{
+  "name": "deny_t2_micro",
+  "input": {
+    "instance_type": "t2.micro",
+    "security_groups": [
+      { "cidr": "0.0.0.0/0" }
+    ]
+  },
+  "expected_decision": "DENIED",
+  "expected_reason_contains": "not allowed"
+}
