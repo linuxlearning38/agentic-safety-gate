@@ -72,24 +72,35 @@ def log_decision(decision_id, timestamp, input_payload, decision, reasons):
         print(f"[AUDIT ERROR] {e}")
 
 
+def evaluate_policy(input_data: dict) -> dict:
+    decision_id = str(uuid.uuid4())
+    timestamp = datetime.datetime.now(datetime.UTC)
+
+    decision, reasons = evaluate(input_data)
+
+    log_decision(decision_id, timestamp, input_data, decision, reasons)
+
+    return {
+        "decision_id": decision_id,
+        "timestamp": timestamp.isoformat(),
+        "decision": decision,
+        "reasons": reasons,
+    }
+
+
 if __name__ == "__main__":
     test_input = {
         "instance_type": "t2.micro",
         "security_groups": [{"cidr": "0.0.0.0/0"}],
     }
 
-    decision_id = str(uuid.uuid4())
-    timestamp = datetime.datetime.now(datetime.UTC)
+    result = evaluate_policy(test_input)
 
-    decision, reasons = evaluate(test_input)
+    print("Decision ID:", result["decision_id"])
+    print("Timestamp:", result["timestamp"])
+    print("Decision:", result["decision"])
 
-    log_decision(decision_id, timestamp, test_input, decision, reasons)
-
-    print("Decision ID:", decision_id)
-    print("Timestamp:", timestamp.isoformat())
-    print("Decision:", decision)
-
-    if decision == "DENIED":
+    if result["decision"] == "DENIED":
         print("Reasons:")
-        for r in reasons:
+        for r in result["reasons"]:
             print(" -", r)
