@@ -17,10 +17,8 @@ jobs:
         ports:
           - 8181:8181
         options: >-
-          --health-cmd="wget --spider -q http://localhost:8181/health"
-          --health-interval=5s
-          --health-timeout=2s
-          --health-retries=5
+          --entrypoint /opa
+        command: ["run", "--server"]
 
     steps:
       - name: Checkout repository
