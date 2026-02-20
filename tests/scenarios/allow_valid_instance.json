@@ -1,0 +1,10 @@
+{
+  "name": "allow_t3_micro_private_sg",
+  "input": {
+    "instance_type": "t3.micro",
+    "security_groups": [
+      { "cidr": "10.0.0.0/24" }
+    ]
+  },
+  "expected_decision": "APPROVED"
+}
