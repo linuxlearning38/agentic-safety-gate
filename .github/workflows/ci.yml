@@ -11,15 +11,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    services:
-      opa:
-        image: openpolicyagent/opa:latest
-        ports:
-          - 8181:8181
-        options: >-
-          --entrypoint /opa
-        command: ["run", "--server"]
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,7 +25,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests psycopg[binary]
 
-      - name: Load Rego policy into OPA
+      - name: Start OPA server
+        run: |
+          docker run -d \
+            -p 8181:8181 \
+            --name opa \
+            openpolicyagent/opa:latest \
+            run --server
+
+      - name: Wait for OPA
+        run: sleep 5
+
+      - name: Load Rego policy
         run: |
           curl -X PUT \
             --data-binary @policies/infrastructure.rego \
