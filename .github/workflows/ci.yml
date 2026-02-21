@@ -31,7 +31,7 @@ jobs:
             -p 8181:8181 \
             --name opa \
             openpolicyagent/opa:latest \
-            run --server
+            run --server --addr=0.0.0.0:8181
 
       - name: Wait for OPA
         run: |
