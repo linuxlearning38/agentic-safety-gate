@@ -1,8 +1,8 @@
 {
-  "name": "allow_valid_full_config",
+  "name": "deny_unapproved_region",
   "input": {
     "instance_type": "t3.micro",
-    "region": "ap-south-1",
+    "region": "us-east-1",
     "encrypted": true,
     "tags": {
       "Environment": "dev",
@@ -13,5 +13,5 @@
       { "cidr": "10.0.0.0/24" }
     ]
   },
-  "expected_decision": "APPROVED"
+  "expected_decision": "DENIED"
 }

@@ -1,4 +1,5 @@
 import requests
+from requests.exceptions import Timeout, ConnectionError, HTTPError
 import uuid
 import datetime
 import json
@@ -21,18 +22,30 @@ def evaluate(input_data):
     reasons = []
 
     try:
+        # -------------------------
+        # 1. Evaluate Allow Rule
+        # -------------------------
         allow_response = requests.post(
             f"{OPA_BASE}/allow",
             json={"input": input_data},
             timeout=TIMEOUT_SECONDS,
         )
         allow_response.raise_for_status()
-        allow_result = allow_response.json().get("result", False)
 
-        if allow_result:
+        allow_json = allow_response.json()
+
+        if "result" not in allow_json:
+            return decision, ["Malformed OPA allow response – fail closed"]
+
+        allow_result = allow_json["result"]
+
+        if allow_result is True:
             decision = "APPROVED"
             return decision, reasons
 
+        # -------------------------
+        # 2. Fetch Violations
+        # -------------------------
         violation_response = requests.post(
             f"{OPA_BASE}/violation",
             json={"input": input_data},
@@ -40,11 +53,33 @@ def evaluate(input_data):
         )
         violation_response.raise_for_status()
 
-        violations = violation_response.json().get("result", {})
-        reasons = list(violations.keys())
+        violation_json = violation_response.json()
+
+        if "result" not in violation_json:
+            return decision, ["Malformed OPA violation response – fail closed"]
+
+        violations = violation_json["result"]
+
+        if isinstance(violations, dict):
+            reasons = list(violations.keys())
+        else:
+            reasons = ["Unexpected violation format from OPA – fail closed"]
+
+    except Timeout:
+        reasons = ["OPA timeout – fail closed"]
+
+    except ConnectionError:
+        reasons = ["OPA connection error – fail closed"]
+
+    except HTTPError as e:
+        status = e.response.status_code if e.response else "unknown"
+        reasons = [f"OPA HTTP error ({status}) – fail closed"]
+
+    except json.JSONDecodeError:
+        reasons = ["OPA returned invalid JSON – fail closed"]
 
     except Exception as e:
-        reasons = [f"OPA unreachable – fail closed ({type(e).__name__})"]
+        reasons = [f"Unexpected error ({type(e).__name__}) – fail closed"]
 
     return decision, reasons
 
@@ -91,6 +126,13 @@ def evaluate_policy(input_data: dict) -> dict:
 if __name__ == "__main__":
     test_input = {
         "instance_type": "t2.micro",
+        "region": "ap-south-1",
+        "encrypted": True,
+        "tags": {
+            "Environment": "dev",
+            "Owner": "manoj",
+            "CostCenter": "cc-101",
+        },
         "security_groups": [{"cidr": "0.0.0.0/0"}],
     }
 

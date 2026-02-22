@@ -1,0 +1,15 @@
+{
+  "name": "deny_multiple_violations",
+  "input": {
+    "instance_type": "t2.micro",
+    "region": "us-east-1",
+    "encrypted": false,
+    "tags": {
+      "Owner": "manoj"
+    },
+    "security_groups": [
+      { "cidr": "0.0.0.0/0" }
+    ]
+  },
+  "expected_decision": "DENIED"
+}

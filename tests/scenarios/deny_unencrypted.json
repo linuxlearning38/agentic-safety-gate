@@ -1,9 +1,9 @@
 {
-  "name": "allow_valid_full_config",
+  "name": "deny_unencrypted_storage",
   "input": {
     "instance_type": "t3.micro",
     "region": "ap-south-1",
-    "encrypted": true,
+    "encrypted": false,
     "tags": {
       "Environment": "dev",
       "Owner": "manoj",
@@ -13,5 +13,5 @@
       { "cidr": "10.0.0.0/24" }
     ]
   },
-  "expected_decision": "APPROVED"
+  "expected_decision": "DENIED"
 }
