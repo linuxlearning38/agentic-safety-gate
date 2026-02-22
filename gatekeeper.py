@@ -104,7 +104,7 @@ def log_decision(decision_id, timestamp, input_payload, decision, reasons):
                 )
             conn.commit()
     except Exception as e:
-        print(f"[AUDIT ERROR] {e}")
+        raise RuntimeError(f"AUDIT LOGGING FAILED: {e}")
 
 
 def evaluate_policy(input_data: dict) -> dict:

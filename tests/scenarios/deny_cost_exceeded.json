@@ -1,0 +1,19 @@
+{
+  "name": "deny_cost_exceeded",
+  "input": {
+    "instance_type": "t3.micro",
+    "region": "ap-south-1",
+    "encrypted": true,
+    "tags": {
+      "Environment": "dev",
+      "Owner": "manoj",
+      "CostCenter": "cc-101"
+    },
+    "security_groups": [
+      { "cidr": "10.0.0.0/24" }
+    ],
+    "estimated_cost_usd": 150.00,
+    "cost_limit_usd": 100.00
+  },
+  "expected_decision": "DENIED"
+}

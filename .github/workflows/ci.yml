@@ -4,28 +4,52 @@ on:
   push:
     branches:
       - main
-      - day-4-test-harness
+      - day-5-policy-expansion
   pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: agent
+          POSTGRES_PASSWORD: localdev_only
+          POSTGRES_DB: agent_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install requests psycopg[binary]
 
-      - name: Start OPA server
+      - name: Initialize Postgres schema
+        run: |
+          PGPASSWORD=localdev_only psql -h localhost -U agent -d agent_db << EOF
+          CREATE TABLE IF NOT EXISTS decisions (
+            decision_id UUID PRIMARY KEY,
+            timestamp TIMESTAMPTZ NOT NULL,
+            input_payload JSONB NOT NULL,
+            decision VARCHAR(20) NOT NULL,
+            violation_reasons JSONB
+          );
+          EOF
+
+      - name: Start OPA
         run: |
           docker run -d \
             -p 8181:8181 \
@@ -37,16 +61,15 @@ jobs:
         run: |
           for i in {1..10}; do
             curl -s http://localhost:8181/health && break
-            echo "Waiting for OPA..."
             sleep 2
           done
 
-      - name: Load Rego policy
+      - name: Load Policy
         run: |
           curl -X PUT \
             --data-binary @policies/infrastructure.rego \
-            http://localhost:8181/v1/policies/infrastructure
+            http://localhost:8181/v1/policies/policies/infrastructure.rego
 
-      - name: Run test harness
+      - name: Run Tests
         run: |
           python tests/runner.py

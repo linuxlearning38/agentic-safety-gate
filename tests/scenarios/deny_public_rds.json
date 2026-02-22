@@ -1,0 +1,21 @@
+{
+  "name": "deny_public_rds",
+  "input": {
+    "instance_type": "t3.micro",
+    "region": "ap-south-1",
+    "encrypted": true,
+    "tags": {
+      "Environment": "dev",
+      "Owner": "manoj",
+      "CostCenter": "cc-101"
+    },
+    "security_groups": [
+      { "cidr": "10.0.0.0/24" }
+    ],
+    "rds_instance": {
+      "name": "prod-db",
+      "publicly_accessible": true
+    }
+  },
+  "expected_decision": "DENIED"
+}

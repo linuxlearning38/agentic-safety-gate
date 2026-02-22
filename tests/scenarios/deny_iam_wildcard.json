@@ -1,0 +1,25 @@
+{
+  "name": "deny_iam_wildcard",
+  "input": {
+    "instance_type": "t3.micro",
+    "region": "ap-south-1",
+    "encrypted": true,
+    "tags": {
+      "Environment": "dev",
+      "Owner": "manoj",
+      "CostCenter": "cc-101"
+    },
+    "security_groups": [
+      { "cidr": "10.0.0.0/24" }
+    ],
+    "iam_policy": {
+      "statements": [
+        {
+          "effect": "Allow",
+          "actions": ["*"]
+        }
+      ]
+    }
+  },
+  "expected_decision": "DENIED"
+}

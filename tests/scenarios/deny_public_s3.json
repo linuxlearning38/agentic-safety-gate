@@ -1,0 +1,21 @@
+{
+  "name": "deny_public_s3_bucket",
+  "input": {
+    "instance_type": "t3.micro",
+    "region": "ap-south-1",
+    "encrypted": true,
+    "tags": {
+      "Environment": "dev",
+      "Owner": "manoj",
+      "CostCenter": "cc-101"
+    },
+    "security_groups": [
+      { "cidr": "10.0.0.0/24" }
+    ],
+    "s3_bucket": {
+      "name": "my-public-bucket",
+      "public_access": true
+    }
+  },
+  "expected_decision": "DENIED"
+}
