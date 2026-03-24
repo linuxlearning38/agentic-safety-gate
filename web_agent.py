@@ -2,8 +2,22 @@ from flask import Flask, request, jsonify
 import ollama
 import chromadb
 import subprocess
+import logging
+import os
+from datetime import datetime
 
 app = Flask(__name__)
+
+# Audit logger
+os.makedirs("/mnt/i/ai-lab/logs", exist_ok=True)
+audit_logger = logging.getLogger("audit")
+audit_logger.setLevel(logging.INFO)
+fh = logging.FileHandler("/mnt/i/ai-lab/logs/agent_audit.log")
+fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+audit_logger.addHandler(fh)
+
+def audit(action, detail=""):
+    audit_logger.info(f"{action} | {detail}")
 
 chroma = chromadb.PersistentClient(path="/mnt/i/ai-lab/chromadb")
 collection = chroma.get_or_create_collection("devops_policies_v2")
@@ -75,6 +89,10 @@ def get_context(question):
 
 def ask(question):
     global conversation_history, token_stats
+    steps = []
+
+    steps.append("🔍 Searching knowledge base...")
+    audit("QUESTION", question)
     context = get_context(question)
     system_prompt = (
         "You are a DevOps and Infrastructure AI assistant with a large knowledge base.\n\n"
@@ -120,22 +138,33 @@ def ask(question):
         for line in reply.split("\n"):
             if line.startswith("COMMAND:"):
                 command_used = clean(line.replace("COMMAND:", ""))
+                steps.append(f"⚙️ Running command: {command_used}")
+                audit("COMMAND_RUN", command_used)
                 shell_output = run_shell(command_used)
+                if shell_output.startswith("Command not allowed") or shell_output.startswith("Access denied"):
+                    steps.append(f"🚫 Blocked: {command_used}")
+                    audit("COMMAND_BLOCKED", command_used)
+                else:
+                    steps.append(f"✅ Command completed")
                 followup_messages = messages + [
                     {"role": "assistant", "content": reply},
                     {"role": "user", "content": "Command output:\n" + shell_output + "\n\nGive a clear answer."}
                 ]
+                steps.append("✅ Generating answer...")
                 followup = ollama.chat(model="qwen2.5:14b", messages=followup_messages)
                 final_reply = followup["message"]["content"]
                 token_stats["prompt"] += followup.get("prompt_eval_count", 0)
                 token_stats["completion"] += followup.get("eval_count", 0)
                 conversation_history.append({"role": "user", "content": question})
                 conversation_history.append({"role": "assistant", "content": final_reply})
-                return final_reply, command_used, shell_output
+                audit("ANSWER", final_reply[:120])
+                return final_reply, command_used, shell_output, steps
 
+    steps.append("✅ Generating answer...")
     conversation_history.append({"role": "user", "content": question})
     conversation_history.append({"role": "assistant", "content": reply})
-    return reply, None, None
+    audit("ANSWER", reply[:120])
+    return reply, None, None, steps
 
 
 HTML = """<!DOCTYPE html>
@@ -183,6 +212,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; b
 .agent-icon { width: 28px; height: 28px; flex-shrink: 0; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; color: white; margin-top: 2px; }
 .turn.agent .bubble { font-size: 0.95rem; line-height: 1.7; flex: 1; }
 
+.steps-block { margin-bottom: 12px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.step { font-size: 0.82rem; color: var(--text-muted); padding: 2px 0; font-family: "SF Mono", "Fira Code", monospace; }
 .thinking-dots { display: flex; gap: 4px; padding: 8px 0; }
 .thinking-dots span { width: 6px; height: 6px; background: var(--text-muted); border-radius: 50%; animation: pulse 1.2s ease-in-out infinite; }
 .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
@@ -289,7 +320,11 @@ function sendMessage() {
   })
   .then(function(r) { return r.json(); })
   .then(function(data) {
-    var html = escHtml(data.answer || "").replace(/\\n/g, "<br>");
+    var stepsHtml = "";
+    if (data.steps && data.steps.length) {
+      stepsHtml = '<div class="steps-block">' + data.steps.map(function(s){ return '<div class="step">' + escHtml(s) + '</div>'; }).join("") + '</div>';
+    }
+    var html = stepsHtml + marked.parse(data.answer || "");
     if (data.command) {
       html += '<div class="cmd-block"><div class="cmd-header"><div class="cmd-dot" style="background:#ff5f57"></div><div class="cmd-dot" style="background:#febc2e"></div><div class="cmd-dot" style="background:#28c840"></div><span class="cmd-label">Terminal</span></div><div class="cmd-body"><div class="cmd-line">' + escHtml(data.command) + '</div><div class="cmd-output">' + escHtml(data.output || "") + '</div></div></div>';
     }
@@ -335,11 +370,12 @@ def clear_history():
 @app.route("/ask", methods=["POST"])
 def ask_endpoint():
     question = request.json.get("question", "")
-    answer, command, output = ask(question)
+    answer, command, output, steps = ask(question)
     return jsonify({
         "answer": answer,
         "command": command,
         "output": output,
+        "steps": steps,
         "tokens_prompt": token_stats["prompt"],
         "tokens_completion": token_stats["completion"],
         "tokens_total": token_stats["prompt"] + token_stats["completion"]
