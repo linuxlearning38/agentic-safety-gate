@@ -281,77 +281,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; b
   </div>
 </div>
 
-<script>
-document.getElementById("input").addEventListener("keydown", function(e) {
-  if (e.key === "Enter") { e.preventDefault(); sendMessage(); }
-});
-
-function usePrompt(text) {
-  document.getElementById("input").value = text;
-  sendMessage();
-}
-
-function escHtml(t) {
-  return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-}
-
-function sendMessage() {
-  var input = document.getElementById("input");
-  var question = input.value.trim();
-  if (!question) return;
-
-  var w = document.getElementById("welcome");
-  if (w) w.remove();
-
-  input.value = "";
-  document.getElementById("btn-send").disabled = true;
-
-  var chat = document.getElementById("chat");
-  chat.innerHTML += '<div class="turn user"><div class="bubble">' + escHtml(question) + '</div></div>';
-
-  var tid = "t" + Date.now();
-  chat.innerHTML += '<div class="turn agent" id="' + tid + '"><div class="agent-icon">D</div><div class="bubble"><div class="thinking-dots"><span></span><span></span><span></span></div></div></div>';
-  chat.scrollTop = chat.scrollHeight;
-
-  fetch("/ask", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({question: question})
-  })
-  .then(function(r) { return r.json(); })
-  .then(function(data) {
-    var stepsHtml = "";
-    if (data.steps && data.steps.length) {
-      stepsHtml = '<div class="steps-block">' + data.steps.map(function(s){ return '<div class="step">' + escHtml(s) + '</div>'; }).join("") + '</div>';
-    }
-    var html = stepsHtml + marked.parse(data.answer || "");
-    if (data.command) {
-      html += '<div class="cmd-block"><div class="cmd-header"><div class="cmd-dot" style="background:#ff5f57"></div><div class="cmd-dot" style="background:#febc2e"></div><div class="cmd-dot" style="background:#28c840"></div><span class="cmd-label">Terminal</span></div><div class="cmd-body"><div class="cmd-line">' + escHtml(data.command) + '</div><div class="cmd-output">' + escHtml(data.output || "") + '</div></div></div>';
-    }
-    document.getElementById(tid).outerHTML = '<div class="turn agent"><div class="agent-icon">D</div><div class="bubble">' + html + '</div></div>';
-    if (data.tokens_total) {
-      var t = data.tokens_total;
-      document.getElementById("token-badge").textContent = (t > 1000 ? (t/1000).toFixed(1)+"k" : t) + " tokens";
-    }
-    document.getElementById("btn-send").disabled = false;
-    document.getElementById("input").focus();
-    document.getElementById("chat").scrollTop = 99999;
-  })
-  .catch(function(e) {
-    document.getElementById(tid).outerHTML = '<div class="turn agent"><div class="agent-icon">D</div><div class="bubble">Error: ' + e + '</div></div>';
-    document.getElementById("btn-send").disabled = false;
-  });
-}
-
-function clearChat() {
-  fetch("/clear", {method: "POST"});
-  document.getElementById("chat").innerHTML = '<div id="welcome" style="max-width:600px;margin:40px auto 0;padding:0 24px;text-align:center"><div class="w-icon">D</div><h2 style="font-size:1.5rem;font-weight:500;margin-bottom:10px">What can I help with?</h2></div>';
-  document.getElementById("token-badge").textContent = "0 tokens";
-}
-</script>
+<script src="/static/agent.js"></script>
 </body>
 </html>"""
 
+
+
+@app.route("/static/agent.js")
+def serve_js():
+    from flask import send_from_directory
+    return send_from_directory("/mnt/i/ai-lab/projects/devops-agent/static", "agent.js")
 
 @app.route("/")
 def index():
@@ -382,6 +321,102 @@ def ask_endpoint():
     })
 
 
+
+@app.route("/ask_stream", methods=["POST"])
+def ask_stream_endpoint():
+    import json
+    from flask import stream_with_context, Response
+    question = request.json.get("question", "")
+
+    def generate():
+        audit("QUESTION", question)
+        # Intercept date/time questions directly
+        q_lower = question.lower()
+        if any(w in q_lower for w in ["what time", "what is the time", "current time", "what date", "what is the date", "current date"]):
+            result = run_shell("date")
+            yield "data: " + json.dumps({"type": "step", "content": "[*] Running: date"}) + "\n\n"
+            yield "data: " + json.dumps({"type": "token", "content": "The current date and time is: " + result}) + "\n\n"
+            conversation_history.append({"role": "user", "content": question})
+            conversation_history.append({"role": "assistant", "content": result})
+            audit("ANSWER", result)
+            yield "data: " + json.dumps({"type": "done", "command": "date", "output": result, "tokens_total": len(question.split()) + len(result.split())}) + "\n\n"
+            return
+
+        yield "data: " + json.dumps({"type": "step", "content": "[*] Searching knowledge base..."}) + "\n\n"
+        context = get_context(question)
+
+        system_prompt = (
+            "You are a local DevOps AI agent running on the user machine using qwen2.5:14b via Ollama.\n"
+            "You are NOT ChatGPT, NOT Claude, NOT Anthropic.\n\n"
+            "You answer questions about Kubernetes, Docker, CI/CD, Jenkins, GitHub Actions,\n"
+            "ArgoCD, Terraform, Ansible, AWS, Azure, GCP, Linux, DevSecOps, OPA, Git,\n"
+            "monitoring, logging, and ANY application deployment project.\n\n"
+            "Only decline questions completely unrelated to technology.\n\n"
+            "KNOWLEDGE BASE CONTEXT:\n" + context + "\n\n"
+            "RULES:\n"
+            "- ollama runs natively on this machine, never use docker exec for it\n"
+            "- NEVER use curl or wget\n"
+            "- NEVER chain commands with ; or &&\n"
+            "- COMMAND must be a single simple command only\n"
+            "- No backticks or quotes around the command\n"
+            "- If answer exists in context, do NOT use COMMAND\n"
+            "To run a shell command respond with exactly:\n"
+            "COMMAND: <single command here>"
+        )
+
+        messages = [{"role": "system", "content": system_prompt}]
+        messages += conversation_history
+        messages.append({"role": "user", "content": question})
+
+        yield "data: " + json.dumps({"type": "step", "content": "[*] Thinking with Qwen 2.5 14B..."}) + "\n\n"
+
+        full_reply = ""
+        prompt_tokens = 0
+        completion_tokens = 0
+        for chunk in ollama.chat(model="qwen2.5:14b", messages=messages, stream=True):
+            token = chunk["message"]["content"]
+            full_reply += token
+            completion_tokens += 1
+            if chunk.get("prompt_eval_count"): prompt_tokens = chunk["prompt_eval_count"]
+            if chunk.get("eval_count"): completion_tokens = chunk["eval_count"]
+            yield "data: " + json.dumps({"type": "token", "content": token}) + "\n\n"
+
+        command_used = None
+        shell_output = ""
+
+        if "COMMAND:" in full_reply:
+            for line in full_reply.split("\n"):
+                if line.startswith("COMMAND:"):
+                    command_used = clean(line.replace("COMMAND:", ""))
+                    yield "data: " + json.dumps({"type": "step", "content": "[*] Running: " + command_used}) + "\n\n"
+                    audit("COMMAND_RUN", command_used)
+                    shell_output = run_shell(command_used)
+                    if shell_output.startswith("Command not allowed") or shell_output.startswith("Access denied"):
+                        yield "data: " + json.dumps({"type": "step", "content": "[X] Blocked: " + command_used}) + "\n\n"
+                        audit("COMMAND_BLOCKED", command_used)
+                    else:
+                        yield "data: " + json.dumps({"type": "command", "command": command_used, "output": shell_output}) + "\n\n"
+                        yield "data: " + json.dumps({"type": "step", "content": "[*] Generating final answer..."}) + "\n\n"
+                        followup_messages = messages + [
+                            {"role": "assistant", "content": full_reply},
+                            {"role": "user", "content": "Command output:\n" + shell_output + "\n\nGive a clear answer."}
+                        ]
+                        full_reply = ""
+                        for chunk in ollama.chat(model="qwen2.5:14b", messages=followup_messages, stream=True):
+                            token = chunk["message"]["content"]
+                            full_reply += token
+                            yield "data: " + json.dumps({"type": "token", "content": token}) + "\n\n"
+                    break
+
+        conversation_history.append({"role": "user", "content": question})
+        conversation_history.append({"role": "assistant", "content": full_reply})
+        audit("ANSWER", full_reply[:120])
+        total_tokens = prompt_tokens + completion_tokens
+        yield "data: " + json.dumps({"type": "done", "command": command_used, "output": shell_output, "tokens_total": total_tokens}) + "\n\n"
+
+    return Response(stream_with_context(generate()), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
 if __name__ == "__main__":
     print("DevOps AI Agent running at http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
