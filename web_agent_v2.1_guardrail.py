@@ -7,6 +7,7 @@ Improved sidebar with modals
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 import chromadb
+from knowledge_updater.hybrid_retrieval import HybridRetriever
 import ollama
 import subprocess
 import os
@@ -33,6 +34,12 @@ EMBED_MODEL = "nomic-embed-text"
 # Initialize ChromaDB
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = chroma_client.get_collection(COLLECTION_NAME)
+
+# Phase 2: Hybrid retriever (policies + blogs)
+import yaml
+with open("knowledge_updater/config.yaml") as _f:
+    _ku_config = yaml.safe_load(_f)
+hybrid_retriever = HybridRetriever(_ku_config, existing_client=chroma_client)
 
 # Command whitelist - expanded for server management
 ALLOWED_COMMANDS = [
@@ -198,76 +205,59 @@ def get_embedding(text):
 
 def query_knowledge_base(query, n_results=5):
     try:
+        # Phase 2: hybrid retrieval (policies + blogs)
+        chunks = hybrid_retriever.query(
+            query_text=query,
+            n_policies=4,
+            n_blogs=6,
+            blog_min_relevance=0.003,
+            format_for_llm=False
+        )
+        if chunks:
+            return [chunk.content for chunk in chunks]
+        # fallback to original single collection
         embedding = get_embedding(query)
         if not embedding:
             return []
         results = collection.query(query_embeddings=[embedding], n_results=n_results)
-        return results['documents'][0] if results['documents'] else []
+        return results["documents"][0] if results["documents"] else []
     except Exception as e:
         logger.error(f"Query error: {e}")
         return []
 
 def generate_response(query, context):
-    """Generate response using LLM with simple, focused prompting"""
+    """Generate response using Qwen chat template with clean prompting"""
     try:
-        # Build prompt - keeping it simple like the old version
         if context:
-            context_str = "\n\n".join(context[:3])  # Use top 3 results
-            prompt = f"""You are AVA, a DevOps AI assistant with security controls.
+            context_str = "\n\n---\n\n".join(context[:8])
+            user_msg = f"""Here is the relevant context from the knowledge base:
 
-CRITICAL INSTRUCTIONS FOR COMMAND EXECUTION:
-1. When executing commands, you will receive ACTUAL output from the system
-2. NEVER say "command executed successfully" unless you see real output
-3. If you see "requires manual approval", tell user: "Command queued for approval - check Security dashboard"
-4. Do NOT predict or imagine command results
-5. Only report what you actually observe from system output
-
-Your responses should be based on FACTS, not predictions. with security controls.
-
-CRITICAL INSTRUCTIONS FOR COMMAND EXECUTION:
-1. When executing commands, you will receive ACTUAL output from the system
-2. NEVER say "command executed successfully" unless you see real output
-3. If you see "requires manual approval", tell user: "Command queued for approval - check Security dashboard"
-4. Do NOT predict or imagine command results
-5. Only report what you actually observe from system output
-
-Your responses should be based on FACTS, not predictions.. Use the following context to answer the question.
-
-Context:
+<context>
 {context_str}
+</context>
 
 Question: {query}
 
-Provide a clear, practical answer. Include code examples if relevant."""
+Instructions: Read the context carefully. If the answer is in the context, extract and quote the specific details, config values, or commands directly. Do not say the information is unavailable if it exists in the context above."""
         else:
-            prompt = f"""You are AVA, a DevOps AI assistant with security controls.
+            user_msg = f"""Answer this DevOps question from your knowledge:
+{query}"""
 
-CRITICAL INSTRUCTIONS FOR COMMAND EXECUTION:
-1. When executing commands, you will receive ACTUAL output from the system
-2. NEVER say "command executed successfully" unless you see real output
-3. If you see "requires manual approval", tell user: "Command queued for approval - check Security dashboard"
-4. Do NOT predict or imagine command results
-5. Only report what you actually observe from system output
-
-Your responses should be based on FACTS, not predictions. with security controls.
-
-CRITICAL INSTRUCTIONS FOR COMMAND EXECUTION:
-1. When executing commands, you will receive ACTUAL output from the system
-2. NEVER say "command executed successfully" unless you see real output
-3. If you see "requires manual approval", tell user: "Command queued for approval - check Security dashboard"
-4. Do NOT predict or imagine command results
-5. Only report what you actually observe from system output
-
-Your responses should be based on FACTS, not predictions.. Answer this question based on your DevOps knowledge.
-
-Question: {query}"""
-        
-        # Call LLM with simple user message (no system prompt)
         response = ollama.chat(
             model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}]
+            messages=[
+                {"role": "system", "content": """You are AVA, a senior DevOps AI assistant.
+
+RULES:
+1. When context is provided between <context> tags, read it carefully and extract the answer from it
+0. IMPORTANT: Always respond in English only, regardless of the language of the context
+2. Always quote specific config values, commands, or fixes found in the context
+3. If context contains the answer, use it — never say information is unavailable when it exists
+4. For command execution: NEVER say a command succeeded unless you see real output
+5. Be specific, practical, and cite exact details from the context"""},
+                {"role": "user", "content": user_msg}
+            ]
         )
-        
         return response['message']['content']
     except Exception as e:
         logger.error(f"LLM error: {e}")
