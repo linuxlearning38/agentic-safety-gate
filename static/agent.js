@@ -13,6 +13,70 @@ function escHtml(t) {
   return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
 
+function processMermaid() {
+  document.querySelectorAll(".bubble p, .bubble code, .bubble pre code").forEach(function(block) {
+    if (block.dataset.mermaidProcessed) return;
+    block.dataset.mermaidProcessed = "true";
+
+    var text = block.innerHTML
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .trim();
+
+    if (/^(graph\s+(TD|LR|BT|RL)|sequenceDiagram|classDiagram|flowchart)/i.test(text)) {
+      var div = document.createElement("div");
+      div.className = "mermaid";
+      div.textContent = text;
+      div.style.cssText = "background:#1a1a2e;padding:16px;border-radius:8px;margin:8px 0;overflow:auto;";
+      var target = block.closest("pre") || block;
+      target.replaceWith(div);
+      if (typeof mermaid !== "undefined") {
+        try { mermaid.init(undefined, [div]); }
+        catch(e) { console.error("Mermaid:", e); }
+      }
+    }
+  });
+}
+function processMermaid_OLD() {
+  // Target both <code> blocks AND raw <p> tags (when LLM outputs raw graph syntax)
+  var selectors = ["code", "pre code", "p"];
+  selectors.forEach(function(sel) {
+    document.querySelectorAll(sel).forEach(function(block) {
+      if (block.dataset.mermaidProcessed) return;
+      block.dataset.mermaidProcessed = "true";
+
+      var text = block.innerHTML
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .trim();
+
+      if (/^(graph\s+(TD|LR|BT|RL)|sequenceDiagram|classDiagram|flowchart)/i.test(text)) {
+        var div = document.createElement("div");
+        div.className = "mermaid";
+        div.textContent = text;
+        div.style.cssText = "background:#1a1a2e;padding:16px;border-radius:8px;margin:8px 0;overflow:auto;";
+        var target = block.closest("pre") || block;
+        target.replaceWith(div);
+        if (typeof mermaid !== "undefined") {
+          try {
+            mermaid.init(undefined, [div]);
+          } catch(e) {
+            console.error("Mermaid:", e);
+          }
+        }
+      }
+    });
+  });
+}
+
 function sendMessage() {
   var input = document.getElementById("input");
   var question = input.value.trim();
@@ -31,69 +95,50 @@ function sendMessage() {
   chat.innerHTML += '<div class="turn agent" id="' + tid + '"><div class="agent-icon">D</div><div class="bubble"><div class="thinking-dots"><span></span><span></span><span></span></div></div></div>';
   chat.scrollTop = chat.scrollHeight;
 
-  var steps = [];
   var tokens = "";
   var cmdUsed = null;
   var cmdOutput = null;
 
   function renderStream() {
-    var stepsHtml = steps.length ? '<div class="steps-block">' + steps.map(function(s){ return '<div class="step">' + escHtml(s) + '</div>'; }).join("") + '</div>' : "";
     var answerHtml = tokens ? marked.parse(tokens) : "";
     var cmdHtml = "";
     if (cmdUsed) {
       cmdHtml = '<div class="cmd-block"><div class="cmd-header"><div class="cmd-dot" style="background:#ff5f57"></div><div class="cmd-dot" style="background:#febc2e"></div><div class="cmd-dot" style="background:#28c840"></div><span class="cmd-label">Terminal</span></div><div class="cmd-body"><div class="cmd-line">' + escHtml(cmdUsed) + '</div><div class="cmd-output">' + escHtml(cmdOutput || "") + '</div></div></div>';
     }
+
     var el = document.getElementById(tid);
-    if (el) el.outerHTML = '<div class="turn agent" id="' + tid + '"><div class="agent-icon">D</div><div class="bubble">' + stepsHtml + answerHtml + cmdHtml + '</div></div>';
+    if (el) {
+      el.querySelector(".bubble").innerHTML = answerHtml + cmdHtml;
+    }
+
+    setTimeout(processMermaid, 100);
+    setTimeout(processMermaid, 400);
   }
 
-  fetch("/ask_stream", {
+  fetch("/ask", {
     method: "POST",
     headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({question: question})
+    body: JSON.stringify({query: question})
   }).then(function(response) {
-    var reader = response.body.getReader();
-    var decoder = new TextDecoder();
-    var buffer = "";
-
-    function pump() {
-      reader.read().then(function(result) {
-        if (result.done) {
-          renderStream();
-          document.getElementById("btn-send").disabled = false;
-          document.getElementById("input").focus();
-          document.getElementById("chat").scrollTop = 99999;
-          return;
-        }
-        buffer += decoder.decode(result.value, {stream: true});
-        var lines = buffer.split("\n");
-        buffer = lines.pop();
-        lines.forEach(function(line) {
-          if (line.startsWith("data: ")) {
-            try {
-              var msg = JSON.parse(line.slice(6));
-              if (msg.type === "step") { steps.push(msg.content); }
-              else if (msg.type === "token") { 
-                // Strip COMMAND: lines from visible answer
-                if (!msg.content.match(/^COMMAND:/)) { tokens += msg.content; }
-              }
-              else if (msg.type === "command") { cmdUsed = msg.command; cmdOutput = msg.output; tokens = tokens.replace(/COMMAND:.*$/m, "").trim(); }
-              else if (msg.type === "done" && msg.tokens_total) {
-                var t = msg.tokens_total;
-                document.getElementById("token-badge").textContent = (t > 1000 ? (t/1000).toFixed(1)+"k" : t) + " tokens";
-              }
-              renderStream();
-              document.getElementById("chat").scrollTop = 99999;
-            } catch(e) {}
-          }
-        });
-        pump();
-      });
+    return response.json();
+  }).then(function(data) {
+    if (data.type === "command") {
+      cmdUsed = data.result && data.result.output ? "Command executed" : "";
+      cmdOutput = data.result ? (data.result.output || data.result.reason || "") : "";
+      tokens = "";
+    } else {
+      tokens = data.response || data.analysis || "";
     }
-    pump();
+    var sourcesCount = data.sources_used || 0;
+    var timeStr = data.time_taken || "";
+    document.getElementById("token-badge").textContent = sourcesCount + " sources • " + timeStr;
+    renderStream();
+    document.getElementById("btn-send").disabled = false;
+    document.getElementById("input").focus();
+    document.getElementById("chat").scrollTop = 99999;
   }).catch(function(e) {
     var el = document.getElementById(tid);
-    if (el) el.outerHTML = '<div class="turn agent"><div class="agent-icon">D</div><div class="bubble">Error: ' + e + '</div></div>';
+    if (el) el.querySelector(".bubble").innerHTML = "Error: " + e;
     document.getElementById("btn-send").disabled = false;
   });
 }

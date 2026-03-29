@@ -31,6 +31,39 @@ HISTORY_FILE = "/mnt/i/ai-lab/projects/devops-agent/query_history.json"
 LLM_MODEL = "qwen2.5:14b"
 EMBED_MODEL = "nomic-embed-text"
 
+# Phase 3: Memory Layer
+MEMORY_PATH = "/mnt/i/ai-lab/ava_memory.json"
+
+def load_memory():
+    try:
+        if os.path.exists(MEMORY_PATH):
+            with open(MEMORY_PATH) as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Memory load failed: {e}")
+    return {}
+
+def save_memory(memory):
+    try:
+        with open(MEMORY_PATH, "w") as f:
+            json.dump(memory, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Memory save failed: {e}")
+
+def update_memory_issue(query, response_summary):
+    memory = load_memory()
+    memory.setdefault("past_issues", []).append({
+        "date": datetime.now().isoformat(),
+        "query": query[:100],
+        "resolution": response_summary[:200]
+    })
+    memory["past_issues"] = memory["past_issues"][-50:]
+    save_memory(memory)
+
+AVA_MEMORY = load_memory()
+logger.info(f"Memory loaded: user={AVA_MEMORY.get('user', 'unknown')}, "
+            f"infra={list(k for k,v in AVA_MEMORY.get('infra', {}).items() if v)}")
+
 # Initialize ChromaDB
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = chroma_client.get_collection(COLLECTION_NAME)
@@ -64,8 +97,15 @@ BLOCKED_PATHS = [
 ]
 
 # Stats
+_blogs_count = 0
+try:
+    _blogs_col = chroma_client.get_collection("devops_blogs_v1")
+    _blogs_count = _blogs_col.count()
+except:
+    pass
+
 STATS = {
-    'total_chunks': collection.count(),
+    'total_chunks': collection.count() + _blogs_count,
     'repos': 5,
     'model': 'Qwen 2.5 14B',
     'opa_enabled': True,
@@ -203,19 +243,22 @@ def get_embedding(text):
         logger.error(f"Embedding error: {e}")
         return None
 
-def query_knowledge_base(query, n_results=5):
+def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_relevance=0.003):
+    """Phase 3: Hybrid retrieval with context assembly."""
     try:
-        # Phase 2: hybrid retrieval (policies + blogs)
-        chunks = hybrid_retriever.query(
+        raw_chunks = hybrid_retriever.query(
             query_text=query,
-            n_policies=4,
-            n_blogs=6,
-            blog_min_relevance=0.003,
+            n_policies=n_policies,
+            n_blogs=12,
+            blog_min_relevance=0.001,
             format_for_llm=False
         )
-        if chunks:
-            return [chunk.content for chunk in chunks]
-        # fallback to original single collection
+        if raw_chunks:
+            assembled = hybrid_retriever.assemble_context(raw_chunks)
+            if assembled:
+                logger.info(f"Context assembly: {len(raw_chunks)} chunks -> {len(assembled)} merged blocks")
+                return assembled
+            return [chunk.content for chunk in raw_chunks]
         embedding = get_embedding(query)
         if not embedding:
             return []
@@ -225,40 +268,101 @@ def query_knowledge_base(query, n_results=5):
         logger.error(f"Query error: {e}")
         return []
 
+def is_technical_query(query):
+    signals = ["fix", "error", "failed", "issue", "not working", "debug", "broken",
+               "problem", "crash", "warning", "exception", "configure", "setup", "how to"]
+    return any(s in query.lower() for s in signals)
+
+def is_complex_query(query):
+    cot_keywords = ["why", "how", "explain", "design", "compare", "difference",
+                    "should i", "best way", "which", "when"]
+    return len(query.split()) > 10 or any(k in query.lower() for k in cot_keywords)
+
+def is_weak_response(response_text):
+    weak_signals = ["i don't have", "i don't know", "not found", "no information",
+                    "unable to find", "cannot find", "not in my knowledge",
+                    "i cannot", "no relevant", "i'm not sure", "i am not sure",
+                    "i do not have access"]
+    return any(signal in response_text.lower() for signal in weak_signals)
+
+def build_memory_context():
+    if not AVA_MEMORY:
+        return ""
+    infra = AVA_MEMORY.get("infra", {})
+    active_tools = [k for k, v in infra.items() if v]
+    user = AVA_MEMORY.get("user", "the user")
+    prefs = AVA_MEMORY.get("preferences", {})
+    lines = [f"User: {user}"]
+    if active_tools:
+        lines.append(f"Their infrastructure stack: {', '.join(active_tools)}")
+    if prefs.get("style"):
+        lines.append(f"Response style: {prefs['style']}")
+    return "\n".join(lines)
+
+def force_knowledge_routing(query):
+    q = query.lower().strip()
+    knowledge_patterns = [
+        "how to", "how do i", "how does", "how can i", "how should",
+        "why is", "why does", "why did", "why would", "why are",
+        "what is", "what are", "what does", "what should", "what causes",
+        "debug", "fix", "troubleshoot", "resolve", "solve", "help me",
+        "not working", "fails", "error", "issue", "problem", "broken",
+        "crash", "stuck", "slow", "explain", "describe", "tell me",
+        "best practice", "best way", "difference between", "compare",
+        "architecture", "design", "diagram", "flow", "show me",
+        "create a", "draw a", "visualize",
+    ]
+    for pattern in knowledge_patterns:
+        if pattern in q:
+            return True
+    question_starters = ["how", "why", "what", "when", "where", "which", "explain", "describe", "create", "show"]
+    first_word = q.split()[0] if q.split() else ""
+    if first_word in question_starters:
+        return True
+    return False
+
 def generate_response(query, context):
-    """Generate response using Qwen chat template with clean prompting"""
+    """Phase 3: Structured response with memory, CoT, Mermaid, fail-safe."""
     try:
+        memory_ctx = build_memory_context()
+        use_structured = is_technical_query(query)
+        use_cot = is_complex_query(query)
+        wants_diagram = any(k in query.lower() for k in [
+            "diagram", "architecture", "flow", "show me how", "draw", "visualize", "create a diagram"
+        ])
+
+        system_parts = ["You are AVA, a senior DevOps AI assistant.\n\nRULES:\n1. Always respond in English only\n2. When context is provided in <context> tags, extract the exact answer from it\n3. Quote specific config values, commands, and fixes directly from context\n4. Never say information is unavailable when it exists in the context\n5. Be specific, practical, and concise"]
+
+        if memory_ctx:
+            system_parts.append(f"\nUSER CONTEXT (use this to tailor your answers):\n{memory_ctx}")
+
+        if use_structured:
+            system_parts.append("\nFor technical problems, always structure your answer as:\n\n**Root Cause:** [1-2 sentences]\n**Fix:** [exact commands or config]\n**Why this works:** [1-2 sentences]\n**Watch out for:** [edge cases or caveats]")
+
+        if wants_diagram:
+            system_parts.append("\nIMPORTANT: When asked for any diagram, architecture, or flow - ALWAYS output ONLY a mermaid diagram. Start with ```mermaid on its own line. Use graph LR for horizontal layouts, graph TD for vertical. Make nodes descriptive. After the diagram add a brief explanation.")
+
+        system_prompt = "\n".join(system_parts)
+
         if context:
-            context_str = "\n\n---\n\n".join(context[:8])
-            user_msg = f"""Here is the relevant context from the knowledge base:
-
-<context>
-{context_str}
-</context>
-
-Question: {query}
-
-Instructions: Read the context carefully. If the answer is in the context, extract and quote the specific details, config values, or commands directly. Do not say the information is unavailable if it exists in the context above."""
+            context_str = "\n\n---\n\n".join(context[:5])
+            user_msg = f"<context>\n{context_str}\n</context>\n\nQuestion: {query}"
         else:
-            user_msg = f"""Answer this DevOps question from your knowledge:
-{query}"""
+            user_msg = f"Answer this DevOps question from your knowledge:\n{query}"
+
+        if use_cot:
+            user_msg += "\n\nThink step by step before answering."
 
         response = ollama.chat(
             model=LLM_MODEL,
             messages=[
-                {"role": "system", "content": """You are AVA, a senior DevOps AI assistant.
-
-RULES:
-1. When context is provided between <context> tags, read it carefully and extract the answer from it
-0. IMPORTANT: Always respond in English only, regardless of the language of the context
-2. Always quote specific config values, commands, or fixes found in the context
-3. If context contains the answer, use it — never say information is unavailable when it exists
-4. For command execution: NEVER say a command succeeded unless you see real output
-5. Be specific, practical, and cite exact details from the context"""},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg}
-            ]
+            ],
+            options={"num_ctx": 8192, "temperature": 0.7}
         )
-        return response['message']['content']
+        return response["message"]["content"]
+
     except Exception as e:
         logger.error(f"LLM error: {e}")
         return f"Error generating response: {str(e)}"
@@ -507,8 +611,8 @@ def ask():
                 'time_taken': f"{elapsed:.2f}s"
             })
         
-        # Check for multi-part query FIRST
-        questions = split_multi_query(query)
+        # Phase 3: Multi-query splitting disabled - causes fragmentation
+        questions = [query]
         if len(questions) > 1:
             logger.info(f"Detected {len(questions)} questions: {questions}")
             results = []
@@ -573,10 +677,16 @@ def ask():
                 'time_taken': f"{elapsed:.2f}s"
             })
         
-        # Use LLM to analyze query and decide action
-        logger.info("[*] Analyzing query with LLM...")
-        analysis = analyze_query_with_llm(query)
-        action_type = analysis.get('action')
+        # Phase 3: Force KNOWLEDGE routing for how/why/fix queries
+        if force_knowledge_routing(query):
+            logger.info("[*] Force-routing to knowledge base (knowledge pattern detected)")
+            action_type = "KNOWLEDGE"
+            analysis = {"action": "KNOWLEDGE", "reasoning": "forced by knowledge pattern"}
+        else:
+            # Use LLM to analyze query and decide action
+            logger.info("[*] Analyzing query with LLM...")
+            analysis = analyze_query_with_llm(query)
+            action_type = analysis.get('action')
         
         if action_type == 'COMMAND':
             # Try to extract and validate command
@@ -645,6 +755,24 @@ def ask():
             logger.info(f"[*] Thinking with {LLM_MODEL}...")
             
             response = generate_response(query, context)
+
+            # Phase 3: Fail-safe retry
+            if context and len(context) < 2 and is_weak_response(response):
+                logger.info("[FAILSAFE] Weak response - retrying with extended retrieval...")
+                retry_chunks = hybrid_retriever.query(
+                    query_text=query,
+                    n_policies=6,
+                    n_blogs=10,
+                    blog_min_relevance=0.001,
+                    format_for_llm=False
+                )
+                if retry_chunks:
+                    retry_context = hybrid_retriever.assemble_context(
+                        retry_chunks, max_articles=5, max_chunks_per_article=4
+                    )
+                    response = generate_response(query, retry_context)
+                    logger.info("[FAILSAFE] Retry complete")
+
             elapsed = time.time() - start_time
             
             save_history({
@@ -678,8 +806,40 @@ def upload_file():
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
         
-        content = file.read().decode('utf-8', errors='ignore')
+        file_bytes = file.read()
         filename = file.filename
+        file_ext = filename.split('.')[-1].lower() if '.' in filename else 'unknown'
+
+        # Phase 3: Image analysis with llava
+        if file_ext in ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp']:
+            import base64
+            image_data = base64.b64encode(file_bytes).decode('utf-8')
+            logger.info(f"Image detected: {filename} — using llava:13b")
+            vision_response = ollama.chat(
+                model="llava:13b",
+                messages=[{
+                    "role": "user",
+                    "content": "Analyze this diagram in detail. Identify all components, their relationships, data flows, and architecture patterns. Provide specific technical insights.",
+                    "images": [image_data]
+                }]
+            )
+            analysis = vision_response['message']['content']
+            elapsed = time.time() - start_time
+            save_history({
+                'timestamp': datetime.now().isoformat(),
+                'query': f"Image analysis: {filename}",
+                'type': 'image_analysis',
+                'filename': filename,
+                'time_taken': f"{elapsed:.2f}s"
+            })
+            return jsonify({
+                'type': 'file_analysis',
+                'filename': filename,
+                'analysis': analysis,
+                'time_taken': f"{elapsed:.2f}s"
+            })
+
+        content = file_bytes.decode('utf-8', errors='ignore')
         
         logger.info(f"Analyzing file: {filename}")
         
@@ -1453,6 +1613,9 @@ HTML_TEMPLATE = r'''
             color: #51cf66;
         }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({ startOnLoad: false, theme: 'dark' });</script>
 </head>
 <body>
     <div class="app-container">
@@ -1815,7 +1978,7 @@ HTML_TEMPLATE = r'''
                     <div class="message-text">${escapeHtml(text)}</div>
                 </div>
             `;
-            chatArea.appendChild(messageDiv);
+            chatArea.appendChild(messageDiv); setTimeout(renderMermaidPlaceholders, 100); setTimeout(renderMermaidPlaceholders, 400);
             chatArea.scrollTop = chatArea.scrollHeight;
         }
         
@@ -1950,7 +2113,7 @@ HTML_TEMPLATE = r'''
                     </div>
                 </div>
             `;
-            chatArea.appendChild(messageDiv);
+            chatArea.appendChild(messageDiv); setTimeout(renderMermaidPlaceholders, 100); setTimeout(renderMermaidPlaceholders, 500);
             chatArea.scrollTop = chatArea.scrollHeight;
         }
         
@@ -2043,11 +2206,88 @@ HTML_TEMPLATE = r'''
         }
         
         function formatResponse(text) {
+            // Handle mermaid code blocks FIRST
+            text = text.replace(/```mermaid\n([\s\S]*?)```/g, function(match, diagram) {
+                return '<div class="mermaid-placeholder" data-diagram="' + encodeURIComponent(diagram.trim()) + '" style="background:#1a1a2e;padding:16px;border-radius:8px;margin:8px 0;text-align:center;color:#888;">Loading diagram...</div>';
+            });
+            // Handle plain ``` blocks containing graph syntax
+            text = text.replace(/```[^\n]*\n(graph\s+(?:TD|LR|BT|RL)[\s\S]*?)```/g, function(match, diagram) {
+                return '<div class="mermaid-placeholder" data-diagram="' + encodeURIComponent(diagram.trim()) + '" style="background:#1a1a2e;padding:16px;border-radius:8px;margin:8px 0;text-align:center;color:#888;">Loading diagram...</div>';
+            });
             text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
             text = text.replace(/`([^`]+)`/g, '<code style="background: #2a2a2a; padding: 2px 6px; border-radius: 4px; font-size: 13px;">$1</code>');
             text = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
             text = text.replace(/\n/g, '<br>');
             return text;
+        }
+        function renderMermaidPlaceholders() {
+            document.querySelectorAll('.mermaid-placeholder').forEach(function(el) {
+                var diagram = decodeURIComponent(el.getAttribute('data-diagram'));
+
+                // Create container with toggle + export buttons
+                var wrapper = document.createElement('div');
+                wrapper.style.cssText = 'margin:8px 0;';
+
+                var toolbar = document.createElement('div');
+                toolbar.style.cssText = 'display:flex;gap:8px;margin-bottom:6px;';
+                toolbar.innerHTML = '<button onclick="toggleDiagramView(this)" style="background:#2a2a3e;border:1px solid #444;color:#aaa;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;">📊 Diagram</button><button onclick="exportSVG(this)" style="background:#2a2a3e;border:1px solid #444;color:#aaa;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;">⬇ SVG</button><button onclick="copyMermaid(this)" style="background:#2a2a3e;border:1px solid #444;color:#aaa;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;">📋 Code</button>';
+
+                var diagramDiv = document.createElement('div');
+                diagramDiv.className = 'mermaid';
+                diagramDiv.textContent = diagram;
+                diagramDiv.style.cssText = 'background:#1a1a2e;padding:16px;border-radius:8px;overflow:auto;';
+                diagramDiv.setAttribute('data-raw', diagram);
+
+                var codeDiv = document.createElement('pre');
+                codeDiv.style.cssText = 'display:none;background:#1a1a2e;padding:16px;border-radius:8px;color:#a8ff78;font-size:12px;overflow:auto;';
+                codeDiv.textContent = diagram;
+
+                wrapper.appendChild(toolbar);
+                wrapper.appendChild(diagramDiv);
+                wrapper.appendChild(codeDiv);
+                el.replaceWith(wrapper);
+
+                if (typeof mermaid !== 'undefined') {
+                    try { mermaid.init(undefined, [diagramDiv]); }
+                    catch(e) { console.error('Mermaid:', e); }
+                }
+            });
+        }
+
+        function toggleDiagramView(btn) {
+            var wrapper = btn.closest('div');
+            var diagram = wrapper.querySelector('.mermaid');
+            var code = wrapper.querySelector('pre');
+            if (diagram.style.display === 'none') {
+                diagram.style.display = 'block';
+                code.style.display = 'none';
+                btn.textContent = '📊 Diagram';
+            } else {
+                diagram.style.display = 'none';
+                code.style.display = 'block';
+                btn.textContent = '📝 Code';
+            }
+        }
+
+        function exportSVG(btn) {
+            var wrapper = btn.closest('div');
+            var svg = wrapper.querySelector('svg');
+            if (!svg) { alert('Diagram not rendered yet'); return; }
+            var blob = new Blob([svg.outerHTML], {type:'image/svg+xml'});
+            var a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'diagram.svg';
+            a.click();
+        }
+
+        function copyMermaid(btn) {
+            var wrapper = btn.closest('div');
+            var diagramDiv = wrapper.querySelector('.mermaid');
+            var raw = diagramDiv ? diagramDiv.getAttribute('data-raw') : '';
+            navigator.clipboard.writeText(raw || '').then(function() {
+                btn.textContent = '✅ Copied';
+                setTimeout(function() { btn.textContent = '📋 Code'; }, 2000);
+            });
         }
         
         function escapeHtml(text) {

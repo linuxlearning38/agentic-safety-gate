@@ -1,5 +1,5 @@
 # ============================================================
-# AVA Knowledge Updater - Phase 2 Configuration
+# AVA Knowledge Updater - Phase 3 Configuration
 # ============================================================
 
 # --- ChromaDB ---
@@ -16,6 +16,8 @@ embedding:
   ollama_url: "http://localhost:11434"
 
 # --- Blog Sources ---
+# Kill switch: set enabled: false to disable without redeploying
+# Test new sources with: python3 -m knowledge_updater.scheduler --source "Name" --dry-run
 sources:
   - name: "AWS DevOps"
     url: "https://aws.amazon.com/blogs/devops/"
@@ -31,14 +33,6 @@ sources:
     min_content_length: 500
     enabled: true
 
-  - name: "HashiCorp Blog"
-    url: "https://www.hashicorp.com/blog"
-    rss: "https://www.hashicorp.com/blog/feed.xml"
-    max_articles: 8
-    min_content_length: 500
-    enabled: true
-    request_delay: 6
-
   - name: "Kubernetes Blog"
     url: "https://kubernetes.io/blog/"
     rss: "https://kubernetes.io/feed.xml"
@@ -46,12 +40,82 @@ sources:
     min_content_length: 400
     enabled: true
 
+  # ❌ Phase 2 broken — HTTP 429, bot blocked, empty RSS summaries
+  # Replaced by Datadog Engineering in Phase 3 (tomorrow's session)
+  - name: "HashiCorp Blog"
+    url: "https://www.hashicorp.com/blog"
+    rss: "https://www.hashicorp.com/blog/feed.xml"
+    max_articles: 8
+    min_content_length: 500
+    enabled: false
+    request_delay: 6
+
+  # ❌ Phase 2 broken — malformed RSS, invalid XML token at position 3:250
+  # Replaced by Pulumi Blog in Phase 3 (tomorrow's session)
   - name: "Spacelift Blog"
     url: "https://spacelift.io/blog"
     rss: "https://spacelift.io/blog/rss.xml"
     max_articles: 8
     min_content_length: 500
-    enabled: true
+    enabled: false
+
+  # ─── Phase 3 replacements (enable tomorrow after --dry-run test) ──────────
+  - name: "Pulumi Blog"
+    url: "https://www.pulumi.com/blog/"
+    rss: "https://www.pulumi.com/blog/rss.xml"
+    max_articles: 8
+    min_content_length: 400
+    enabled: false   # flip to true after dry-run confirms working
+
+  - name: "Datadog Engineering"
+    url: "https://www.datadoghq.com/blog/engineering/"
+    rss: "https://www.datadoghq.com/blog/engineering/feed/"
+    max_articles: 8
+    min_content_length: 400
+    enabled: false   # flip to true after dry-run confirms working
+
+  # ─── Phase 3 new sources (enable tomorrow after --dry-run test) ──────────
+  - name: "Azure DevOps Blog"
+    url: "https://devblogs.microsoft.com/devops/"
+    rss: "https://devblogs.microsoft.com/devops/feed/"
+    max_articles: 8
+    min_content_length: 400
+    enabled: false
+
+  - name: "Jenkins Blog"
+    url: "https://www.jenkins.io/blog/"
+    rss: "https://www.jenkins.io/blog/rss.xml"
+    max_articles: 8
+    min_content_length: 400
+    enabled: false
+
+  - name: "Red Hat Blog"
+    url: "https://www.redhat.com/en/blog"
+    rss: "https://www.redhat.com/en/rss/blog"
+    max_articles: 8
+    min_content_length: 400
+    enabled: false
+
+  - name: "Ubuntu Blog"
+    url: "https://ubuntu.com/blog"
+    rss: "https://ubuntu.com/blog/feed"
+    max_articles: 6
+    min_content_length: 400
+    enabled: false
+
+  - name: "Ansible Blog"
+    url: "https://www.ansible.com/blog"
+    rss: "https://www.ansible.com/blog/rss.xml"
+    max_articles: 8
+    min_content_length: 400
+    enabled: false
+
+  - name: "GCP Blog"
+    url: "https://cloud.google.com/blog/products/devops-sre"
+    rss: "https://cloud.google.com/feeds/gcp-blog-it.xml"
+    max_articles: 8
+    min_content_length: 400
+    enabled: false
 
 # --- Chunking ---
 chunking:
@@ -75,6 +139,13 @@ dedup:
   check_url: true
   check_content_hash: true
   hash_algorithm: "sha256"
+
+# --- Ingestion Limits (Phase 3) ---
+# Hard cap per run — prevents DB bloat as we add more sources
+limits:
+  max_new_chunks_per_run: 200
+  # Weak source warning threshold — print warning if source yields fewer than this
+  weak_source_threshold: 5
 
 # --- Scraper Behaviour ---
 scraper:
