@@ -16,6 +16,7 @@ import time
 import logging
 from datetime import datetime
 from control.secure_executor import execute_command_secure
+from control.command_graph import match_graph, execute_graph
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -677,6 +678,66 @@ def ask():
                 'time_taken': f"{elapsed:.2f}s"
             })
         
+        # ── Phase 4: Command Graph — deterministic diagnostics ──────────────
+        graph_name = match_graph(query)
+        if graph_name:
+            logger.info(f"[*] Command Graph matched: {graph_name}")
+            graph_result = execute_graph(graph_name, query)
+
+            # If a medium-risk step needs approval, pause and tell the user
+            if graph_result.paused_at:
+                elapsed = time.time() - start_time
+                return jsonify({
+                    'type':        'knowledge',
+                    'response':    (
+                        f"⚠️ **Approval Required**\n\n"
+                        f"I ran the `{graph_name}` diagnostic and reached a step that "
+                        f"needs your approval before continuing:\n\n"
+                        f"**Tool:** `{graph_result.paused_at}`\n"
+                        f"**Approval ID:** `{graph_result.approval_id}`\n\n"
+                        f"Run this to approve:\n"
+                        f"```bash\npython3 -m control.security_review\n```\n\n"
+                        f"Steps completed so far:\n{graph_result.summary_for_ui()}"
+                    ),
+                    'sources_used': 0,
+                    'time_taken':  f"{elapsed:.2f}s",
+                    'graph_used':  graph_name,
+                })
+
+            # Build context from live tool outputs → send to LLM for analysis
+            context_blocks = graph_result.to_context_blocks()
+            framing = (
+                f"The following is LIVE diagnostic output from running the "
+                f"'{graph_name}' diagnostic on the user's system. "
+                f"Analyse the output and give a specific diagnosis and fix.\n"
+            )
+            context_blocks.insert(0, framing)
+
+            response = generate_response(query, context_blocks)
+
+            elapsed = time.time() - start_time
+            save_history({
+                'timestamp':  datetime.now().isoformat(),
+                'query':      query,
+                'type':       'command_graph',
+                'graph':      graph_name,
+                'steps':      len(graph_result.steps_run),
+                'time_taken': f"{elapsed:.2f}s",
+            })
+
+            return jsonify({
+                'type':        'knowledge',
+                'response':    response,
+                'sources_used': len(context_blocks),
+                'time_taken':  f"{elapsed:.2f}s",
+                'graph_used':  graph_name,
+                'steps_run':   [
+                    {'tool': s['tool'], 'status': s['status']}
+                    for s in graph_result.steps_run
+                ],
+            })
+        # ── End Command Graph ───────────────────────────────────────────────
+
         # Phase 3: Force KNOWLEDGE routing for how/why/fix queries
         if force_knowledge_routing(query):
             logger.info("[*] Force-routing to knowledge base (knowledge pattern detected)")
