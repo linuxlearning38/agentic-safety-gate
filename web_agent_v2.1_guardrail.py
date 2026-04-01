@@ -773,6 +773,11 @@ def ask():
                     response = generate_response(query, retry_context)
                     logger.info("[FAILSAFE] Retry complete")
 
+            # Pending 3: Memory auto-update — persist resolved issues
+            if is_technical_query(query) and not is_weak_response(response):
+                update_memory_issue(query, response[:200])
+                logger.info("[MEMORY] Issue saved to ava_memory.json")
+
             elapsed = time.time() - start_time
             
             save_history({
