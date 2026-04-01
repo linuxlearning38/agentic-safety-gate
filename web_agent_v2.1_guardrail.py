@@ -17,6 +17,7 @@ import logging
 from datetime import datetime
 from control.secure_executor import execute_command_secure
 from control.command_graph import match_graph, execute_graph
+from control.react_loop import react_loop
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -737,6 +738,58 @@ def ask():
                 ],
             })
         # ── End Command Graph ───────────────────────────────────────────────
+
+        # ── Phase 4: ReAct Loop — for complex/unknown problems ─────────────
+        # Runs when no command graph matched AND query looks like a real problem
+        # not just a knowledge question
+        react_signals = [
+            "not working", "broken", "failing", "failed", "down", "crash",
+            "error", "issue", "problem", "stuck", "slow", "high latency",
+            "can't connect", "cannot connect", "unreachable", "timeout",
+            "oom", "killed", "evicted", "pending", "unknown", "investigate",
+            "diagnose", "debug", "troubleshoot", "why is", "what's wrong",
+        ]
+        is_problem_query = any(s in query.lower() for s in react_signals)
+
+        if is_problem_query and not any(k in query.lower() for k in [
+            "how to", "how do", "what is", "explain", "best practice",
+            "difference between", "compare", "show me", "create a"
+        ]):
+            logger.info("[*] ReAct loop triggered for problem query")
+            # Seed with RAG context so LLM has background knowledge
+            rag_context = query_knowledge_base(query, n_results=3)
+            react_result = react_loop.run(query, initial_context=rag_context)
+
+            logger.info(f"[ReAct] {react_result.summary_for_log()}")
+
+            elapsed = time.time() - start_time
+            save_history({
+                'timestamp':   datetime.now().isoformat(),
+                'query':       query,
+                'type':        'react',
+                'iterations':  react_result.iterations,
+                'stopped':     react_result.stopped_reason,
+                'tools_used':  [s.action for s in react_result.steps if s.action],
+                'time_taken':  f"{elapsed:.2f}s",
+            })
+
+            return jsonify({
+                'type':       'knowledge',
+                'response':   react_result.final_answer or "I was unable to complete the diagnostic. Please check kubectl is available in this environment.",
+                'sources_used': react_result.iterations,
+                'time_taken': f"{elapsed:.2f}s",
+                'react_trace': [
+                    {
+                        'iteration':    s.iteration,
+                        'thought':      s.thought[:200],
+                        'action':       s.action,
+                        'observation':  (s.observation or '')[:300],
+                        'final_answer': bool(s.final_answer),
+                    }
+                    for s in react_result.steps
+                ],
+            })
+        # ── End ReAct Loop ──────────────────────────────────────────────────
 
         # Phase 3: Force KNOWLEDGE routing for how/why/fix queries
         if force_knowledge_routing(query):
