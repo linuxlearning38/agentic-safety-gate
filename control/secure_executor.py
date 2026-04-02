@@ -202,6 +202,7 @@ def execute_command_secure(cmd: str, query: str) -> dict:
         )
 
     # Step 5: LOW risk — whitelist check + safety validation + execute
+    # Note: trivy/lynis are native tools — they never reach secure_executor
     if risk == "low":
         if not is_approved(cmd):
             return _queue_for_approval(

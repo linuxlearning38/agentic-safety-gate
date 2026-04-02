@@ -381,6 +381,22 @@ class ToolRegistry:
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
+    def register_native(self, name: str, handler, description: str,
+                        args: dict, risk_level: str = "low",
+                        requires_approval: bool = False,
+                        available: bool = True):
+        """Register a Python callable as a tool (not a shell command). Day 8."""
+        self._tools[name] = type("Tool", (), {
+            "name":              name,
+            "description":       description,
+            "args":              args,
+            "risk_level":        risk_level,
+            "type":              "native",
+            "handler":           handler,
+            "requires_approval": requires_approval,
+            "available":         available,
+        })()
+
     def execute(self, name: str, input_args: Dict) -> Dict:
         """
         Execute a registered tool.
@@ -397,6 +413,23 @@ class ToolRegistry:
             }
         """
         tool = self._tools.get(name)
+        # Day 8: native tool dispatch (Python callable, not shell)
+        if tool and getattr(tool, "type", None) == "native":
+            handler = getattr(tool, "handler", None)
+            if not callable(handler):
+                return {"status": "error", "error": f"Tool '{name}' has no callable handler", "tool_name": name}
+            if not getattr(tool, "available", True):
+                return {"status": "error", "error": f"Tool '{name}' unavailable (binary not installed)", "tool_name": name}
+            try:
+                result = handler(**input_args) if input_args else handler()
+                if isinstance(result, dict):
+                    result["tool_name"] = name
+                return result
+            except TypeError as e:
+                return {"status": "error", "error": f"Tool '{name}' argument error: {e}", "tool_name": name}
+            except Exception as e:
+                return {"status": "error", "error": f"Tool '{name}' error: {e}", "tool_name": name}
+
 
         if not tool:
             return {
