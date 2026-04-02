@@ -19,8 +19,11 @@ from control.secure_executor import execute_command_secure, execute_approved_com
 from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
-from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
+from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt, decode_token
 from control.auth import init_jwt, verify_credentials, require_admin, make_token
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_limiter.errors import RateLimitExceeded
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -31,6 +34,41 @@ CORS(app)
 
 # ── Day 5: JWT Authentication ─────────────────────────────────────────────────
 jwt_manager = init_jwt(app)
+
+# ── Day 6: Rate Limiting ──────────────────────────────────────────────────────
+def _rate_limit_key() -> str:
+    """
+    Rate limit key function.
+    Authenticated requests: keyed by JWT username → per-user limits.
+    Unauthenticated requests: keyed by IP address → brute force protection.
+    """
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        try:
+            decoded = decode_token(auth[7:], allow_expired=False)
+            return f"user:{decoded.get('sub', 'unknown')}"
+        except Exception:
+            pass
+    return f"ip:{get_remote_address()}"
+
+def _on_rate_limit_breach(limit):
+    key = _rate_limit_key()
+    logger.warning(
+        f"[RateLimit] BREACH: key='{key}' "
+        f"limit='{limit.limit}' "
+        f"endpoint='{request.endpoint}' "
+        f"path='{request.path}'"
+    )
+
+limiter = Limiter(
+    app=app,
+    key_func=_rate_limit_key,
+    default_limits=["30 per minute"],
+    storage_uri="memory://",
+    headers_enabled=True,
+    swallow_errors=True,
+)
+logger.info("[RateLimit] Flask-Limiter initialised — default: 30 req/min per user")
 
 # Configuration
 CHROMA_PATH = "/mnt/i/ai-lab/chromadb"
@@ -379,6 +417,7 @@ def generate_response(query, context):
 # ── Auth Endpoints ────────────────────────────────────────────────────────────
 
 @app.route('/auth/login', methods=['POST'])
+@limiter.limit("10 per minute", key_func=get_remote_address)
 def auth_login():
     """
     POST /auth/login
@@ -643,6 +682,7 @@ I'm here to help with your DevOps journey - ask me anything!"""
 
 @app.route('/ask', methods=['POST'])
 @jwt_required()
+@limiter.limit("20 per minute")
 def ask():
     start_time = time.time()
     try:
@@ -1070,6 +1110,7 @@ def get_stats():
 
 @app.route('/execute_approved', methods=['POST'])
 @require_admin
+@limiter.limit("10 per minute")
 def execute_approved_route():
     """
     Execute a command that was previously queued for approval.
@@ -1130,6 +1171,7 @@ def list_tools_route():
 
 @app.route('/tools/<tool_name>/run', methods=['POST'])
 @require_admin
+@limiter.limit("10 per minute")
 def run_tool_route(tool_name):
     """
     Directly run a LOW risk tool from the UI.
@@ -1169,6 +1211,7 @@ def run_tool_route(tool_name):
 
 @app.route('/react/run', methods=['POST'])
 @require_admin
+@limiter.limit("5 per minute")
 def react_run_route():
     """
     Directly trigger the ReAct loop for a query.
@@ -1210,6 +1253,36 @@ def react_run_route():
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/rate-limit/status', methods=['GET'])
+@jwt_required()
+def rate_limit_status():
+    """
+    GET /rate-limit/status
+    Shows current rate limit config for the authenticated user.
+    Useful for debugging and monitoring.
+    """
+    identity = get_jwt_identity()
+    claims   = get_jwt()
+    role     = claims.get("role", "unknown")
+
+    limits = {
+        "user":    identity,
+        "role":    role,
+        "limits":  {
+            "default":           "30 per minute",
+            "/ask":              "20 per minute",
+            "/tools/<n>/run":    "10 per minute",
+            "/execute_approved": "10 per minute",
+            "/react/run":        "5 per minute",
+            "/auth/login":       "10 per minute (per IP, unauthenticated)",
+        },
+        "storage": "in-memory (resets on restart)",
+        "headers": "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset",
+        "note":    "Rate limits are per-user for authenticated endpoints, per-IP for login.",
+    }
+    return jsonify(limits)
+
+
 @app.errorhandler(404)
 def not_found(e):
     return jsonify({'error': 'Endpoint not found'}), 404
@@ -1217,6 +1290,21 @@ def not_found(e):
 @app.errorhandler(500)
 def internal_error(e):
     return jsonify({'error': 'Internal server error'}), 500
+
+@app.errorhandler(429)
+def rate_limit_exceeded_handler(e):
+    """Return JSON on 429 — not Flask default HTML."""
+    retry_after = 60
+    try:
+        retry_after = int(e.retry_after)
+    except Exception:
+        pass
+    logger.warning(f"[RateLimit] 429: path={request.path} key={_rate_limit_key()}")
+    return jsonify({
+        "error":               "Rate limit exceeded. Slow down.",
+        "code":                "rate_limit_exceeded",
+        "retry_after_seconds": retry_after,
+    }), 429
 
 
 @app.route('/security/stats', methods=['GET'])
