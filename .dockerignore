@@ -1,0 +1,53 @@
+# Secrets — never in image
+.env
+certs/
+
+# ChromaDB data — mounted as volume, not baked in
+chromadb/
+
+# Runtime data files — mounted as volumes
+query_history.json
+ava_memory.json
+
+# Log files
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment — image uses its own pip install
+venv/
+.venv/
+env/
+
+# Backup files created by patch scripts
+*.bak_*
+
+# Test and patch scripts — not needed in image
+test_*.py
+patch_*.py
+
+# Git
+.git/
+.gitignore
+
+# Reports
+reports/
+
+# Day build logs
+PHASE*.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

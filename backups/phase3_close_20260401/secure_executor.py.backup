@@ -1,0 +1,189 @@
+# control/secure_executor.py
+# Integration of Phase 1 Control System + Security Layer
+
+from control.registry import is_approved, add_to_whitelist
+from control.approval import add_request, update_status
+from control.logger import log as execution_log
+from control.security_layer import (
+    analyze_command_security,
+    security_audit_log,
+    validate_command_safety
+)
+import subprocess
+
+def execute_command_secure(cmd, query):
+    """
+    Execute command with full security controls
+    
+    Flow:
+    1. Security analysis
+    2. Check whitelist
+    3. Validate safety
+    4. Execute or queue for approval
+    5. Log everything
+    """
+    
+    # Step 1: Analyze security
+    security_analysis = analyze_command_security(cmd, query)
+    
+    risk = security_analysis["risk_analysis"]["risk"]
+    threats = security_analysis["threats"]
+    recommendation = security_analysis["recommendation"]
+    
+    # Step 2: Check if command is blocked
+    if recommendation == "block":
+        security_audit_log(
+            event_type="blocked",
+            cmd=cmd,
+            query=query,
+            risk_analysis=security_analysis["risk_analysis"],
+            threats=threats,
+            decision="blocked_by_policy"
+        )
+        
+        return {
+            "status": "blocked",
+            "reason": security_analysis["reason"],
+            "risk": risk,
+            "threats": threats
+        }
+    
+    # Step 3: Check whitelist (auto-approve if safe)
+    if is_approved(cmd) and risk == "low":
+        # Final safety check
+        is_safe, safety_reason = validate_command_safety(cmd)
+        
+        if not is_safe:
+            security_audit_log(
+                event_type="blocked",
+                cmd=cmd,
+                query=query,
+                risk_analysis=security_analysis["risk_analysis"],
+                threats=threats,
+                decision="failed_safety_check"
+            )
+            
+            return {
+                "status": "blocked",
+                "reason": safety_reason,
+                "risk": risk
+            }
+        
+        # Execute approved command
+        try:
+            result = subprocess.run(
+                cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            output = {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode
+            }
+            
+            # Log execution
+            execution_log(query, cmd, output)
+            security_audit_log(
+                event_type="executed",
+                cmd=cmd,
+                query=query,
+                risk_analysis=security_analysis["risk_analysis"],
+                threats=threats,
+                decision="auto_approved_whitelist"
+            )
+            
+            return {
+                "status": "executed",
+                "command": cmd,
+                "output": output,
+                "risk": risk,
+                "threats": threats
+            }
+            
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "command": cmd
+            }
+    
+    # Step 4: Require approval
+    approval_id = add_request(cmd, query)
+    
+    security_audit_log(
+        event_type="queued_for_approval",
+        cmd=cmd,
+        query=query,
+        risk_analysis=security_analysis["risk_analysis"],
+        threats=threats,
+        decision="pending_manual_review"
+    )
+    
+    return {
+        "status": "approval_required",
+        "approval_id": approval_id,
+        "command": cmd,
+        "risk": risk,
+        "blast_radius": security_analysis["risk_analysis"]["blast_radius"],
+        "threats": threats,
+        "reason": security_analysis["reason"],
+        "message": f"Command requires approval (Risk: {risk}, Threats: {len(threats)})"
+    }
+
+
+def execute_approved_command(approval_id):
+    """
+    Execute a command after manual approval
+    """
+    from control.approval import load_queue
+    
+    queue = load_queue()
+    entry = next((e for e in queue if e["id"] == approval_id), None)
+    
+    if not entry:
+        return {"status": "error", "error": "Approval ID not found"}
+    
+    if entry["status"] != "approved":
+        return {"status": "error", "error": "Command not approved"}
+    
+    cmd = entry["command"]
+    query = entry["query"]
+    
+    # Execute with logging
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        output = {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode
+        }
+        
+        # Log
+        execution_log(query, cmd, output)
+        
+        # Mark as executed
+        update_status(approval_id, "executed")
+        
+        return {
+            "status": "executed",
+            "command": cmd,
+            "output": output
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "command": cmd
+        }

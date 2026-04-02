@@ -1,4 +1,3 @@
-version: "3.9"
 
 services:
 
@@ -44,3 +43,57 @@ services:
       - IPC_LOCK
     restart: unless-stopped
 
+  ava:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ava-agent:latest
+    container_name: ava-agent
+    ports:
+      - "5443:5443"
+
+    volumes:
+      - ./certs:/app/certs:ro
+      - /mnt/i/ai-lab/chromadb:/data/chromadb
+      - /mnt/i/ai-lab/logs:/data/logs
+      - /mnt/i/ai-lab/projects/devops-agent/query_history.json:/data/history/query_history.json
+      - /mnt/i/ai-lab/ava_memory.json:/data/ava_memory.json
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    env_file:
+      - .env
+
+    environment:
+      CHROMA_PATH:         /data/chromadb
+      HISTORY_FILE:        /data/history/query_history.json
+      MEMORY_PATH:         /data/ava_memory.json
+      GUNICORN_ACCESS_LOG: /data/logs/ava_access.log
+      GUNICORN_ERROR_LOG:  /data/logs/ava_error.log
+      OLLAMA_HOST:         http://host.docker.internal:11434
+      FLASK_ENV:           production
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    depends_on:
+      - redis
+      - postgres
+
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - |
+          import urllib.request, ssl
+          ctx = ssl.create_default_context()
+          ctx.check_hostname = False
+          ctx.verify_mode = ssl.CERT_NONE
+          urllib.request.urlopen('https://localhost:5443/health', context=ctx, timeout=5)
+      interval: 30s
+      timeout: 10s
+      start_period: 25s
+      retries: 3
+
+    user: "0:0"
+    restart: unless-stopped

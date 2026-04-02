@@ -19,3 +19,4 @@ devops_agent.py
 devops_shell_agent.py
 query_ollama.py
 update_ui.py
+users.json

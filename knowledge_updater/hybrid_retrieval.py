@@ -44,8 +44,10 @@ class RetrievedChunk:
             return f"[Blog] {self.metadata.get('source', 'Unknown')} — {self.metadata.get('title', '')[:50]}"
 
 
+import os
 class EmbeddingClient:
     def __init__(self, ollama_url: str, model: str):
+        ollama_url = os.getenv("OLLAMA_HOST", ollama_url)
         self.url = f"{ollama_url}/api/embeddings"
         self.model = model
 

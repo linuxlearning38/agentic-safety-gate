@@ -81,7 +81,7 @@ limiter = Limiter(
 logger.info("[RateLimit] Flask-Limiter initialised — default: 30 req/min per user")
 
 # Configuration
-CHROMA_PATH = "/mnt/i/ai-lab/chromadb"
+CHROMA_PATH = os.getenv("CHROMA_PATH", "/mnt/i/ai-lab/chromadb")
 COLLECTION_NAME = "devops_policies_v2"
 HISTORY_FILE = "/mnt/i/ai-lab/projects/devops-agent/query_history.json"
 LLM_MODEL = "qwen2.5:14b"
@@ -3268,4 +3268,5 @@ def route_scan_lynis():
             logger.warning(f"[Scan] Auto-report failed: {_e}")
     return jsonify(result)
 
-app.run(host="0.0.0.0", port=5002, debug=False)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5002, debug=False)
