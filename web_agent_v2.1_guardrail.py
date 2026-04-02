@@ -15,7 +15,8 @@ import json
 import time
 import logging
 from datetime import datetime
-from control.secure_executor import execute_command_secure
+from control.secure_executor import execute_command_secure, execute_approved_command
+from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
 
@@ -1005,6 +1006,144 @@ def get_history():
 @app.route('/stats', methods=['GET'])
 def get_stats():
     return jsonify(STATS)
+
+@app.route('/execute_approved', methods=['POST'])
+def execute_approved_route():
+    """
+    Execute a command that was previously queued for approval.
+    Called from the UI approval panel.
+
+    Body: {"approval_id": "abc123"}
+    """
+    try:
+        data        = request.json
+        approval_id = data.get('approval_id', '').strip()
+
+        if not approval_id:
+            return jsonify({'error': 'approval_id is required'}), 400
+
+        logger.info(f"[Approval] Executing approved command: {approval_id}")
+        result = execute_approved_command(approval_id)
+
+        if result.get('status') == 'executed':
+            return jsonify({
+                'status':  'executed',
+                'command': result.get('command', ''),
+                'output':  result.get('output', {}),
+            })
+        else:
+            return jsonify({
+                'status': 'error',
+                'error':  result.get('error', 'Unknown error'),
+            }), 400
+
+    except Exception as e:
+        logger.error(f"Error in execute_approved: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/tools', methods=['GET'])
+def list_tools_route():
+    """
+    List all registered tools with their risk levels and descriptions.
+    Used by the UI to display available tools.
+    """
+    try:
+        tools = tool_registry.list_tools()
+        by_risk = {
+            'low':    [t for t in tools if t['risk_level'] == 'low'],
+            'medium': [t for t in tools if t['risk_level'] == 'medium'],
+            'high':   [t for t in tools if t['risk_level'] == 'high'],
+        }
+        return jsonify({
+            'total': len(tools),
+            'by_risk': by_risk,
+            'tools': tools,
+        })
+    except Exception as e:
+        logger.error(f"Error listing tools: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/tools/<tool_name>/run', methods=['POST'])
+def run_tool_route(tool_name):
+    """
+    Directly run a LOW risk tool from the UI.
+    Medium/high risk tools go through the approval workflow.
+
+    Body: {"args": {"namespace": "default", ...}}
+    """
+    try:
+        data      = request.json or {}
+        tool_args = data.get('args', {})
+
+        tool = tool_registry.get_tool(tool_name)
+        if not tool:
+            return jsonify({'error': f"Tool '{tool_name}' not found"}), 404
+
+        if tool.risk_level != 'low':
+            return jsonify({
+                'error':      f"Tool '{tool_name}' is {tool.risk_level} risk",
+                'message':    'Use /ask to run medium/high risk tools through the approval workflow',
+                'risk_level': tool.risk_level,
+            }), 403
+
+        logger.info(f"[Tool] Direct run: {tool_name}({tool_args})")
+        result = tool_registry.execute(tool_name, tool_args)
+
+        return jsonify({
+            'tool':    tool_name,
+            'status':  result.get('status'),
+            'output':  result.get('output', ''),
+            'error':   result.get('error', ''),
+        })
+
+    except Exception as e:
+        logger.error(f"Error running tool {tool_name}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/react/run', methods=['POST'])
+def react_run_route():
+    """
+    Directly trigger the ReAct loop for a query.
+    Returns full trace including all iterations.
+
+    Body: {"query": "my nginx pod is slow"}
+    """
+    try:
+        data  = request.json
+        query = data.get('query', '').strip()
+
+        if not query:
+            return jsonify({'error': 'query is required'}), 400
+
+        logger.info(f"[ReAct Direct] Query: {query}")
+        react_result = react_loop.run(query)
+
+        return jsonify({
+            'query':        query,
+            'final_answer': react_result.final_answer,
+            'iterations':   react_result.iterations,
+            'stopped':      react_result.stopped_reason,
+            'success':      react_result.success,
+            'trace': [
+                {
+                    'iteration':    s.iteration,
+                    'thought':      s.thought,
+                    'action':       s.action,
+                    'action_input': s.action_input,
+                    'observation':  s.observation,
+                    'final_answer': s.final_answer,
+                }
+                for s in react_result.steps
+            ],
+        })
+
+    except Exception as e:
+        logger.error(f"Error in react_run: {e}")
+        return jsonify({'error': str(e)}), 500
+
 
 @app.errorhandler(404)
 def not_found(e):
