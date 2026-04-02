@@ -19,6 +19,7 @@ from control.secure_executor import execute_command_secure, execute_approved_com
 from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
+from control import vuln_scanner          # Day 8 — Trivy + Lynis
 from control.incident_reporter import (
     report_tool_execution,
     report_graph_execution,
@@ -3208,7 +3209,63 @@ if __name__ == '__main__':
     logger.info("=" * 50)
     logger.info("AVA - DevOps AI Agent v2.1.2")
     logger.info(f"Knowledge Base: {STATS['total_chunks']} chunks")
+
+    # Day 8: Register vulnerability scanner tools
+    for _vt in vuln_scanner.get_tool_descriptions():
+        tool_registry.register_native(
+            name=_vt["name"],
+            handler=_vt["handler"],
+            description=_vt["description"],
+            args=_vt["args"],
+            risk_level=_vt["risk_level"],
+            requires_approval=_vt["requires_approval"],
+            available=_vt["available"],
+        )
+    _vt_avail = vuln_scanner.check_tools()
+    logger.info(f"[VulnScanner] Trivy={_vt_avail['trivy']} Lynis={_vt_avail['lynis']}")
     logger.info(f"Model: {STATS['model']}")
     logger.info("=" * 50)
     
-    app.run(host='0.0.0.0', port=5002, debug=False)
+
+# ═══════════════════════════ SCAN ROUTES (Day 8) ════════════════════
+
+@app.route("/scan/check", methods=["GET"])
+@jwt_required()
+def route_scan_check():
+    return jsonify({"tools": vuln_scanner.check_tools(), "install": {"trivy": "curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin", "lynis": "sudo apt install lynis"}})
+
+
+@app.route("/scan/trivy", methods=["POST"])
+@require_admin
+@limiter.limit("5 per minute")
+def route_scan_trivy():
+    from flask_jwt_extended import get_jwt_identity
+    body = request.get_json(silent=True) or {}
+    image = body.get("image", "").strip()
+    if not image:
+        return jsonify({"error": "Missing image field"}), 400
+    user = get_jwt_identity()
+    result = vuln_scanner.scan_trivy(image)
+    if result.get("status") == "success" and result.get("risk_level") in ("critical", "high"):
+        try:
+            report_tool_execution(tool_name="trivy_scan", tool_args={"image": image}, result=result, triggered_by=user, ip_address=request.remote_addr, duration=0)
+        except Exception as _e:
+            logger.warning(f"[Scan] Auto-report failed: {_e}")
+    return jsonify(result)
+
+
+@app.route("/scan/lynis", methods=["POST"])
+@require_admin
+@limiter.limit("2 per minute")
+def route_scan_lynis():
+    from flask_jwt_extended import get_jwt_identity
+    user = get_jwt_identity()
+    result = vuln_scanner.scan_lynis()
+    if result.get("status") == "success" and result.get("risk_level") in ("critical", "high"):
+        try:
+            report_tool_execution(tool_name="lynis_audit", tool_args={}, result=result, triggered_by=user, ip_address=request.remote_addr, duration=0)
+        except Exception as _e:
+            logger.warning(f"[Scan] Auto-report failed: {_e}")
+    return jsonify(result)
+
+app.run(host="0.0.0.0", port=5002, debug=False)
