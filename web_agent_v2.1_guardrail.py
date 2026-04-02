@@ -19,6 +19,8 @@ from control.secure_executor import execute_command_secure, execute_approved_com
 from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
+from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
+from control.auth import init_jwt, verify_credentials, require_admin, make_token
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
+
+# ── Day 5: JWT Authentication ─────────────────────────────────────────────────
+jwt_manager = init_jwt(app)
 
 # Configuration
 CHROMA_PATH = "/mnt/i/ai-lab/chromadb"
@@ -371,6 +376,59 @@ def generate_response(query, context):
         return f"Error generating response: {str(e)}"
 
 # Routes
+# ── Auth Endpoints ────────────────────────────────────────────────────────────
+
+@app.route('/auth/login', methods=['POST'])
+def auth_login():
+    """
+    POST /auth/login
+    Body: {"username": "admin", "password": "<YOUR_ADMIN_PASSWORD>"}
+    Returns: {"access_token": "...", "username": "...", "role": "...", "expires_in": 86400}
+    """
+    try:
+        data     = request.json or {}
+        username = data.get("username", "").strip()
+        password = data.get("password", "")
+
+        if not username or not password:
+            return jsonify({"error": "username and password are required"}), 400
+
+        user = verify_credentials(username, password)
+        if not user:
+            return jsonify({"error": "Invalid credentials"}), 401
+
+        token = make_token(user["username"], user["role"])
+        logger.info(f"[Auth] Token issued: user='{user['username']}' role='{user['role']}'")
+
+        return jsonify({
+            "access_token": token,
+            "token_type":   "Bearer",
+            "username":     user["username"],
+            "role":         user["role"],
+            "expires_in":   86400,   # 24h in seconds
+        })
+
+    except Exception as e:
+        logger.error(f"[Auth] Login error: {e}")
+        return jsonify({"error": "Login failed"}), 500
+
+
+@app.route('/auth/me', methods=['GET'])
+@jwt_required()
+def auth_me():
+    """
+    GET /auth/me
+    Returns current user info from JWT claims.
+    Useful for frontend to verify token and get role.
+    """
+    identity = get_jwt_identity()
+    claims   = get_jwt()
+    return jsonify({
+        "username": identity,
+        "role":     claims.get("role", "unknown"),
+    })
+
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -584,6 +642,7 @@ def get_ava_introduction():
 I'm here to help with your DevOps journey - ask me anything!"""
 
 @app.route('/ask', methods=['POST'])
+@jwt_required()
 def ask():
     start_time = time.time()
     try:
@@ -916,6 +975,7 @@ def ask():
         return jsonify({'error': 'Failed to process query', 'details': str(e)}), 500
 
 @app.route('/upload', methods=['POST'])
+@require_admin
 def upload_file():
     start_time = time.time()
     try:
@@ -996,6 +1056,7 @@ File content:
         return jsonify({'error': 'Failed to analyze file', 'details': str(e)}), 500
 
 @app.route('/history', methods=['GET'])
+@jwt_required()
 def get_history():
     try:
         history = load_history()
@@ -1008,6 +1069,7 @@ def get_stats():
     return jsonify(STATS)
 
 @app.route('/execute_approved', methods=['POST'])
+@require_admin
 def execute_approved_route():
     """
     Execute a command that was previously queued for approval.
@@ -1043,6 +1105,7 @@ def execute_approved_route():
 
 
 @app.route('/tools', methods=['GET'])
+@jwt_required()
 def list_tools_route():
     """
     List all registered tools with their risk levels and descriptions.
@@ -1066,6 +1129,7 @@ def list_tools_route():
 
 
 @app.route('/tools/<tool_name>/run', methods=['POST'])
+@require_admin
 def run_tool_route(tool_name):
     """
     Directly run a LOW risk tool from the UI.
@@ -1104,6 +1168,7 @@ def run_tool_route(tool_name):
 
 
 @app.route('/react/run', methods=['POST'])
+@require_admin
 def react_run_route():
     """
     Directly trigger the ReAct loop for a query.
@@ -1876,6 +1941,36 @@ HTML_TEMPLATE = r'''
     <script>mermaid.initialize({ startOnLoad: false, theme: 'dark' });</script>
 </head>
 <body>
+
+    < Day 5: Login Overlay -->
+    <div id="loginOverlay" style="display:flex;position:fixed;inset:0;background:rgba(10,10,20,0.97);z-index:9999;align-items:center;justify-content:center;font-family:Inter,sans-serif;">
+        <div style="background:#12121f;border:1px solid #2a2a4a;border-radius:16px;padding:40px 48px;width:380px;box-shadow:0 24px 60px rgba(0,0,0,0.8);">
+            <div style="text-align:center;margin-bottom:32px;">
+                <div style="font-size:36px;margin-bottom:8px;">🤖</div>
+                <div style="font-size:22px;font-weight:700;color:#e0e0e0;">AVA</div>
+                <div style="font-size:13px;color:#667eea;margin-top:4px;">DevOps AI Agent — Secure Login</div>
+            </div>
+            <div style="margin-bottom:16px;">
+                <label style="display:block;font-size:12px;color:#888;margin-bottom:6px;text-transform:uppercase;">Username</label>
+                <input id="loginUsername" type="text" placeholder="admin"
+                    style="width:100%;box-sizing:border-box;padding:10px 14px;background:#1a1a2e;border:1px solid #2a2a4a;border-radius:8px;color:#e0e0e0;font-size:14px;outline:none;"
+                    onkeydown="if(event.key==='Enter') loginSubmit()">
+            </div>
+            <div style="margin-bottom:24px;">
+                <label style="display:block;font-size:12px;color:#888;margin-bottom:6px;text-transform:uppercase;">Password</label>
+                <input id="loginPassword" type="password" placeholder="••••••••"
+                    style="width:100%;box-sizing:border-box;padding:10px 14px;background:#1a1a2e;border:1px solid #2a2a4a;border-radius:8px;color:#e0e0e0;font-size:14px;outline:none;"
+                    onkeydown="if(event.key==='Enter') loginSubmit()">
+            </div>
+            <div id="loginError" style="display:none;color:#ff6b6b;font-size:13px;margin-bottom:16px;text-align:center;"></div>
+            <button onclick="loginSubmit()" id="loginBtn" style="width:100%;padding:12px;background:linear-gradient(135deg,#667eea,#764ba2);border:none;border-radius:8px;color:white;font-size:15px;font-weight:600;cursor:pointer;">
+                Sign In
+            </button>
+            <div style="text-align:center;margin-top:20px;font-size:11px;color:#444;">Tokens expire after 24 hours</div>
+        </div>
+    </div>
+    < End Login Overlay -->
+
     <div class="app-container">
         <!-- Sidebar -->
         <div class="sidebar">
@@ -2038,7 +2133,148 @@ HTML_TEMPLATE = r'''
     </div>
     
     <script>
-        console.log('AVA v2.1.2 - Script loading...');
+        // ── Day 5: Auth State + JWT Handling ──────────────────────────────────
+        const AVA_TOKEN_KEY = 'ava_jwt_token';
+
+        function getToken() {
+            return localStorage.getItem(AVA_TOKEN_KEY);
+        }
+
+        function setToken(token) {
+            localStorage.setItem(AVA_TOKEN_KEY, token);
+        }
+
+        function clearToken() {
+            localStorage.removeItem(AVA_TOKEN_KEY);
+        }
+
+        function showLoginOverlay(errorMsg) {
+            document.getElementById('loginOverlay').style.display = 'flex';
+            if (errorMsg) {
+                const err = document.getElementById('loginError');
+                err.textContent = errorMsg;
+                err.style.display = 'block';
+            }
+            document.getElementById('loginUsername').focus();
+        }
+
+        function hideLoginOverlay() {
+            document.getElementById('loginOverlay').style.display = 'none';
+        }
+
+        async function loginSubmit() {
+            const username = document.getElementById('loginUsername').value.trim();
+            const password = document.getElementById('loginPassword').value;
+            const btn      = document.getElementById('loginBtn');
+            const err      = document.getElementById('loginError');
+
+            if (!username || !password) {
+                err.textContent = 'Username and password are required.';
+                err.style.display = 'block';
+                return;
+            }
+
+            btn.disabled    = true;
+            btn.textContent = 'Signing in…';
+            err.style.display = 'none';
+
+            try {
+                const resp = await window._fetchNoAuth('/auth/login', {
+                    method:  'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body:    JSON.stringify({ username, password })
+                });
+
+                const data = await resp.json();
+
+                if (resp.ok) {
+                    setToken(data.access_token);
+                    window._avaRole = data.role;
+                    window._avaUser = data.username;
+                    hideLoginOverlay();
+                    document.getElementById('loginPassword').value = '';
+                    applyRoleUI(data.role);
+                } else {
+                    err.textContent = data.error || 'Login failed.';
+                    err.style.display = 'block';
+                    document.getElementById('loginPassword').value = '';
+                }
+            } catch (e) {
+                err.textContent = 'Network error — is AVA running?';
+                err.style.display = 'block';
+            } finally {
+                btn.disabled    = false;
+                btn.textContent = 'Sign In';
+            }
+        }
+
+        function logoutAva() {
+            clearToken();
+            window._avaRole = null;
+            window._avaUser = null;
+            showLoginOverlay();
+        }
+
+        function applyRoleUI(role) {
+            // Disable execution buttons for readonly users
+            if (role === 'readonly') {
+                document.querySelectorAll('.admin-only').forEach(el => {
+                    el.style.opacity = '0.4';
+                    el.style.pointerEvents = 'none';
+                    el.title = 'Admin access required';
+                });
+            }
+        }
+
+        // Global fetch interceptor — auto-attach Bearer token to every request
+        window._fetchNoAuth = window.fetch.bind(window);   // keep raw fetch for login
+        window.fetch = function(url, options = {}) {
+            const token = getToken();
+            if (token) {
+                options.headers = Object.assign(
+                    { 'Authorization': 'Bearer ' + token },
+                    options.headers || {}
+                );
+            }
+            return window._fetchNoAuth(url, options).then(resp => {
+                if (resp.status === 401) {
+                    clearToken();
+                    showLoginOverlay('Session expired. Please log in again.');
+                    return Promise.reject(new Error('Unauthorized'));
+                }
+                return resp;
+            });
+        };
+
+        // On page load — verify stored token or show login
+        (async function checkAuth() {
+            const token = getToken();
+            if (!token) {
+                showLoginOverlay();
+                return;
+            }
+            try {
+                const resp = await window._fetchNoAuth('/auth/me', {
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                if (resp.ok) {
+                    const data = await resp.json();
+                    window._avaRole = data.role;
+                    window._avaUser = data.username;
+                    hideLoginOverlay();
+                    applyRoleUI(data.role);
+                } else {
+                    clearToken();
+                    showLoginOverlay();
+                }
+            } catch {
+                showLoginOverlay();
+            }
+        })();
+        // ── End Auth ──────────────────────────────────────────────────────────
+
+        // Global state
+        let currentApprovalId = null;
         console.log('PORT 5002 - FRESH CACHE');
         
         // Global error handler
