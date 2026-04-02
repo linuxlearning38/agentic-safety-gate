@@ -1,3 +1,4 @@
+import os
 # gunicorn.conf.py
 # AVA Phase 4 Day 9 — Production WSGI config
 
@@ -18,8 +19,8 @@ timeout         = 300             # 5 min — ReAct loops can take 2-3 min
 keepalive       = 5
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-accesslog       = "/mnt/i/ai-lab/logs/ava_access.log"
-errorlog        = "/mnt/i/ai-lab/logs/ava_error.log"
+accesslog       = os.getenv("GUNICORN_ACCESS_LOG", "/mnt/i/ai-lab/logs/ava_access.log")
+errorlog        = os.getenv("GUNICORN_ERROR_LOG",  "/mnt/i/ai-lab/logs/ava_error.log")
 loglevel        = "info"
 access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s %(D)sμs'
 

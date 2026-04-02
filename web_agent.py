@@ -1,422 +1,900 @@
-from flask import Flask, request, jsonify
-import ollama
+#!/usr/bin/env python3
+"""
+AVA - DevOps AI Agent
+Local DevOps assistant with RAG, OPA security, and command execution
+"""
+
+from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
 import chromadb
+import ollama
 import subprocess
-import logging
 import os
+import json
+import time
+import logging
 from datetime import datetime
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
+CORS(app)
 
-# Audit logger
-os.makedirs("/mnt/i/ai-lab/logs", exist_ok=True)
-audit_logger = logging.getLogger("audit")
-audit_logger.setLevel(logging.INFO)
-fh = logging.FileHandler("/mnt/i/ai-lab/logs/agent_audit.log")
-fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
-audit_logger.addHandler(fh)
+# Configuration
+CHROMA_PATH = "/mnt/i/ai-lab/chromadb"
+COLLECTION_NAME = "devops_policies_v2"
+HISTORY_FILE = "/mnt/i/ai-lab/projects/devops-agent/query_history.json"
+LLM_MODEL = "qwen2.5:14b"
+EMBED_MODEL = "nomic-embed-text"
 
-def audit(action, detail=""):
-    audit_logger.info(f"{action} | {detail}")
+# Initialize ChromaDB
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+collection = chroma_client.get_collection(COLLECTION_NAME)
 
-chroma = chromadb.PersistentClient(path="/mnt/i/ai-lab/chromadb")
-collection = chroma.get_or_create_collection("devops_policies_v2")
-
+# Command whitelist (OPA-style safety)
 ALLOWED_COMMANDS = [
-    "docker", "kubectl", "cat", "ls", "find",
-    "systemctl", "df", "free", "uname", "whoami",
-    "ollama", "python3", "opa", "grep", "nproc",
-    "ps", "which", "echo", "pwd", "date", "uptime", "lscpu"
+    'date', 'whoami', 'pwd', 'ls', 'cat', 'grep', 'df', 'free',
+    'ps', 'top', 'uptime', 'uname', 'echo', 'head', 'tail',
+    'wc', 'find', 'which', 'hostname'
 ]
 
-conversation_history = []
-token_stats = {"prompt": 0, "completion": 0}
-
-
-def clean(command):
-    return command.strip().strip('`').strip('"').strip("'")
-
-
-def is_safe(command):
-    first_word = clean(command).split()[0]
-    return first_word in ALLOWED_COMMANDS
-
-
-# Sensitive paths that should never be read
 BLOCKED_PATHS = [
-    "/etc/shadow", "/etc/passwd", "/etc/sudoers",
-    "/.ssh/", "id_rsa", "id_ed25519", ".env",
-    "/root/", "authorized_keys", ".aws/credentials",
-    "/etc/ssl", "private_key", ".pem", ".key"
+    '/etc/passwd', '/etc/shadow', '/root', '~/.ssh',
+    '/var/log', '/proc', '/sys'
 ]
 
-def run_shell(command):
-    command = clean(command)
-    if not is_safe(command):
-        return "Command not allowed: " + command
-    # Block sensitive paths
-    if any(p in command for p in BLOCKED_PATHS):
-        return "Access denied: sensitive path blocked."
-    try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=15)
-        output = result.stdout or result.stderr
-        # Filter to show only real Linux partitions
-        if command.strip().startswith("df"):
-            lines = output.split("\n")
-            allowed = []
-            for l in lines:
-                if l.startswith("Filesystem"):
-                    allowed.append(l)
-                elif l.startswith("/dev/"):
-                    allowed.append(l)
-            output = "\n".join(allowed)
-        return output.strip() or "Done with no output."
-    except subprocess.TimeoutExpired:
-        return "Timed out."
-    except Exception as e:
-        return "Error: " + str(e)
-
-
-def get_context(question):
-    base = collection.get(ids=["infrastructure.rego_chunk_0"])
-    base_doc = base["documents"][0] if base["documents"] else ""
-    q_embed = ollama.embeddings(model="nomic-embed-text", prompt=question)
-    results = collection.query(query_embeddings=[q_embed["embedding"]], n_results=8)
-    semantic_docs = results["documents"][0]
-    all_docs = [base_doc] + [d for d in semantic_docs if d != base_doc]
-    return "\n\n---\n\n".join(all_docs)
-
-
-def ask(question):
-    global conversation_history, token_stats
-    steps = []
-
-    steps.append("🔍 Searching knowledge base...")
-    audit("QUESTION", question)
-    context = get_context(question)
-    system_prompt = (
-        "You are a DevOps and Infrastructure AI assistant with a large knowledge base.\n\n"
-        "You answer questions about Kubernetes, Docker, CI/CD, Jenkins, GitHub Actions,\n"
-        "ArgoCD, Terraform, Ansible, AWS, Azure, GCP, Linux, DevSecOps, OPA, Git,\n"
-        "monitoring, logging, and ANY application deployment project.\n\n"
-        "IMPORTANT: Questions about deploying ANY app (Netflix clone, Zomato, Reddit,\n"
-        "games, e-commerce, or any app on Kubernetes/Docker/Jenkins/AWS) ARE valid\n"
-        "DevOps questions - always answer them fully using the knowledge base.\n\n"
-        "Only decline questions completely unrelated to technology like medical advice,\n"
-        "personal finance, or general life questions. In that case respond with exactly:\n"
-        "This assistant only answers DevOps and infrastructure questions.\n\n"
-        "KNOWLEDGE BASE CONTEXT (use this to answer questions):\n" + context + "\n\n"
-        "RULES:\n"
-        "- For policy, config, or scenario questions: answer directly from the POLICY CONTEXT above\n"
-        "- For system questions (disk, processes, files): use COMMAND:\n"
-        "- NEVER use curl or wget\n"
-        "- ollama runs natively on this machine, NEVER use docker exec for it, just run: ollama list directly\n"
-        "- For disk/storage queries ONLY show Linux partitions, NEVER Windows mounts like /mnt/c /mnt/d /mnt/i\n"
-        "- NEVER access or reference /mnt/c /mnt/d /mnt/e /mnt/f /mnt/i paths\n"
-        "- NEVER chain commands with ; or &&\n"
-        "- COMMAND must be a single simple command only\n"
-        "- No backticks, no quotes around the command\n"
-        "- NEVER use echo to display policy values - just state them directly\n"
-        "- If the answer exists in POLICY CONTEXT, do NOT use COMMAND at all\n"
-        "To run a shell command respond with exactly:\n"
-        "COMMAND: <single command here>"
-    )
-
-    messages = [{"role": "system", "content": system_prompt}]
-    messages += conversation_history
-    messages.append({"role": "user", "content": question})
-
-    response = ollama.chat(model="qwen2.5:14b", messages=messages)
-    reply = response["message"]["content"]
-    token_stats["prompt"] += response.get("prompt_eval_count", 0)
-    token_stats["completion"] += response.get("eval_count", 0)
-
-    shell_output = ""
-    command_used = None
-
-    if "COMMAND:" in reply:
-        for line in reply.split("\n"):
-            if line.startswith("COMMAND:"):
-                command_used = clean(line.replace("COMMAND:", ""))
-                steps.append(f"⚙️ Running command: {command_used}")
-                audit("COMMAND_RUN", command_used)
-                shell_output = run_shell(command_used)
-                if shell_output.startswith("Command not allowed") or shell_output.startswith("Access denied"):
-                    steps.append(f"🚫 Blocked: {command_used}")
-                    audit("COMMAND_BLOCKED", command_used)
-                else:
-                    steps.append(f"✅ Command completed")
-                followup_messages = messages + [
-                    {"role": "assistant", "content": reply},
-                    {"role": "user", "content": "Command output:\n" + shell_output + "\n\nGive a clear answer."}
-                ]
-                steps.append("✅ Generating answer...")
-                followup = ollama.chat(model="qwen2.5:14b", messages=followup_messages)
-                final_reply = followup["message"]["content"]
-                token_stats["prompt"] += followup.get("prompt_eval_count", 0)
-                token_stats["completion"] += followup.get("eval_count", 0)
-                conversation_history.append({"role": "user", "content": question})
-                conversation_history.append({"role": "assistant", "content": final_reply})
-                audit("ANSWER", final_reply[:120])
-                return final_reply, command_used, shell_output, steps
-
-    steps.append("✅ Generating answer...")
-    conversation_history.append({"role": "user", "content": question})
-    conversation_history.append({"role": "assistant", "content": reply})
-    audit("ANSWER", reply[:120])
-    return reply, None, None, steps
-
-
-HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>DevOps AI Agent</title>
-<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-<style>
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-:root {
-  --bg: #1c1c1c; --surface: #262626; --surface2: #2f2f2f;
-  --border: #383838; --text: #ececec; --text-muted: #8a8a8a;
-  --accent: #cc785c; --accent-light: #d4956e; --code-bg: #1a1a1a;
+# Stats
+STATS = {
+    'total_chunks': collection.count(),
+    'repos': 5,
+    'model': 'Qwen 2.5 14B',
+    'opa_enabled': True
 }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
 
-#header { display: flex; align-items: center; justify-content: space-between; padding: 14px 24px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-.header-left { display: flex; align-items: center; gap: 10px; }
-.logo { width: 28px; height: 28px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; color: white; }
-#header h1 { font-size: 0.95rem; font-weight: 500; }
-.header-right { display: flex; align-items: center; gap: 8px; }
-.badge { font-size: 0.72rem; color: var(--text-muted); background: var(--surface); border: 1px solid var(--border); padding: 3px 8px; border-radius: 20px; }
-#token-badge { color: var(--accent); }
-#btn-clear { font-size: 0.8rem; color: var(--text-muted); background: none; border: 1px solid var(--border); padding: 5px 12px; border-radius: 8px; cursor: pointer; }
-#btn-clear:hover { border-color: #e05252; color: #e05252; }
+# History functions
+def load_history():
+    """Load query history from file"""
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r') as f:
+                return json.load(f)
+        return []
+    except Exception as e:
+        logger.error(f"Error loading history: {e}")
+        return []
 
-#chat { flex: 1; overflow-y: auto; padding: 32px 0; }
-#chat::-webkit-scrollbar { width: 6px; }
-#chat::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+def save_history(entry):
+    """Save query to history"""
+    try:
+        history = load_history()
+        history.append(entry)
+        # Keep last 100 entries
+        history = history[-100:]
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving history: {e}")
 
-#welcome { max-width: 600px; margin: 40px auto 0; padding: 0 24px; text-align: center; }
-.w-icon { width: 52px; height: 52px; background: var(--accent); border-radius: 14px; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center; font-size: 22px; color: white; font-weight: 700; }
-#welcome h2 { font-size: 1.6rem; font-weight: 500; margin-bottom: 10px; }
-#welcome p { color: var(--text-muted); font-size: 0.95rem; line-height: 1.6; margin-bottom: 24px; }
-.suggestions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
-.suggestion { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; font-size: 0.83rem; color: var(--text-muted); cursor: pointer; transition: all 0.15s; }
-.suggestion:hover { border-color: var(--accent); color: var(--text); }
+# Safety check functions
+def is_command_safe(cmd):
+    """Check if command is safe to execute"""
+    cmd_parts = cmd.strip().split()
+    if not cmd_parts:
+        return False, "Empty command"
+    
+    base_cmd = cmd_parts[0]
+    
+    # Check if command is in whitelist
+    if base_cmd not in ALLOWED_COMMANDS:
+        return False, f"Command '{base_cmd}' not in whitelist"
+    
+    # Check for blocked paths
+    for path in BLOCKED_PATHS:
+        if path in cmd:
+            return False, f"Access to '{path}' is blocked"
+    
+    # Check for dangerous patterns
+    dangerous_patterns = ['rm', 'sudo', '>', '>>', '|', '&', ';']
+    for pattern in dangerous_patterns:
+        if pattern in cmd and base_cmd != 'grep':
+            return False, f"Dangerous pattern '{pattern}' detected"
+    
+    return True, "Command is safe"
 
-.turn { max-width: 720px; margin: 0 auto; padding: 0 24px 24px; }
-.turn.user { display: flex; justify-content: flex-end; }
-.turn.user .bubble { background: var(--surface2); border: 1px solid var(--border); border-radius: 18px; padding: 12px 16px; max-width: 80%; font-size: 0.95rem; line-height: 1.55; }
-.turn.agent { display: flex; gap: 12px; align-items: flex-start; }
-.agent-icon { width: 28px; height: 28px; flex-shrink: 0; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; color: white; margin-top: 2px; }
-.turn.agent .bubble { font-size: 0.95rem; line-height: 1.7; flex: 1; }
+def execute_command(cmd):
+    """Execute shell command safely"""
+    safe, reason = is_command_safe(cmd)
+    
+    if not safe:
+        return {
+            'success': False,
+            'blocked': True,
+            'reason': reason,
+            'suggestion': 'Use read-only commands from the whitelist'
+        }
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return {
+            'success': True,
+            'blocked': False,
+            'output': result.stdout,
+            'error': result.stderr,
+            'returncode': result.returncode
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            'success': False,
+            'blocked': False,
+            'reason': 'Command timed out (5s limit)'
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'blocked': False,
+            'reason': str(e)
+        }
 
-.steps-block { margin-bottom: 12px; padding: 10px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
-.step { font-size: 0.82rem; color: var(--text-muted); padding: 2px 0; font-family: "SF Mono", "Fira Code", monospace; }
-.thinking-dots { display: flex; gap: 4px; padding: 8px 0; }
-.thinking-dots span { width: 6px; height: 6px; background: var(--text-muted); border-radius: 50%; animation: pulse 1.2s ease-in-out infinite; }
-.thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
-.thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
-@keyframes pulse { 0%,80%,100% { opacity:0.3; transform:scale(0.85); } 40% { opacity:1; transform:scale(1); } }
+def get_embedding(text):
+    """Get embedding for text"""
+    try:
+        response = ollama.embeddings(model=EMBED_MODEL, prompt=text)
+        return response['embedding']
+    except Exception as e:
+        logger.error(f"Embedding error: {e}")
+        return None
 
-.cmd-block { margin-top: 14px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; font-family: "SF Mono", "Fira Code", monospace; font-size: 0.82rem; }
-.cmd-header { display: flex; align-items: center; gap: 6px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); }
-.cmd-dot { width: 8px; height: 8px; border-radius: 50%; }
-.cmd-label { color: var(--text-muted); font-size: 0.75rem; font-family: sans-serif; margin-left: 4px; }
-.cmd-body { padding: 12px; }
-.cmd-line { color: #f0883e; margin-bottom: 6px; }
-.cmd-line::before { content: "$ "; color: var(--text-muted); }
-.cmd-output { color: #57c97d; white-space: pre-wrap; line-height: 1.6; }
+def query_knowledge_base(query, n_results=5):
+    """Query ChromaDB for relevant context"""
+    try:
+        embedding = get_embedding(query)
+        if not embedding:
+            return []
+        
+        results = collection.query(
+            query_embeddings=[embedding],
+            n_results=n_results
+        )
+        
+        return results['documents'][0] if results['documents'] else []
+    except Exception as e:
+        logger.error(f"Query error: {e}")
+        return []
 
-#input-area { padding: 16px 24px 20px; border-top: 1px solid var(--border); flex-shrink: 0; }
-.input-box { max-width: 720px; margin: 0 auto; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; display: flex; align-items: center; gap: 8px; padding: 10px 10px 10px 16px; transition: border-color 0.15s; }
-.input-box:focus-within { border-color: var(--accent); }
-#input { flex: 1; background: none; border: none; outline: none; color: var(--text); font-size: 0.95rem; line-height: 1.5; font-family: inherit; }
-#input::placeholder { color: var(--text-muted); }
-#btn-send { width: 34px; height: 34px; flex-shrink: 0; background: var(--accent); border: none; border-radius: 8px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background 0.15s; }
-#btn-send:hover { background: var(--accent-light); }
-#btn-send:disabled { background: var(--surface2); cursor: not-allowed; }
-#btn-send svg { width: 16px; height: 16px; fill: white; }
-</style>
-</head>
-<body>
+def generate_response(query, context):
+    """Generate response using LLM"""
+    try:
+        # Build prompt
+        if context:
+            context_str = "\n\n".join(context[:3])  # Use top 3 results
+            prompt = f"""You are AVA, a DevOps AI assistant. Use the following context to answer the question.
 
-<div id="header">
-  <div class="header-left">
-    <div class="logo">D</div>
-    <h1>DevOps AI Agent</h1>
-  </div>
-  <div class="header-right">
-    <span class="badge">Qwen 2.5 14B</span>
-    <span class="badge">2242 chunks</span>
-    <span class="badge">Shell enabled</span>
-    <span class="badge" id="token-badge">0 tokens</span>
-    <button id="btn-clear" onclick="clearChat()">New chat</button>
-  </div>
-</div>
+Context:
+{context_str}
 
-<div id="chat">
-  <div id="welcome">
-    <div class="w-icon">D</div>
-    <h2>What can I help with?</h2>
-    <p>Ask about your OPA policies, infrastructure config, Terraform plans, or run shell commands on your system.</p>
-    <div class="suggestions">
-      <div class="suggestion" onclick="usePrompt('What violation rules are in our policy?')">What violation rules are in our policy?</div>
-      <div class="suggestion" onclick="usePrompt('How much disk space is available?')">How much disk space is available?</div>
-      <div class="suggestion" onclick="usePrompt('What approved regions are defined?')">What approved regions are defined?</div>
-      <div class="suggestion" onclick="usePrompt('Show running ollama processes')">Show running ollama processes</div>
-      <div class="suggestion" onclick="usePrompt('Explain how gatekeeper.py works')">Explain how gatekeeper.py works</div>
-      <div class="suggestion" onclick="usePrompt('What services are in docker-compose?')">What services are in docker-compose?</div>
-    </div>
-  </div>
-</div>
+Question: {query}
 
-<div id="input-area">
-  <div class="input-box">
-    <input type="text" id="input" placeholder="Ask anything..." />
-    <button id="btn-send" onclick="sendMessage()">
-      <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
-    </button>
-  </div>
-</div>
+Provide a clear, practical answer. Include code examples if relevant."""
+        else:
+            prompt = f"""You are AVA, a DevOps AI assistant. Answer this question based on your DevOps knowledge.
 
-<script src="/static/agent.js"></script>
-</body>
-</html>"""
+Question: {query}"""
+        
+        # Call LLM
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        return response['message']['content']
+    except Exception as e:
+        logger.error(f"LLM error: {e}")
+        return f"Error generating response: {str(e)}"
 
-
-
-@app.route("/static/agent.js")
-def serve_js():
-    from flask import send_from_directory
-    return send_from_directory("/mnt/i/ai-lab/projects/devops-agent/static", "agent.js")
-
-@app.route("/")
+# Routes
+@app.route('/')
 def index():
-    return HTML
+    """Main page"""
+    return render_template_string(HTML_TEMPLATE)
 
+@app.route('/ask', methods=['POST'])
+def ask():
+    """Main query endpoint"""
+    start_time = time.time()
+    
+    try:
+        data = request.json
+        query = data.get('query', '').strip()
+        
+        if not query:
+            return jsonify({'error': 'No query provided'}), 400
+        
+        logger.info(f"Query: {query}")
+        
+        # Check if it's a command request
+        if query.lower().startswith(('run ', 'execute ', 'shell ')):
+            cmd = query.split(' ', 1)[1] if ' ' in query else ''
+            result = execute_command(cmd)
+            
+            elapsed = time.time() - start_time
+            
+            # Log to history
+            save_history({
+                'timestamp': datetime.now().isoformat(),
+                'query': query,
+                'type': 'command',
+                'blocked': result.get('blocked', False),
+                'time_taken': f"{elapsed:.2f}s"
+            })
+            
+            return jsonify({
+                'type': 'command',
+                'result': result,
+                'time_taken': f"{elapsed:.2f}s"
+            })
+        
+        # Knowledge base query
+        logger.info("[*] Searching knowledge base...")
+        context = query_knowledge_base(query)
+        
+        logger.info(f"[*] Found {len(context)} relevant chunks")
+        logger.info(f"[*] Thinking with {LLM_MODEL}...")
+        
+        response = generate_response(query, context)
+        
+        elapsed = time.time() - start_time
+        
+        # Log to history
+        save_history({
+            'timestamp': datetime.now().isoformat(),
+            'query': query,
+            'type': 'knowledge',
+            'sources_used': len(context),
+            'time_taken': f"{elapsed:.2f}s",
+            'response_preview': response[:200] + '...' if len(response) > 200 else response
+        })
+        
+        return jsonify({
+            'type': 'knowledge',
+            'response': response,
+            'sources_used': len(context),
+            'time_taken': f"{elapsed:.2f}s"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in ask endpoint: {e}")
+        return jsonify({
+            'error': 'Failed to process query',
+            'details': str(e)
+        }), 500
 
-@app.route("/clear", methods=["POST"])
-def clear_history():
-    global conversation_history, token_stats
-    conversation_history = []
-    token_stats["prompt"] = 0
-    token_stats["completion"] = 0
-    return jsonify({"status": "cleared"})
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """File upload and analysis endpoint"""
+    start_time = time.time()
+    
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        # Read file
+        content = file.read().decode('utf-8', errors='ignore')
+        filename = file.filename
+        
+        logger.info(f"Analyzing file: {filename} ({len(content)} chars)")
+        
+        # Build analysis query
+        file_type = filename.split('.')[-1] if '.' in filename else 'unknown'
+        query = f"""Analyze this {file_type} file ({filename}) and provide:
+1. What it does
+2. Any issues or improvements
+3. Best practices recommendations
 
+File content:
+{content[:3000]}"""  # Limit to first 3000 chars
+        
+        # Get context
+        context = query_knowledge_base(f"best practices for {file_type} files")
+        
+        # Generate analysis
+        analysis = generate_response(query, context)
+        
+        elapsed = time.time() - start_time
+        
+        # Log to history
+        save_history({
+            'timestamp': datetime.now().isoformat(),
+            'query': f"File analysis: {filename}",
+            'type': 'file_analysis',
+            'filename': filename,
+            'time_taken': f"{elapsed:.2f}s"
+        })
+        
+        return jsonify({
+            'type': 'file_analysis',
+            'filename': filename,
+            'analysis': analysis,
+            'time_taken': f"{elapsed:.2f}s"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in upload endpoint: {e}")
+        return jsonify({
+            'error': 'Failed to analyze file',
+            'details': str(e)
+        }), 500
 
-@app.route("/ask", methods=["POST"])
-def ask_endpoint():
-    question = request.json.get("question", "")
-    answer, command, output, steps = ask(question)
+@app.route('/history', methods=['GET'])
+def get_history():
+    """Get query history"""
+    try:
+        history = load_history()
+        return jsonify({
+            'history': history[-20:],  # Last 20 entries
+            'total': len(history)
+        })
+    except Exception as e:
+        logger.error(f"Error fetching history: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    """Get system stats"""
+    try:
+        return jsonify({
+            'total_chunks': STATS['total_chunks'],
+            'repos': STATS['repos'],
+            'model': STATS['model'],
+            'opa_enabled': STATS['opa_enabled'],
+            'uptime': 'Running'
+        })
+    except Exception as e:
+        logger.error(f"Error fetching stats: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
     return jsonify({
-        "answer": answer,
-        "command": command,
-        "output": output,
-        "steps": steps,
-        "tokens_prompt": token_stats["prompt"],
-        "tokens_completion": token_stats["completion"],
-        "tokens_total": token_stats["prompt"] + token_stats["completion"]
+        'status': 'healthy',
+        'chromadb': 'connected',
+        'ollama': 'running'
     })
 
+# Error handlers
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Endpoint not found'}), 404
 
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal error: {e}")
+    return jsonify({'error': 'Internal server error'}), 500
 
-@app.route("/ask_stream", methods=["POST"])
-def ask_stream_endpoint():
-    import json
-    from flask import stream_with_context, Response
-    question = request.json.get("question", "")
+# HTML Template
+HTML_TEMPLATE = r'''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AVA - DevOps AI Agent</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            transition: background 0.3s, color 0.3s;
+        }
+        
+        body.dark-mode {
+            background: #1a1a1a;
+            color: #e0e0e0;
+        }
+        
+        body.light-mode {
+            background: #f5f5f5;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 2px solid #444;
+        }
+        
+        .title {
+            font-size: 28px;
+            font-weight: bold;
+        }
+        
+        .theme-toggle {
+            background: #3a3a3a;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 20px;
+        }
+        
+        .stats-bar {
+            display: flex;
+            gap: 15px;
+            padding: 15px 0;
+            flex-wrap: wrap;
+        }
+        
+        .stat {
+            padding: 8px 12px;
+            background: #2a2a2a;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        
+        body.light-mode .stat {
+            background: #e0e0e0;
+        }
+        
+        .main-content {
+            margin-top: 30px;
+        }
+        
+        .welcome {
+            text-align: center;
+            padding: 40px 0;
+        }
+        
+        .welcome h2 {
+            font-size: 32px;
+            margin-bottom: 10px;
+        }
+        
+        .welcome p {
+            color: #888;
+            font-size: 16px;
+        }
+        
+        .examples {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 10px;
+            margin: 30px 0;
+        }
+        
+        .example-btn {
+            padding: 15px;
+            background: #2a2a2a;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            text-align: left;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+        
+        .example-btn:hover {
+            background: #3a3a3a;
+        }
+        
+        body.light-mode .example-btn {
+            background: #e0e0e0;
+        }
+        
+        body.light-mode .example-btn:hover {
+            background: #d0d0d0;
+        }
+        
+        .upload-section {
+            margin: 20px 0;
+            padding: 20px;
+            background: #2a2a2a;
+            border-radius: 8px;
+        }
+        
+        body.light-mode .upload-section {
+            background: #e0e0e0;
+        }
+        
+        .upload-section input[type="file"] {
+            margin-right: 10px;
+        }
+        
+        .input-section {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            padding: 20px;
+            background: #1a1a1a;
+            border-top: 2px solid #444;
+        }
+        
+        body.light-mode .input-section {
+            background: #f5f5f5;
+        }
+        
+        .input-container {
+            max-width: 900px;
+            margin: 0 auto;
+            display: flex;
+            gap: 10px;
+        }
+        
+        #queryInput {
+            flex: 1;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+            background: #2a2a2a;
+            color: #e0e0e0;
+            font-size: 16px;
+        }
+        
+        body.light-mode #queryInput {
+            background: #fff;
+            color: #333;
+            border-color: #ccc;
+        }
+        
+        .send-btn {
+            padding: 15px 30px;
+            background: #0066cc;
+            border: none;
+            border-radius: 8px;
+            color: white;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .send-btn:hover {
+            background: #0052a3;
+        }
+        
+        .response-container {
+            margin: 20px 0;
+            padding: 20px;
+            background: #2a2a2a;
+            border-radius: 8px;
+        }
+        
+        body.light-mode .response-container {
+            background: #fff;
+            border: 1px solid #ddd;
+        }
+        
+        .response-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 15px;
+        }
+        
+        .copy-btn {
+            padding: 8px 12px;
+            background: #3a3a3a;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #888;
+        }
+        
+        .error {
+            padding: 15px;
+            background: #ff4444;
+            color: white;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        
+        pre {
+            background: #1a1a1a;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+        }
+        
+        body.light-mode pre {
+            background: #f0f0f0;
+        }
+        
+        code {
+            font-family: 'Courier New', monospace;
+        }
+    </style>
+</head>
+<body class="dark-mode">
+    <div class="container">
+        <div class="header">
+            <div class="title">🤖 AVA - DevOps AI Agent</div>
+            <button onclick="toggleTheme()" class="theme-toggle" id="themeToggle">🌙</button>
+        </div>
+        
+        <div class="stats-bar">
+            <span class="stat" id="chunksCount">📚 Loading...</span>
+            <span class="stat">🔧 5 repos</span>
+            <span class="stat">🤖 Qwen 2.5 14B</span>
+            <span class="stat">🛡️ OPA enabled</span>
+            <button class="stat" onclick="showHistory()" style="cursor: pointer; border: none;">📜 History</button>
+        </div>
+        
+        <div class="main-content" id="mainContent">
+            <div class="welcome">
+                <h2>What can I help with?</h2>
+                <p>Ask about your OPA policies, infrastructure config, Terraform plans, or run shell commands on your system.</p>
+            </div>
+            
+            <div class="examples">
+                <button class="example-btn" onclick="askExample('How to secure S3 buckets in production?')">
+                    🔒 S3 Security
+                </button>
+                <button class="example-btn" onclick="askExample('Design a highly available RDS setup')">
+                    🗄️ HA Database
+                </button>
+                <button class="example-btn" onclick="askExample('VPC peering vs Transit Gateway')">
+                    🌐 VPC Design
+                </button>
+                <button class="example-btn" onclick="askExample('Best practices for IAM policies')">
+                    👤 IAM Best Practices
+                </button>
+                <button class="example-btn" onclick="askExample('How to reduce Docker image size?')">
+                    🐳 Docker Optimization
+                </button>
+                <button class="example-btn" onclick="askExample('Kubernetes rolling updates vs recreate')">
+                    ☸️ K8s Deployments
+                </button>
+            </div>
+            
+            <div class="upload-section">
+                <h3>📁 Analyze a File</h3>
+                <p style="margin: 10px 0; color: #888;">Upload Terraform, Docker, Kubernetes, or shell scripts for analysis</p>
+                <input type="file" id="fileUpload" accept=".tf,.yml,.yaml,.json,.sh,.py,.md,.hcl">
+                <button class="example-btn" onclick="analyzeFile()" style="display: inline-block; margin-top: 10px;">
+                    Analyze File
+                </button>
+            </div>
+        </div>
+        
+        <div id="responseArea"></div>
+    </div>
+    
+    <div class="input-section">
+        <div class="input-container">
+            <input type="text" id="queryInput" placeholder="Ask anything..." onkeypress="handleKeyPress(event)">
+            <button class="send-btn" onclick="sendQuery()">Send</button>
+        </div>
+    </div>
+    
+    <script>
+        // Load stats
+        fetch('/stats')
+            .then(r => r.json())
+            .then(data => {
+                document.getElementById('chunksCount').textContent = `📚 ${data.total_chunks} chunks`;
+            });
+        
+        // Theme management
+        function toggleTheme() {
+            const body = document.body;
+            const isDark = body.classList.contains('dark-mode');
+            body.classList.remove('dark-mode', 'light-mode');
+            body.classList.add(isDark ? 'light-mode' : 'dark-mode');
+            document.getElementById('themeToggle').textContent = isDark ? '☀️' : '🌙';
+            localStorage.setItem('theme', isDark ? 'light' : 'dark');
+        }
+        
+        // Load saved theme
+        window.onload = function() {
+            const theme = localStorage.getItem('theme') || 'dark';
+            document.body.classList.add(theme + '-mode');
+            document.getElementById('themeToggle').textContent = theme === 'dark' ? '🌙' : '☀️';
+        };
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendQuery();
+            }
+        }
+        
+        function askExample(query) {
+            document.getElementById('queryInput').value = query;
+            sendQuery();
+        }
+        
+        function showLoading() {
+            const messages = [
+                "🔍 Searching knowledge base...",
+                "🧠 Analyzing with Qwen 2.5 14B...",
+                "📊 Processing results...",
+                "✨ Generating response..."
+            ];
+            
+            let index = 0;
+            const loadingDiv = document.createElement('div');
+            loadingDiv.className = 'loading';
+            loadingDiv.id = 'loadingIndicator';
+            loadingDiv.textContent = messages[0];
+            
+            document.getElementById('responseArea').innerHTML = '';
+            document.getElementById('responseArea').appendChild(loadingDiv);
+            
+            return setInterval(() => {
+                index = (index + 1) % messages.length;
+                const loader = document.getElementById('loadingIndicator');
+                if (loader) loader.textContent = messages[index];
+            }, 2000);
+        }
+        
+        function sendQuery() {
+            const query = document.getElementById('queryInput').value.trim();
+            if (!query) return;
+            
+            const loadingInterval = showLoading();
+            
+            fetch('/ask', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({query: query})
+            })
+            .then(r => r.json())
+            .then(data => {
+                clearInterval(loadingInterval);
+                displayResponse(data);
+                document.getElementById('queryInput').value = '';
+            })
+            .catch(err => {
+                clearInterval(loadingInterval);
+                displayError(err.message);
+            });
+        }
+        
+        function analyzeFile() {
+            const fileInput = document.getElementById('fileUpload');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                alert('Please select a file');
+                return;
+            }
+            
+            const loadingInterval = showLoading();
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(r => r.json())
+            .then(data => {
+                clearInterval(loadingInterval);
+                displayResponse(data);
+                fileInput.value = '';
+            })
+            .catch(err => {
+                clearInterval(loadingInterval);
+                displayError(err.message);
+            });
+        }
+        
+        function displayResponse(data) {
+            const responseArea = document.getElementById('responseArea');
+            responseArea.innerHTML = '';
+            
+            const container = document.createElement('div');
+            container.className = 'response-container';
+            
+            // Header
+            const header = document.createElement('div');
+            header.className = 'response-header';
+            
+            const info = document.createElement('div');
+            if (data.type === 'command') {
+                info.textContent = `Command ${data.result.blocked ? '🛡️ Blocked' : '✅ Executed'} • ${data.time_taken}`;
+            } else if (data.type === 'file_analysis') {
+                info.textContent = `📄 ${data.filename} • ${data.time_taken}`;
+            } else {
+                info.textContent = `📚 ${data.sources_used} sources • ${data.time_taken}`;
+            }
+            
+            const copyBtn = document.createElement('button');
+            copyBtn.className = 'copy-btn';
+            copyBtn.textContent = '📋 Copy';
+            copyBtn.onclick = () => copyResponse(data);
+            
+            header.appendChild(info);
+            header.appendChild(copyBtn);
+            
+            // Content
+            const content = document.createElement('div');
+            
+            if (data.type === 'command') {
+                if (data.result.blocked) {
+                    content.innerHTML = `<div class="error">
+                        <strong>🛡️ Command Blocked</strong><br>
+                        ${data.result.reason}<br>
+                        💡 ${data.result.suggestion}
+                    </div>`;
+                } else if (data.result.success) {
+                    content.innerHTML = `<pre><code>${data.result.output || data.result.error || 'Command executed successfully'}</code></pre>`;
+                } else {
+                    content.innerHTML = `<div class="error">${data.result.reason}</div>`;
+                }
+            } else {
+                const text = data.response || data.analysis;
+                content.innerHTML = formatResponse(text);
+            }
+            
+            container.appendChild(header);
+            container.appendChild(content);
+            responseArea.appendChild(container);
+            
+            // Scroll to response
+            container.scrollIntoView({behavior: 'smooth'});
+        }
+        
+        function formatResponse(text) {
+            // Basic markdown-like formatting
+            text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+            text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
+            text = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            return text.replace(/\n/g, '<br>');
+        }
+        
+        function copyResponse(data) {
+            const text = data.response || data.analysis || JSON.stringify(data.result);
+            navigator.clipboard.writeText(text).then(() => {
+                alert('✅ Copied to clipboard!');
+            });
+        }
+        
+        function displayError(message) {
+            const responseArea = document.getElementById('responseArea');
+            responseArea.innerHTML = `<div class="error">❌ Error: ${message}</div>`;
+        }
+        
+        function showHistory() {
+            fetch('/history')
+                .then(r => r.json())
+                .then(data => {
+                    alert(`Recent queries: ${data.total} total\n\n${data.history.map(h => h.query).join('\n')}`);
+                });
+        }
+    </script>
+</body>
+</html>
+'''
 
-    def generate():
-        audit("QUESTION", question)
-        # Intercept date/time questions directly
-        q_lower = question.lower()
-        if any(w in q_lower for w in ["what time", "what is the time", "current time", "what date", "what is the date", "current date"]):
-            result = run_shell("date")
-            yield "data: " + json.dumps({"type": "step", "content": "[*] Running: date"}) + "\n\n"
-            yield "data: " + json.dumps({"type": "token", "content": "The current date and time is: " + result}) + "\n\n"
-            conversation_history.append({"role": "user", "content": question})
-            conversation_history.append({"role": "assistant", "content": result})
-            audit("ANSWER", result)
-            yield "data: " + json.dumps({"type": "done", "command": "date", "output": result, "tokens_total": len(question.split()) + len(result.split())}) + "\n\n"
-            return
-
-        yield "data: " + json.dumps({"type": "step", "content": "[*] Searching knowledge base..."}) + "\n\n"
-        context = get_context(question)
-
-        system_prompt = (
-            "You are a local DevOps AI agent running on the user machine using qwen2.5:14b via Ollama.\n"
-            "You are NOT ChatGPT, NOT Claude, NOT Anthropic.\n\n"
-            "You answer questions about Kubernetes, Docker, CI/CD, Jenkins, GitHub Actions,\n"
-            "ArgoCD, Terraform, Ansible, AWS, Azure, GCP, Linux, DevSecOps, OPA, Git,\n"
-            "monitoring, logging, and ANY application deployment project.\n\n"
-            "Only decline questions completely unrelated to technology.\n\n"
-            "KNOWLEDGE BASE CONTEXT:\n" + context + "\n\n"
-            "RULES:\n"
-            "- ollama runs natively on this machine, never use docker exec for it\n"
-            "- NEVER use curl or wget\n"
-            "- NEVER chain commands with ; or &&\n"
-            "- COMMAND must be a single simple command only\n"
-            "- No backticks or quotes around the command\n"
-            "- If answer exists in context, do NOT use COMMAND\n"
-            "To run a shell command respond with exactly:\n"
-            "COMMAND: <single command here>"
-        )
-
-        messages = [{"role": "system", "content": system_prompt}]
-        messages += conversation_history
-        messages.append({"role": "user", "content": question})
-
-        yield "data: " + json.dumps({"type": "step", "content": "[*] Thinking with Qwen 2.5 14B..."}) + "\n\n"
-
-        full_reply = ""
-        prompt_tokens = 0
-        completion_tokens = 0
-        for chunk in ollama.chat(model="qwen2.5:14b", messages=messages, stream=True):
-            token = chunk["message"]["content"]
-            full_reply += token
-            completion_tokens += 1
-            if chunk.get("prompt_eval_count"): prompt_tokens = chunk["prompt_eval_count"]
-            if chunk.get("eval_count"): completion_tokens = chunk["eval_count"]
-            yield "data: " + json.dumps({"type": "token", "content": token}) + "\n\n"
-
-        command_used = None
-        shell_output = ""
-
-        if "COMMAND:" in full_reply:
-            for line in full_reply.split("\n"):
-                if line.startswith("COMMAND:"):
-                    command_used = clean(line.replace("COMMAND:", ""))
-                    yield "data: " + json.dumps({"type": "step", "content": "[*] Running: " + command_used}) + "\n\n"
-                    audit("COMMAND_RUN", command_used)
-                    shell_output = run_shell(command_used)
-                    if shell_output.startswith("Command not allowed") or shell_output.startswith("Access denied"):
-                        yield "data: " + json.dumps({"type": "step", "content": "[X] Blocked: " + command_used}) + "\n\n"
-                        audit("COMMAND_BLOCKED", command_used)
-                    else:
-                        yield "data: " + json.dumps({"type": "command", "command": command_used, "output": shell_output}) + "\n\n"
-                        yield "data: " + json.dumps({"type": "step", "content": "[*] Generating final answer..."}) + "\n\n"
-                        followup_messages = messages + [
-                            {"role": "assistant", "content": full_reply},
-                            {"role": "user", "content": "Command output:\n" + shell_output + "\n\nGive a clear answer."}
-                        ]
-                        full_reply = ""
-                        for chunk in ollama.chat(model="qwen2.5:14b", messages=followup_messages, stream=True):
-                            token = chunk["message"]["content"]
-                            full_reply += token
-                            yield "data: " + json.dumps({"type": "token", "content": token}) + "\n\n"
-                    break
-
-        conversation_history.append({"role": "user", "content": question})
-        conversation_history.append({"role": "assistant", "content": full_reply})
-        audit("ANSWER", full_reply[:120])
-        total_tokens = prompt_tokens + completion_tokens
-        yield "data: " + json.dumps({"type": "done", "command": command_used, "output": shell_output, "tokens_total": total_tokens}) + "\n\n"
-
-    return Response(stream_with_context(generate()), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-if __name__ == "__main__":
-    print("DevOps AI Agent running at http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+if __name__ == '__main__':
+    logger.info("=" * 50)
+    logger.info("AVA - DevOps AI Agent Starting...")
+    logger.info(f"Knowledge Base: {STATS['total_chunks']} chunks")
+    logger.info(f"Model: {STATS['model']}")
+    logger.info(f"Security: OPA Enabled")
+    logger.info("=" * 50)
+    
+    app.run(host='0.0.0.0', port=5000, debug=False)

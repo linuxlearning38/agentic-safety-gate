@@ -1,0 +1,2209 @@
+#!/usr/bin/env python3
+"""
+AVA - DevOps AI Agent v2.1
+Improved sidebar with modals
+"""
+
+from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS
+import chromadb
+from knowledge_updater.hybrid_retrieval import HybridRetriever
+import ollama
+import subprocess
+import os
+import json
+import time
+import logging
+from datetime import datetime
+from control.secure_executor import execute_command_secure
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+CORS(app)
+
+# Configuration
+CHROMA_PATH = "/mnt/i/ai-lab/chromadb"
+COLLECTION_NAME = "devops_policies_v2"
+HISTORY_FILE = "/mnt/i/ai-lab/projects/devops-agent/query_history.json"
+LLM_MODEL = "qwen2.5:14b"
+EMBED_MODEL = "nomic-embed-text"
+
+# Initialize ChromaDB
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+collection = chroma_client.get_collection(COLLECTION_NAME)
+
+# Phase 2: Hybrid retriever (policies + blogs)
+import yaml
+with open("knowledge_updater/config.yaml") as _f:
+    _ku_config = yaml.safe_load(_f)
+hybrid_retriever = HybridRetriever(_ku_config, existing_client=chroma_client)
+
+# Command whitelist - expanded for server management
+ALLOWED_COMMANDS = [
+    # Basic commands
+    'date', 'whoami', 'pwd', 'ls', 'cat', 'grep', 'df', 'free',
+    'ps', 'top', 'uptime', 'uname', 'echo', 'head', 'tail',
+    'wc', 'find', 'which', 'hostname',
+    # Server management
+    'ollama',      # For ollama list, ollama ps, etc.
+    'docker',      # For docker ps, docker images, etc.
+    'systemctl',   # For service management (status, start, stop)
+    'curl',        # For API testing
+    'wget',        # For downloads
+    'netstat',     # For network stats
+    'ss',          # Socket statistics
+    'git'          # For git status, git log, etc.
+]
+
+BLOCKED_PATHS = [
+    '/etc/passwd', '/etc/shadow', '/root', '~/.ssh',
+    '/var/log', '/proc', '/sys'
+]
+
+# Stats
+STATS = {
+    'total_chunks': collection.count(),
+    'repos': 5,
+    'model': 'Qwen 2.5 14B',
+    'opa_enabled': True,
+    'whitelisted_commands': len(ALLOWED_COMMANDS),
+    'total_tokens': 0,
+    'query_count': 0,
+    'avg_tokens_per_query': 0
+}
+
+# History functions
+def load_history():
+    try:
+        if os.path.exists(HISTORY_FILE):
+            with open(HISTORY_FILE, 'r') as f:
+                return json.load(f)
+        return []
+    except Exception as e:
+        logger.error(f"Error loading history: {e}")
+        return []
+
+def save_history(entry):
+    try:
+        history = load_history()
+        history.append(entry)
+        history = history[-100:]
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        logger.error(f"Error saving history: {e}")
+
+# Safety functions
+def is_command_safe(cmd):
+    cmd_parts = cmd.strip().split()
+    if not cmd_parts:
+        return False, "Empty command"
+    
+    base_cmd = cmd_parts[0]
+    if base_cmd not in ALLOWED_COMMANDS:
+        return False, f"Command '{base_cmd}' not in whitelist"
+    
+    for path in BLOCKED_PATHS:
+        if path in cmd:
+            return False, f"Access to '{path}' is blocked"
+    
+    dangerous_patterns = ['rm', 'sudo', '>', '>>', '&', ';']
+    for pattern in dangerous_patterns:
+        if pattern in cmd:
+            return False, f"Dangerous pattern '{pattern}' detected"
+    
+    # Check for pipe - allow only when used with grep (safe filtering)
+    if '|' in cmd and 'grep' not in cmd:
+        return False, "Pipe (|) is only allowed with grep for filtering"
+    
+    return True, "Command is safe"
+
+def analyze_command_output(cmd, output):
+    """Generate brief analysis of command output"""
+    try:
+        # Skip analysis for empty or very short outputs
+        if not output or len(output.strip()) < 10:
+            return None
+        
+        # Create a concise prompt for analysis
+        prompt = f"""Analyze this command output and provide a brief 2-3 sentence summary of key insights.
+
+Command: {cmd}
+Output:
+{output[:1000]}
+
+Provide only the summary, no preamble. Focus on important numbers, status, or findings."""
+        
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        return response['message']['content'].strip()
+    except Exception as e:
+        logger.error(f"Analysis error: {e}")
+        return None
+
+def execute_command(cmd, query=""):
+    """Execute command with AgentGuard security controls"""
+    result = execute_command_secure(cmd, query)
+    
+    if result["status"] == "executed":
+        return {
+            'success': True,
+            'blocked': False,
+            'output': result["output"]["stdout"],
+            'error': result["output"]["stderr"],
+            'returncode': result["output"]["returncode"],
+            'security': {
+                'risk': result.get("risk"),
+                'threats': result.get("threats", [])
+            }
+        }
+    
+    elif result["status"] == "blocked":
+        return {
+            'success': False,
+            'blocked': True,
+            'reason': result["reason"],
+            'security': {
+                'risk': result["risk"],
+                'threats': result.get("threats", [])
+            },
+            'suggestion': 'Command blocked by AgentGuard security policy.'
+        }
+    
+    elif result["status"] == "approval_required":
+        return {
+            'success': False,
+            'blocked': False,
+            'approval_required': True,
+            'approval_id': result["approval_id"],
+            'reason': result["reason"],
+            'command': cmd,
+            'security': {
+                'risk': result["risk"],
+                'blast_radius': result.get("blast_radius"),
+                'threats': result.get("threats", [])
+            },
+            'suggestion': f'⚠️  Run: python3 control/security_review.py (ID: {result["approval_id"]})'
+        }
+    
+    else:
+        return {'success': False, 'blocked': False, 'reason': 'Unknown error'}
+
+def get_embedding(text):
+    try:
+        response = ollama.embeddings(model=EMBED_MODEL, prompt=text)
+        return response['embedding']
+    except Exception as e:
+        logger.error(f"Embedding error: {e}")
+        return None
+
+def query_knowledge_base(query, n_results=5):
+    try:
+        # Phase 2: hybrid retrieval (policies + blogs)
+        chunks = hybrid_retriever.query(
+            query_text=query,
+            n_policies=4,
+            n_blogs=6,
+            blog_min_relevance=0.003,
+            format_for_llm=False
+        )
+        if chunks:
+            return [chunk.content for chunk in chunks]
+        # fallback to original single collection
+        embedding = get_embedding(query)
+        if not embedding:
+            return []
+        results = collection.query(query_embeddings=[embedding], n_results=n_results)
+        return results["documents"][0] if results["documents"] else []
+    except Exception as e:
+        logger.error(f"Query error: {e}")
+        return []
+
+def generate_response(query, context):
+    """Generate response using Qwen chat template with clean prompting"""
+    try:
+        if context:
+            context_str = "\n\n---\n\n".join(context[:8])
+            user_msg = f"""Here is the relevant context from the knowledge base:
+
+<context>
+{context_str}
+</context>
+
+Question: {query}
+
+Instructions: Read the context carefully. If the answer is in the context, extract and quote the specific details, config values, or commands directly. Do not say the information is unavailable if it exists in the context above."""
+        else:
+            user_msg = f"""Answer this DevOps question from your knowledge:
+{query}"""
+
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": """You are AVA, a senior DevOps AI assistant.
+
+RULES:
+1. When context is provided between <context> tags, read it carefully and extract the answer from it
+0. IMPORTANT: Always respond in English only, regardless of the language of the context
+2. Always quote specific config values, commands, or fixes found in the context
+3. If context contains the answer, use it — never say information is unavailable when it exists
+4. For command execution: NEVER say a command succeeded unless you see real output
+5. Be specific, practical, and cite exact details from the context"""},
+                {"role": "user", "content": user_msg}
+            ]
+        )
+        return response['message']['content']
+    except Exception as e:
+        logger.error(f"LLM error: {e}")
+        return f"Error generating response: {str(e)}"
+
+# Routes
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+def split_multi_query(query):
+    """Split a multi-part query into individual questions"""
+    import re
+    
+    # Don't split if query is very short
+    if len(query.split()) < 5:
+        return [query]
+    
+    # Patterns that indicate multiple questions
+    separators = [
+        r',\s+',                  # Comma (most common)
+        r'\.\s+(?=[A-Z])',        # Period followed by capital letter
+        r'\?\s+',                 # Question mark
+        r'\.\s+also\s+',          # "also"
+        r'\.\s+and\s+',           # "and" 
+        r'\s+too\.\s+',           # "too"
+        r'\s+also\s+',            # "also" without period
+    ]
+    
+    # Split by any of these patterns
+    parts = [query]
+    for separator in separators:
+        new_parts = []
+        for part in parts:
+            split_result = re.split(separator, part, flags=re.IGNORECASE)
+            new_parts.extend([p.strip() for p in split_result if p.strip()])
+        parts = new_parts
+    
+    # Filter out very short parts (likely noise)
+    questions = [p for p in parts if len(p.split()) >= 3]
+    
+    # If we got more than 5 questions, something went wrong - return original
+    if len(questions) > 5:
+        return [query]
+    
+    # If we only got 1 question back, return original
+    if len(questions) <= 1:
+        return [query]
+    
+    return questions
+
+def is_greeting(query):
+    """Check if query is a greeting"""
+    greetings = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening', 'how are you', 'whats up', 'sup']
+    query_lower = query.lower().strip()
+    # Check if query is just a greeting (possibly with punctuation)
+    query_clean = query_lower.replace('?', '').replace('!', '').replace(',', '').strip()
+    return query_clean in greetings or any(query_clean == g for g in greetings)
+
+def is_meta_question(query):
+    """Check if query is about AVA itself"""
+    meta_patterns = [
+        'what can you do', 'what do you do', 'what are you', 'who are you',
+        'what is your', 'introduce yourself', 'tell me about yourself',
+        'what are your capabilities', 'what can you help', 'how can you help',
+        'what is ava', 'tell me about ava', 'what\'s your purpose',
+        # Model-related questions
+        'which model', 'what model', 'which llm', 'what llm',
+        'are you using', 'do you use'
+    ]
+    query_lower = query.lower()
+    return any(pattern in query_lower for pattern in meta_patterns)
+
+def analyze_query_with_llm(query):
+    """Use Qwen to analyze query and determine the best action"""
+    try:
+        # Create a focused prompt for Qwen
+        prompt = f"""You are a query analyzer for a DevOps AI assistant. Analyze this query and determine the appropriate action.
+
+Query: "{query}"
+
+Respond in JSON format with ONE of these action types:
+
+1. COMMAND - If user wants to execute a system command
+   {{"action": "COMMAND", "command": "exact command to run", "reasoning": "brief explanation"}}
+
+2. DIRECT_ANSWER - If you can answer directly without searching
+   {{"action": "DIRECT_ANSWER", "answer": "your concise answer", "reasoning": "brief explanation"}}
+
+3. KNOWLEDGE - If you need to search the knowledge base
+   {{"action": "KNOWLEDGE", "reasoning": "brief explanation"}}
+
+Available commands (whitelist):
+- Basic: date, whoami, pwd, ls, cat, grep, df, free, ps, top, uptime, uname, echo, head, tail, wc, find, which, hostname
+- Server: ollama, docker, systemctl, git, curl, wget, netstat, ss
+
+Examples:
+- "check my git status" → {{"action": "COMMAND", "command": "git status", "reasoning": "user wants git repository status"}}
+- "what are running processes" → {{"action": "COMMAND", "command": "ps aux", "reasoning": "user wants to see active processes"}}
+- "which model are you using" → {{"action": "DIRECT_ANSWER", "answer": "I'm using Qwen 2.5 14B via Ollama", "reasoning": "meta question about the assistant"}}
+- "how to secure S3" → {{"action": "KNOWLEDGE", "reasoning": "requires DevOps knowledge base"}}
+
+Respond ONLY with valid JSON, no other text."""
+
+        # Call Qwen via Ollama
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[{'role': 'user', 'content': prompt}],
+            options={'temperature': 0.1}  # Low temperature for consistent structured output
+        )
+        
+        result_text = response['message']['content'].strip()
+        
+        # Try to extract JSON if wrapped in markdown
+        import re
+        import json
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if json_match:
+            result_text = json_match.group(0)
+        
+        # Parse JSON response
+        result = json.loads(result_text)
+        
+        logger.info(f"[LLM Analysis] Action: {result.get('action')}, Reasoning: {result.get('reasoning')}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"[LLM Analysis] Error: {e}")
+        # Fallback to knowledge search on error
+        return {"action": "KNOWLEDGE", "reasoning": "fallback due to analysis error"}
+
+def extract_command_from_query(query):
+    """Extract command from natural language query using LLM analysis"""
+    analysis = analyze_query_with_llm(query)
+    
+    if analysis.get('action') == 'COMMAND':
+        proposed_cmd = analysis.get('command', '').strip()
+        
+        if proposed_cmd:
+            # Security validation - same whitelist enforcement as before
+            is_safe, reason = is_command_safe(proposed_cmd)
+            if is_safe:
+                logger.info(f"[Command Extraction] Approved: {proposed_cmd}")
+                return proposed_cmd
+            else:
+                logger.warning(f"[Command Extraction] Blocked: {proposed_cmd} - {reason}")
+                return None
+    
+    return None
+
+def get_ava_introduction():
+    """Return AVA's self-introduction"""
+    return """I'm **AVA** (Automated Virtual Assistant) - a specialized local DevOps AI agent running entirely on your machine.
+
+### What Makes Me Different
+
+**🔒 Private & Secure**
+- Everything runs locally (no cloud, no data leaks)
+- OPA policy enforcement for command safety
+- Whitelisted command execution only
+- No telemetry or external API calls
+
+**📚 Specialized Knowledge Base**
+- **3,885 curated chunks** from 5 GitHub repositories:
+  - DevOps Exercises (real-world Q&A scenarios)
+  - AWS DevOps Zero to Hero
+  - Jenkins Zero to Hero  
+  - Docker Zero to Hero
+  - Terraform Zero to Hero
+  - mrcloudbook.com best practices
+- Powered by Qwen 2.5 14B (local LLM)
+- ChromaDB for semantic search
+
+### What I Can Do
+
+**💡 Answer DevOps Questions**
+- AWS architecture, S3, RDS, VPC, IAM
+- Kubernetes deployments and strategies
+- Docker image optimization
+- Terraform infrastructure-as-code
+- Jenkins CI/CD pipelines
+
+**📄 Analyze Your Files**
+- Terraform (.tf, .hcl)
+- Docker (Dockerfile)
+- Kubernetes (.yaml, .yml)
+- Shell scripts (.sh)
+- Python (.py)
+- JSON configs
+
+**⚡ Execute Safe Commands**
+- Run whitelisted shell commands
+- Commands: date, whoami, pwd, ls, cat, grep, df, free, ps, top, uptime, etc.
+- OPA blocks dangerous operations
+
+**🔍 Provide Working Examples**
+- AWS CLI commands
+- Infrastructure code
+- Configuration files
+- Best practices
+
+### What I'm NOT
+
+- ❌ Not a general-purpose chatbot
+- ❌ Not connected to the internet
+- ❌ Not sending your data anywhere
+- ❌ Not replacing human expertise (verify critical decisions!)
+
+### Try Me With
+
+- "How to secure S3 buckets in production?"
+- "Analyze this Terraform file" (upload a .tf file)
+- "Design a highly available RDS setup"
+- "Run pwd" (safe command execution)
+
+I'm here to help with your DevOps journey - ask me anything!"""
+
+@app.route('/ask', methods=['POST'])
+def ask():
+    start_time = time.time()
+    try:
+        data = request.json
+        query = data.get('query', '').strip()
+        
+        if not query:
+            return jsonify({'error': 'No query provided'}), 400
+        
+        logger.info(f"Query: {query}")
+        
+        # Handle greetings
+        if is_greeting(query):
+            response = "Hello! I'm AVA, your local DevOps AI assistant. How can I help you today with infrastructure, containers, or cloud services?"
+            elapsed = time.time() - start_time
+            
+            save_history({
+                'timestamp': datetime.now().isoformat(),
+                'query': query,
+                'type': 'greeting',
+                'time_taken': f"{elapsed:.2f}s"
+            })
+            
+            return jsonify({
+                'type': 'knowledge',
+                'response': response,
+                'sources_used': 0,
+                'time_taken': f"{elapsed:.2f}s"
+            })
+        
+        # Check for multi-part query FIRST
+        questions = split_multi_query(query)
+        if len(questions) > 1:
+            logger.info(f"Detected {len(questions)} questions: {questions}")
+            results = []
+            
+            for idx, q in enumerate(questions, 1):
+                logger.info(f"[{idx}/{len(questions)}] Processing: {q}")
+                part_result = {'question': q, 'number': idx}
+                
+                # Get LLM analysis for this question
+                analysis = analyze_query_with_llm(q)
+                action_type = analysis.get('action')
+                
+                if action_type == 'COMMAND':
+                    # Extract and validate command
+                    cmd = extract_command_from_query(q)
+                    if cmd:
+                        logger.info(f"  -> Executing command: {cmd}")
+                        exec_result = execute_command(cmd, q)
+                        if exec_result.get('success') and exec_result.get('output'):
+                            cmd_analysis = analyze_command_output(cmd, exec_result['output'])
+                            if cmd_analysis:
+                                exec_result['analysis'] = cmd_analysis
+                        part_result['type'] = 'command'
+                        part_result['result'] = exec_result
+                    else:
+                        # Command was blocked by security
+                        part_result['type'] = 'knowledge'
+                        part_result['response'] = "This command was blocked by security restrictions."
+                        part_result['sources_used'] = 0
+                        
+                elif action_type == 'DIRECT_ANSWER':
+                    # Use LLM's direct answer
+                    logger.info(f"  -> Direct answer from LLM")
+                    answer = analysis.get('answer', 'I can help with that.')
+                    part_result['type'] = 'knowledge'
+                    part_result['response'] = answer
+                    part_result['sources_used'] = 0
+                    
+                else:  # KNOWLEDGE or fallback
+                    # Search knowledge base
+                    logger.info(f"  -> Searching knowledge base")
+                    context = query_knowledge_base(q)
+                    response = generate_response(q, context)
+                    part_result['type'] = 'knowledge'
+                    part_result['response'] = response
+                    part_result['sources_used'] = len(context)
+                
+                results.append(part_result)
+            
+            elapsed = time.time() - start_time
+            save_history({
+                'timestamp': datetime.now().isoformat(),
+                'query': query,
+                'type': 'multi',
+                'parts': len(questions),
+                'time_taken': f"{elapsed:.2f}s"
+            })
+            
+            return jsonify({
+                'type': 'multi',
+                'results': results,
+                'time_taken': f"{elapsed:.2f}s"
+            })
+        
+        # Use LLM to analyze query and decide action
+        logger.info("[*] Analyzing query with LLM...")
+        analysis = analyze_query_with_llm(query)
+        action_type = analysis.get('action')
+        
+        if action_type == 'COMMAND':
+            # Try to extract and validate command
+            extracted_cmd = extract_command_from_query(query)
+            if extracted_cmd:
+                logger.info(f"Extracted command: {extracted_cmd}")
+                result = execute_command(extracted_cmd, query)
+                
+                # Add analysis for successful commands
+                if result.get('success') and result.get('output'):
+                    logger.info("[*] Analyzing command output...")
+                    cmd_analysis = analyze_command_output(extracted_cmd, result['output'])
+                    if cmd_analysis:
+                        result['analysis'] = cmd_analysis
+                
+                elapsed = time.time() - start_time
+                
+                save_history({
+                    'timestamp': datetime.now().isoformat(),
+                    'query': query,
+                    'type': 'command',
+                    'blocked': result.get('blocked', False),
+                    'time_taken': f"{elapsed:.2f}s"
+                })
+                
+                return jsonify({
+                    'type': 'command',
+                    'result': result,
+                    'time_taken': f"{elapsed:.2f}s"
+                })
+            else:
+                # Command blocked by security
+                elapsed = time.time() - start_time
+                return jsonify({
+                    'type': 'knowledge',
+                    'response': "This command was blocked by security restrictions.",
+                    'sources_used': 0,
+                    'time_taken': f"{elapsed:.2f}s"
+                })
+                
+        elif action_type == 'DIRECT_ANSWER':
+            # Use LLM's direct answer
+            logger.info("[*] Using direct answer from LLM")
+            answer = analysis.get('answer', 'I can help with that.')
+            elapsed = time.time() - start_time
+            
+            save_history({
+                'timestamp': datetime.now().isoformat(),
+                'query': query,
+                'type': 'direct_answer',
+                'time_taken': f"{elapsed:.2f}s"
+            })
+            
+            return jsonify({
+                'type': 'knowledge',
+                'response': answer,
+                'sources_used': 0,
+                'time_taken': f"{elapsed:.2f}s"
+            })
+        
+        else:  # KNOWLEDGE or fallback
+            # Handle regular DevOps questions with RAG
+            logger.info("[*] Searching knowledge base...")
+            context = query_knowledge_base(query)
+            logger.info(f"[*] Found {len(context)} relevant chunks")
+            logger.info(f"[*] Thinking with {LLM_MODEL}...")
+            
+            response = generate_response(query, context)
+            elapsed = time.time() - start_time
+            
+            save_history({
+                'timestamp': datetime.now().isoformat(),
+                'query': query,
+                'type': 'knowledge',
+                'sources_used': len(context),
+                'time_taken': f"{elapsed:.2f}s",
+                'response_preview': response[:200] + '...' if len(response) > 200 else response
+            })
+            
+            return jsonify({
+                'type': 'knowledge',
+                'response': response,
+                'sources_used': len(context),
+                'time_taken': f"{elapsed:.2f}s"
+            })
+        
+    except Exception as e:
+        logger.error(f"Error in ask endpoint: {e}")
+        return jsonify({'error': 'Failed to process query', 'details': str(e)}), 500
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    start_time = time.time()
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        content = file.read().decode('utf-8', errors='ignore')
+        filename = file.filename
+        
+        logger.info(f"Analyzing file: {filename}")
+        
+        file_type = filename.split('.')[-1] if '.' in filename else 'unknown'
+        query = f"""Analyze this {file_type} file ({filename}) and provide:
+1. What it does
+2. Any issues or improvements
+3. Best practices recommendations
+
+File content:
+{content[:3000]}"""
+        
+        context = query_knowledge_base(f"best practices for {file_type} files")
+        analysis = generate_response(query, context)
+        elapsed = time.time() - start_time
+        
+        save_history({
+            'timestamp': datetime.now().isoformat(),
+            'query': f"File analysis: {filename}",
+            'type': 'file_analysis',
+            'filename': filename,
+            'time_taken': f"{elapsed:.2f}s"
+        })
+        
+        return jsonify({
+            'type': 'file_analysis',
+            'filename': filename,
+            'analysis': analysis,
+            'time_taken': f"{elapsed:.2f}s"
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in upload endpoint: {e}")
+        return jsonify({'error': 'Failed to analyze file', 'details': str(e)}), 500
+
+@app.route('/history', methods=['GET'])
+def get_history():
+    try:
+        history = load_history()
+        return jsonify({'history': history[-50:], 'total': len(history)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    return jsonify(STATS)
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/security/stats', methods=['GET'])
+def get_security_stats_route():
+    """Get security statistics for dashboard"""
+    try:
+        from control.approval import get_pending
+        from datetime import timedelta
+        
+        # Load audit log
+        audit_log_path = "/mnt/i/ai-lab/security_audit.json"
+        if os.path.exists(audit_log_path):
+            with open(audit_log_path, 'r') as f:
+                audit_log = json.load(f)
+        else:
+            audit_log = []
+        
+        # Get stats for last 24 hours
+        cutoff = datetime.now() - timedelta(hours=24)
+        recent = [
+            entry for entry in audit_log
+            if datetime.fromisoformat(entry['timestamp']) > cutoff
+        ]
+        
+        stats = {
+            'total_commands': len(recent),
+            'executed': len([e for e in recent if e['event_type'] == 'executed']),
+            'blocked': len([e for e in recent if e['event_type'] == 'blocked']),
+            'pending': len(get_pending()),
+            'high_risk': len([e for e in recent if e.get('risk_analysis', {}).get('risk') in ['high', 'critical']]),
+            'threats_detected': sum(len(e.get('threats', [])) for e in recent)
+        }
+        
+        return jsonify(stats)
+        
+    except Exception as e:
+        logger.error(f"Error getting security stats: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/security/audit', methods=['GET'])
+def get_audit_log_route():
+    """Get audit log entries"""
+    try:
+        count = int(request.args.get('count', 10))
+        
+        audit_log_path = "/mnt/i/ai-lab/security_audit.json"
+        if os.path.exists(audit_log_path):
+            with open(audit_log_path, 'r') as f:
+                audit_log = json.load(f)
+        else:
+            audit_log = []
+        
+        return jsonify({
+            'total': len(audit_log),
+            'entries': audit_log[-count:]
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting audit log: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# HTML Template
+HTML_TEMPLATE = r'''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AVA - DevOps AI Agent v2.1.2</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            height: 100vh;
+            overflow: hidden;
+        }
+        
+        .app-container {
+            display: flex;
+            height: 100vh;
+        }
+        
+        /* Sidebar */
+        .sidebar {
+            width: 260px;
+            background: #171717;
+            border-right: 1px solid #2a2a2a;
+            display: flex;
+            flex-direction: column;
+            padding: 16px;
+        }
+        
+        .sidebar-header {
+            padding: 12px 16px;
+            margin-bottom: 20px;
+        }
+        
+        .sidebar-title {
+            font-size: 20px;
+            font-weight: 600;
+            color: #fff;
+        }
+        
+        .sidebar-btn {
+            width: 100%;
+            padding: 10px 16px;
+            background: #2a2a2a;
+            border: 1px solid #3a3a3a;
+            border-radius: 8px;
+            color: #e0e0e0;
+            font-size: 14px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+            transition: all 0.2s;
+        }
+        
+        .sidebar-btn:hover {
+            background: #333;
+        }
+        
+        .sidebar-section {
+            margin-top: 24px;
+            flex: 1;
+            overflow-y: auto;
+        }
+        
+        .sidebar-section-title {
+            font-size: 12px;
+            font-weight: 600;
+            color: #888;
+            text-transform: uppercase;
+            padding: 8px 16px;
+            margin-bottom: 8px;
+        }
+        
+        .chat-item {
+            padding: 10px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            color: #aaa;
+            transition: all 0.2s;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .chat-item:hover {
+            background: #2a2a2a;
+            color: #fff;
+        }
+        
+        /* Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            animation: fadeIn 0.2s;
+        }
+        
+        .modal-content {
+            background: #1f1f1f;
+            margin: 5% auto;
+            padding: 0;
+            border: 1px solid #3a3a3a;
+            border-radius: 12px;
+            width: 90%;
+            max-width: 700px;
+            max-height: 80vh;
+            overflow: hidden;
+            animation: slideUp 0.3s;
+        }
+        
+        @keyframes slideUp {
+            from { transform: translateY(50px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        
+        .modal-header {
+            padding: 20px 24px;
+            border-bottom: 1px solid #2a2a2a;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .modal-title {
+            font-size: 18px;
+            font-weight: 600;
+        }
+        
+        .modal-close {
+            background: none;
+            border: none;
+            color: #888;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            width: 32px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 6px;
+            transition: all 0.2s;
+        }
+        
+        .modal-close:hover {
+            background: #2a2a2a;
+            color: #fff;
+        }
+        
+        .modal-body {
+            padding: 24px;
+            max-height: calc(80vh - 80px);
+            overflow-y: auto;
+        }
+        
+        .history-item {
+            padding: 16px;
+            background: #242424;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            border: 1px solid #2a2a2a;
+        }
+        
+        .history-query {
+            font-weight: 500;
+            margin-bottom: 8px;
+            color: #fff;
+        }
+        
+        .history-meta {
+            font-size: 12px;
+            color: #888;
+            display: flex;
+            gap: 12px;
+        }
+        
+        .stat-card {
+            padding: 16px;
+            background: #242424;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            border: 1px solid #2a2a2a;
+        }
+        
+        .stat-label {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 4px;
+        }
+        
+        .stat-value {
+            font-size: 24px;
+            font-weight: 600;
+            color: #667eea;
+        }
+        
+        /* Main Content */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: #1a1a1a;
+        }
+        
+        .top-bar {
+            padding: 16px 24px;
+            border-bottom: 1px solid #2a2a2a;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        
+        .stats {
+            display: flex;
+            gap: 16px;
+            font-size: 13px;
+            color: #888;
+        }
+        
+        .stat-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        /* Chat Area */
+        .chat-area {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+        
+        .welcome-screen {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            text-align: center;
+        }
+        
+        .welcome-title {
+            font-size: 32px;
+            font-weight: 600;
+            margin-bottom: 12px;
+        }
+        
+        .welcome-subtitle {
+            font-size: 16px;
+            color: #888;
+            margin-bottom: 32px;
+        }
+        
+        .example-prompts {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 12px;
+            max-width: 800px;
+            width: 100%;
+            margin-top: 24px;
+        }
+        
+        .example-prompt {
+            padding: 16px;
+            background: #242424;
+            border: 1px solid #333;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: left;
+        }
+        
+        .example-prompt:hover {
+            background: #2a2a2a;
+            border-color: #444;
+        }
+        
+        .example-icon {
+            font-size: 20px;
+            margin-bottom: 8px;
+        }
+        
+        .example-text {
+            font-size: 14px;
+            color: #ccc;
+        }
+        
+        /* Messages */
+        .message {
+            display: flex;
+            gap: 16px;
+            max-width: 900px;
+            margin: 0 auto;
+            width: 100%;
+            animation: fadeIn 0.3s ease;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .message-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        
+        .message-content {
+            flex: 1;
+            padding-top: 4px;
+        }
+        
+        .message-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+        }
+        
+        .message-author {
+            font-weight: 600;
+            font-size: 14px;
+        }
+        
+        .message-meta {
+            font-size: 12px;
+            color: #666;
+        }
+        
+        .message-text {
+            line-height: 1.7;
+            font-size: 15px;
+            color: #d0d0d0;
+        }
+        
+        .message.user .message-text {
+            color: #fff;
+            font-weight: 500;
+        }
+        
+        .message-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        
+        .action-btn {
+            padding: 6px 12px;
+            background: #2a2a2a;
+            border: 1px solid #3a3a3a;
+            border-radius: 6px;
+            color: #aaa;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .action-btn:hover {
+            background: #333;
+            color: #fff;
+        }
+        
+        /* Code blocks */
+        pre {
+            background: #0d0d0d;
+            border: 1px solid #2a2a2a;
+            border-radius: 8px;
+            padding: 16px;
+            overflow-x: auto;
+            margin: 12px 0;
+        }
+        
+        code {
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        
+        /* Input Area */
+        .input-container {
+            border-top: 1px solid #2a2a2a;
+            padding: 20px 24px;
+            background: #1a1a1a;
+        }
+        
+        .input-wrapper {
+            max-width: 900px;
+            margin: 0 auto;
+            position: relative;
+        }
+        
+        .input-box {
+            display: flex;
+            align-items: flex-end;
+            background: #242424;
+            border: 1px solid #3a3a3a;
+            border-radius: 12px;
+            padding: 12px;
+            transition: all 0.2s;
+        }
+        
+        .input-box:focus-within {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .input-actions {
+            display: flex;
+            gap: 8px;
+            margin-right: 8px;
+        }
+        
+        .input-action-btn {
+            width: 32px;
+            height: 32px;
+            border-radius: 8px;
+            background: #2a2a2a;
+            border: none;
+            color: #888;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+        }
+        
+        .input-action-btn:hover {
+            background: #333;
+            color: #fff;
+        }
+        
+        #queryInput {
+            flex: 1;
+            background: transparent;
+            border: none;
+            outline: none;
+            color: #fff;
+            font-size: 15px;
+            font-family: 'Inter', sans-serif;
+            resize: none;
+            min-height: 24px;
+            max-height: 200px;
+            line-height: 1.5;
+        }
+        
+        #queryInput:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .send-btn {
+            width: 36px;
+            height: 36px;
+            border-radius: 8px;
+            background: #667eea;
+            border: none;
+            color: #fff;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            flex-shrink: 0;
+        }
+        
+        .send-btn:hover {
+            background: #5568d3;
+        }
+        
+        .send-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .disclaimer {
+            text-align: center;
+            font-size: 12px;
+            color: #666;
+            margin-top: 12px;
+            max-width: 900px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        
+        /* Loading */
+        .loading-message {
+            display: flex;
+            gap: 16px;
+            max-width: 900px;
+            margin: 0 auto;
+            width: 100%;
+        }
+        
+        .loading-dots {
+            display: flex;
+            gap: 4px;
+            padding: 12px 0;
+        }
+        
+        .loading-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #667eea;
+            animation: bounce 1.4s infinite ease-in-out;
+        }
+        
+        .loading-dot:nth-child(1) { animation-delay: -0.32s; }
+        .loading-dot:nth-child(2) { animation-delay: -0.16s; }
+        
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1); }
+        }
+        
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: #1a1a1a;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: #3a3a3a;
+            border-radius: 3px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: #4a4a4a;
+        }
+        
+        /* Hidden file input */
+        #fileInput {
+            display: none;
+        }
+        
+        /* Security Badge & Dashboard Styles */
+        .badge {
+            background: #ff4444;
+            color: white;
+            border-radius: 10px;
+            padding: 2px 8px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-left: auto;
+        }
+        
+        .security-stat {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: #242424;
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }
+        
+        .security-stat-label {
+            color: #aaa;
+            font-size: 14px;
+        }
+        
+        .security-stat-value {
+            color: #667eea;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        
+        .security-stat-value.danger {
+            color: #ff6b6b;
+        }
+        
+        .security-stat-value.success {
+            color: #51cf66;
+        }
+        
+        .audit-entry {
+            padding: 12px;
+            background: #242424;
+            border-radius: 6px;
+            margin-bottom: 8px;
+            border-left: 3px solid #667eea;
+            font-size: 13px;
+        }
+        
+        .audit-entry.blocked {
+            border-left-color: #ff6b6b;
+        }
+        
+        .audit-entry.executed {
+            border-left-color: #51cf66;
+        }
+        
+        .audit-time {
+            color: #888;
+            font-size: 11px;
+            margin-bottom: 4px;
+        }
+        
+        .audit-command {
+            color: #fff;
+            font-family: 'Monaco', monospace;
+            margin-bottom: 4px;
+        }
+        
+        .audit-risk {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-right: 8px;
+        }
+        
+        .audit-risk.high {
+            background: #ff6b6b22;
+            color: #ff6b6b;
+        }
+        
+        .audit-risk.low {
+            background: #51cf6622;
+            color: #51cf66;
+        }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <div class="sidebar-title">AVA</div>
+            </div>
+            
+            <button class="sidebar-btn" onclick="newChat()">
+                <span>+</span>
+                <span>New chat</span>
+            </button>
+            
+            <button class="sidebar-btn" onclick="showHistoryModal()">
+                <span>📜</span>
+                <span>History</span>
+            </button>
+            
+            <button class="sidebar-btn" onclick="showStatsModal()">
+                <span>📊</span>
+                <span>Stats</span>
+            </button>
+            
+            <button class="sidebar-btn" onclick="showSettingsModal()">
+                <span>⚙️</span>
+                <span>Settings</span>
+            </button>
+            
+            <button class="sidebar-btn" onclick="showSecurityModal()">
+                <span>🛡️</span>
+                <span>Security</span>
+                <span id="securityBadge" class="badge" style="display: none;"></span>
+            </button>
+            
+            <div class="sidebar-section">
+                <div class="sidebar-section-title">Recent Chats</div>
+                <div id="recentChats"></div>
+            </div>
+        </div>
+        
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Top bar removed for more space - stats moved to Stats modal -->
+            
+            <!-- Chat Area -->
+            
+            <div class="chat-area" id="chatArea">
+                <div class="welcome-screen" id="welcomeScreen">
+                    <div class="welcome-title">What can I help with?</div>
+                    <div class="welcome-subtitle">Ask about DevOps, infrastructure, Terraform, Kubernetes, or run shell commands</div>
+                    
+                    <div class="example-prompts">
+                        <div class="example-prompt" onclick="askExample('How to secure S3 buckets in production?')">
+                            <div class="example-icon">🔒</div>
+                            <div class="example-text">Secure S3 buckets</div>
+                        </div>
+                        <div class="example-prompt" onclick="askExample('Design a highly available RDS setup')">
+                            <div class="example-icon">🗄️</div>
+                            <div class="example-text">HA database design</div>
+                        </div>
+                        <div class="example-prompt" onclick="askExample('How to reduce Docker image size?')">
+                            <div class="example-icon">🐳</div>
+                            <div class="example-text">Optimize Docker images</div>
+                        </div>
+                        <div class="example-prompt" onclick="askExample('Kubernetes deployment strategies')">
+                            <div class="example-icon">☸️</div>
+                            <div class="example-text">K8s deployments</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="input-container">
+                <div class="input-wrapper">
+                    <div class="input-box">
+                        <div class="input-actions">
+                            <button class="input-action-btn" onclick="document.getElementById('fileInput').click()" title="Upload file">
+                                <span>+</span>
+                            </button>
+                            <input type="file" id="fileInput" accept=".tf,.yml,.yaml,.json,.sh,.py,.md,.hcl" onchange="handleFileUpload(this)">
+                        </div>
+                        <textarea id="queryInput" placeholder="Ask anything..." rows="1" onkeydown="handleKeyPress(event)" oninput="autoResize(this)"></textarea>
+                        <button class="send-btn" onclick="sendQuery()" id="sendBtn">
+                            <span>→</span>
+                        </button>
+                    </div>
+                    <div class="disclaimer">
+                        AVA is a DevOps AI agent that can make mistakes. Verify important information.
+                        <span style="color: #667eea; margin-left: 8px;">• Powered by Qwen 2.5 14B</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- History Modal -->
+    <div id="historyModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span class="modal-title">Query History</span>
+                <button class="modal-close" onclick="closeModal('historyModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="historyContent">
+                <p style="color: #888;">Loading...</p>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Stats Modal -->
+    <div id="statsModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span class="modal-title">Knowledge Base Stats</span>
+                <button class="modal-close" onclick="closeModal('statsModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="statsContent">
+                <p style="color: #888;">Loading...</p>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span class="modal-title">Settings</span>
+                <button class="modal-close" onclick="closeModal('settingsModal')">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="stat-card">
+                    <div class="stat-label">Model</div>
+                    <div style="color: #fff;">Qwen 2.5 14B (Local)</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Security</div>
+                    <div style="color: #fff;">OPA Policy Enforcement: Enabled</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Command Whitelist (Read-Only)</div>
+                    <div style="color: #fff; font-size: 13px; line-height: 1.6;">
+                        <strong>Basic:</strong> date, whoami, pwd, ls, cat, grep, df, free, ps, top, uptime, uname, echo, head, tail, wc, find, which, hostname<br>
+                        <strong>Server:</strong> ollama, docker, systemctl, git, curl, wget, netstat, ss
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    
+    <!-- Security Modal -->
+    <div id="securityModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span class="modal-title">🛡️ Security Dashboard</span>
+                <button class="modal-close" onclick="closeModal('securityModal')">&times;</button>
+            </div>
+            <div class="modal-body" id="securityContent">
+                <p style="color: #888;">Loading...</p>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        console.log('AVA v2.1.2 - Script loading...');
+        console.log('PORT 5002 - FRESH CACHE');
+        
+        // Global error handler
+        window.addEventListener('error', function(e) {
+            console.error('Global error:', e.message, e.filename, e.lineno);
+        });
+        
+        // Wait for DOM to be ready
+        document.addEventListener('DOMContentLoaded', function() {
+            console.log('AVA: DOM loaded successfully');
+            
+            try {
+                // Load recent chats
+                loadRecentChats();
+                console.log('AVA: Recent chats loaded');
+            } catch (err) {
+                console.error('AVA: Error during initialization:', err);
+            }
+        });
+        
+        // Stats are now loaded in the Stats modal on-demand
+        
+        function loadRecentChats() {
+            fetch('/history')
+                .then(r => r.json())
+                .then(data => {
+                    const container = document.getElementById('recentChats');
+                    if (!container) {
+                        console.warn('recentChats container not found');
+                        return;
+                    }
+                    const recent = data.history.slice(-10).reverse();
+                    if (recent.length === 0) {
+                        container.innerHTML = '<div class="chat-item" style="color: #666;">No recent chats</div>';
+                        return;
+                    }
+                    container.innerHTML = recent.map(h => 
+                        `<div class="chat-item">${h.query.substring(0, 30)}${h.query.length > 30 ? '...' : ''}</div>`
+                    ).join('');
+                })
+                .catch(err => {
+                    console.error('Error loading recent chats:', err);
+                });
+        }
+        
+        function newChat() {
+            console.log('newChat called');
+            try {
+                location.reload();
+            } catch (err) {
+                console.error('Error in newChat:', err);
+            }
+        }
+        
+        function showHistoryModal() {
+            console.log('showHistoryModal called');
+            try {
+                document.getElementById('historyModal').style.display = 'block';
+                fetch('/history')
+                    .then(r => r.json())
+                    .then(data => {
+                        const content = document.getElementById('historyContent');
+                        if (data.history.length === 0) {
+                            content.innerHTML = '<p style="color: #888; text-align: center;">No history yet</p>';
+                            return;
+                        }
+                        content.innerHTML = data.history.reverse().map(h => `
+                            <div class="history-item">
+                                <div class="history-query">${h.query}</div>
+                                <div class="history-meta">
+                                    <span>${h.type}</span>
+                                    <span>${h.time_taken || 'N/A'}</span>
+                                    <span>${new Date(h.timestamp).toLocaleString()}</span>
+                                </div>
+                            </div>
+                        `).join('');
+                    })
+                    .catch(err => console.error('Error loading history:', err));
+            } catch (err) {
+                console.error('Error in showHistoryModal:', err);
+            }
+        }
+        
+        function showStatsModal() {
+            console.log('showStatsModal called');
+            try {
+                document.getElementById('statsModal').style.display = 'block';
+                fetch('/stats')
+                    .then(r => r.json())
+                    .then(data => {
+                        const content = document.getElementById('statsContent');
+                        content.innerHTML = `
+                            <div class="stat-card">
+                                <div class="stat-label">📚 Knowledge Base</div>
+                                <div class="stat-value">${data.total_chunks.toLocaleString()} chunks indexed</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-label">🔧 Source Repositories</div>
+                                <div class="stat-value">${data.repos} GitHub repos</div>
+                                <div style="color: #888; font-size: 13px; margin-top: 6px;">
+                                    DevOps Exercises, AWS/Jenkins/Docker/Terraform Zero to Hero
+                                </div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-label">🤖 LLM Model</div>
+                                <div class="stat-value" style="font-size: 18px;">${data.model}</div>
+                                <div style="color: #888; font-size: 13px; margin-top: 6px;">
+                                    14B parameters • Local inference via Ollama
+                                </div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-label">🔢 Token Usage (Current Session)</div>
+                                <div class="stat-value">${data.total_tokens ? data.total_tokens.toLocaleString() : '0'} tokens</div>
+                                <div style="color: #888; font-size: 13px; margin-top: 6px;">
+                                    Queries: ${data.query_count || 0} • Avg: ${data.avg_tokens_per_query || 0} tokens/query
+                                </div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-label">🛡️ Security</div>
+                                <div class="stat-value">${data.opa_enabled ? 'OPA Policy Enforcement Enabled' : 'Disabled'}</div>
+                                <div style="color: #888; font-size: 13px; margin-top: 6px;">
+                                    Whitelist: ${data.whitelisted_commands || 0} commands • Blocked paths enforced
+                                </div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-label">💾 Storage</div>
+                                <div class="stat-value">ChromaDB Vector Store</div>
+                                <div style="color: #888; font-size: 13px; margin-top: 6px;">
+                                    Embedding: nomic-embed-text • Collection: devops_policies_v2
+                                </div>
+                            </div>
+                        `;
+                    })
+                    .catch(err => console.error('Error loading stats:', err));
+            } catch (err) {
+                console.error('Error in showStatsModal:', err);
+            }
+        }
+        
+        function showSettingsModal() {
+            console.log('showSettingsModal called');
+            try {
+                document.getElementById('settingsModal').style.display = 'block';
+            } catch (err) {
+                console.error('Error in showSettingsModal:', err);
+            }
+        }
+        
+        function closeModal(modalId) {
+            console.log('closeModal called:', modalId);
+            try {
+                document.getElementById(modalId).style.display = 'none';
+            } catch (err) {
+                console.error('Error in closeModal:', err);
+            }
+        }
+        
+        // Close modal on outside click
+        window.onclick = function(event) {
+            if (event.target.classList.contains('modal')) {
+                event.target.style.display = 'none';
+            }
+        }
+        
+        function autoResize(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = textarea.scrollHeight + 'px';
+        }
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendQuery();
+            }
+        }
+        
+        function askExample(query) {
+            document.getElementById('queryInput').value = query;
+            sendQuery();
+        }
+        
+        function hideWelcome() {
+            const welcome = document.getElementById('welcomeScreen');
+            if (welcome) welcome.style.display = 'none';
+        }
+        
+        function addUserMessage(text) {
+            hideWelcome();
+            const chatArea = document.getElementById('chatArea');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message user';
+            messageDiv.innerHTML = `
+                <div class="message-avatar">You</div>
+                <div class="message-content">
+                    <div class="message-text">${escapeHtml(text)}</div>
+                </div>
+            `;
+            chatArea.appendChild(messageDiv);
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+        
+        function addLoadingMessage(action = 'thinking') {
+            const chatArea = document.getElementById('chatArea');
+            const loadingDiv = document.createElement('div');
+            loadingDiv.className = 'loading-message';
+            loadingDiv.id = 'loadingMessage';
+            
+            const actionText = {
+                'thinking': 'Thinking',
+                'executing': 'Executing command',
+                'analyzing': 'Analyzing file',
+                'searching': 'Searching knowledge base'
+            }[action] || 'Processing';
+            
+            loadingDiv.innerHTML = `
+                <div class="message-avatar" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">AVA</div>
+                <div class="message-content">
+                    <div style="color: #888; font-size: 13px; margin-bottom: 4px;">${actionText}...</div>
+                    <div class="loading-dots">
+                        <div class="loading-dot"></div>
+                        <div class="loading-dot"></div>
+                        <div class="loading-dot"></div>
+                    </div>
+                </div>
+            `;
+            chatArea.appendChild(loadingDiv);
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+        
+        function removeLoadingMessage() {
+            const loading = document.getElementById('loadingMessage');
+            if (loading) loading.remove();
+        }
+        
+        function addAVAMessage(data) {
+            removeLoadingMessage();
+            const chatArea = document.getElementById('chatArea');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message';
+            
+            let content = '';
+            
+            // Handle multi-part responses
+            if (data.type === 'multi') {
+                content = '<div style="margin: 8px 0;">';
+                content += `<div style="font-size: 13px; color: #667eea; margin-bottom: 12px; font-weight: 600;">📋 Processing ${data.results.length} questions...</div>`;
+                
+                data.results.forEach((part, idx) => {
+                    content += `<div style="margin-bottom: ${idx < data.results.length - 1 ? '24px' : '0'}; padding-bottom: ${idx < data.results.length - 1 ? '24px' : '0'}; border-bottom: ${idx < data.results.length - 1 ? '1px solid #2a2a2a' : 'none'};">`;
+                    content += `<div style="font-size: 13px; color: #888; margin-bottom: 8px;">Question ${part.number}: ${escapeHtml(part.question)}</div>`;
+                    
+                    if (part.type === 'command') {
+                        if (part.result.blocked) {
+                            content += `<div style="color: #ff6b6b; padding: 12px; background: #2a1a1a; border-left: 3px solid #ff6b6b; border-radius: 6px;">
+                                <strong>🛡️ Command Blocked</strong><br>
+                                ${escapeHtml(part.result.reason)}
+                            </div>`;
+                        } else if (part.result.success) {
+                            const output = escapeHtml(part.result.output || 'Command executed successfully');
+                            let analysisHtml = '';
+                            if (part.result.analysis) {
+                                analysisHtml = `<div style="margin-top: 12px; padding: 12px; background: #1a1a2e; border-left: 3px solid #667eea; border-radius: 6px;">
+                                    <div style="font-size: 12px; color: #667eea; margin-bottom: 6px; font-weight: 600;">📊 Analysis</div>
+                                    <div style="color: #ddd; font-size: 14px; line-height: 1.6;">${escapeHtml(part.result.analysis)}</div>
+                                </div>`;
+                            }
+                            content += `<div style="font-size: 12px; color: #667eea; margin-bottom: 6px;">✓ Command executed</div>
+                                <pre style="background: #0a0a0a; border: 1px solid #333; border-radius: 8px; padding: 16px; overflow-x: auto; margin: 0;">
+                                    <code style="color: #00ff00; font-family: 'Monaco', 'Courier New', monospace; font-size: 13px; line-height: 1.6;">${output}</code>
+                                </pre>
+                                ${analysisHtml}`;
+                        }
+                    } else {
+                        content += formatResponse(part.response);
+                    }
+                    
+                    content += '</div>';
+                });
+                
+                content += '</div>';
+            }
+            // Handle single command response
+            else if (data.type === 'command') {
+                if (data.result.blocked) {
+                    content = `<div style="color: #ff6b6b; padding: 12px; background: #2a1a1a; border-left: 3px solid #ff6b6b; border-radius: 6px;">
+                        <strong>🛡️ Command Blocked</strong><br>
+                        ${escapeHtml(data.result.reason)}<br>
+                        <small style="color: #aaa;">${data.result.suggestion || ''}</small>
+                    </div>`;
+                } else if (data.result.success) {
+                    const output = escapeHtml(data.result.output || 'Command executed successfully');
+                    let analysisHtml = '';
+                    
+                    // Add analysis if available
+                    if (data.result.analysis) {
+                        analysisHtml = `<div style="margin-top: 12px; padding: 12px; background: #1a1a2e; border-left: 3px solid #667eea; border-radius: 6px;">
+                            <div style="font-size: 12px; color: #667eea; margin-bottom: 6px; font-weight: 600;">📊 Analysis</div>
+                            <div style="color: #ddd; font-size: 14px; line-height: 1.6;">${escapeHtml(data.result.analysis)}</div>
+                        </div>`;
+                    }
+                    
+                    content = `<div style="margin: 8px 0;">
+                        <div style="font-size: 12px; color: #667eea; margin-bottom: 6px;">✓ Command executed</div>
+                        <pre style="background: #0a0a0a; border: 1px solid #333; border-radius: 8px; padding: 16px; overflow-x: auto; margin: 0;">
+                            <code style="color: #00ff00; font-family: 'Monaco', 'Courier New', monospace; font-size: 13px; line-height: 1.6;">${output}</code>
+                        </pre>
+                        ${analysisHtml}
+                    </div>`;
+                } else {
+                    content = `<div style="color: #ff6b6b; padding: 12px; background: #2a1a1a; border-left: 3px solid #ff6b6b; border-radius: 6px;">
+                        <strong>❌ Error</strong><br>
+                        ${escapeHtml(data.result.reason || 'Command failed')}
+                    </div>`;
+                }
+            } else {
+                // Handle single knowledge response
+                content = formatResponse(data.response || data.analysis);
+            }
+            
+            messageDiv.innerHTML = `
+                <div class="message-avatar" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">AVA</div>
+                <div class="message-content">
+                    <div class="message-header">
+                        <span class="message-author">AVA</span>
+                        <span class="message-meta">${data.sources_used ? data.sources_used + ' sources • ' : ''}${data.time_taken}</span>
+                    </div>
+                    <div class="message-text">${content}</div>
+                    <div class="message-actions">
+                        <button class="action-btn" onclick="copyMessage(this)">📋 Copy</button>
+                    </div>
+                </div>
+            `;
+            chatArea.appendChild(messageDiv);
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+        
+        function sendQuery() {
+            const input = document.getElementById('queryInput');
+            const sendBtn = document.getElementById('sendBtn');
+            const query = input.value.trim();
+            if (!query) return;
+            
+            // Disable input and button during processing
+            input.disabled = true;
+            sendBtn.disabled = true;
+            
+            addUserMessage(query);
+            input.value = '';
+            input.style.height = 'auto';
+            
+            // Detect if it's likely a command
+            const queryLower = query.toLowerCase();
+            const isCommand = queryLower.startsWith('run ') || 
+                            queryLower.startsWith('execute ') || 
+                            queryLower.startsWith('shell ') ||
+                            queryLower.includes('show me') ||
+                            queryLower.startsWith('show ') ||
+                            queryLower.startsWith('list ') ||
+                            queryLower.startsWith('check ');
+            
+            addLoadingMessage(isCommand ? 'executing' : 'searching');
+            
+            fetch('/ask', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({query: query})
+            })
+            .then(r => r.json())
+            .then(data => {
+                addAVAMessage(data);
+                loadRecentChats();
+            })
+            .catch(err => {
+                removeLoadingMessage();
+                alert('Error: ' + err.message);
+            })
+            .finally(() => {
+                // Re-enable input and button
+                input.disabled = false;
+                sendBtn.disabled = false;
+                input.focus();
+            });
+        }
+        
+        function handleFileUpload(input) {
+            const file = input.files[0];
+            if (!file) return;
+            
+            const queryInput = document.getElementById('queryInput');
+            const sendBtn = document.getElementById('sendBtn');
+            
+            // Disable during processing
+            queryInput.disabled = true;
+            sendBtn.disabled = true;
+            
+            hideWelcome();
+            addUserMessage(`📄 Analyzing file: ${file.name}`);
+            addLoadingMessage('analyzing');
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            fetch('/upload', {
+                method: 'POST',
+                body: formData
+            })
+            .then(r => r.json())
+            .then(data => {
+                addAVAMessage(data);
+                input.value = '';
+                loadRecentChats();
+            })
+            .catch(err => {
+                removeLoadingMessage();
+                alert('Error: ' + err.message);
+            })
+            .finally(() => {
+                // Re-enable
+                queryInput.disabled = false;
+                sendBtn.disabled = false;
+                queryInput.focus();
+            });
+        }
+        
+        function formatResponse(text) {
+            text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+            text = text.replace(/`([^`]+)`/g, '<code style="background: #2a2a2a; padding: 2px 6px; border-radius: 4px; font-size: 13px;">$1</code>');
+            text = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+            text = text.replace(/\n/g, '<br>');
+            return text;
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        function copyMessage(button) {
+            const messageText = button.closest('.message-content').querySelector('.message-text').innerText;
+            
+            const textarea = document.createElement('textarea');
+            textarea.value = messageText;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            
+            try {
+                document.execCommand('copy');
+                button.textContent = '✓ Copied';
+                setTimeout(() => button.textContent = '📋 Copy', 2000);
+            } catch (err) {
+                alert('Copy failed');
+            }
+            
+            document.body.removeChild(textarea);
+        }
+        
+        // Security Dashboard Functions
+        function showSecurityModal() {
+            document.getElementById('securityModal').style.display = 'block';
+            loadSecurityData();
+        }
+        
+        function loadSecurityData() {
+            Promise.all([
+                fetch('/security/stats').then(r => r.json()),
+                fetch('/security/audit?count=10').then(r => r.json())
+            ])
+            .then(([stats, audit]) => {
+                displaySecurityData(stats, audit);
+            })
+            .catch(err => {
+                console.error('Error loading security data:', err);
+                document.getElementById('securityContent').innerHTML = 
+                    '<p style="color: #ff6b6b;">Error loading security data</p>';
+            });
+        }
+        
+        function displaySecurityData(stats, audit) {
+            const content = document.getElementById('securityContent');
+            
+            let html = '<div style="margin-bottom: 24px;">';
+            html += '<h3 style="margin-bottom: 12px; font-size: 14px; color: #888; text-transform: uppercase;">Last 24 Hours</h3>';
+            
+            html += `<div class="security-stat">
+                <span class="security-stat-label">Total Commands</span>
+                <span class="security-stat-value">${stats.total_commands}</span>
+            </div>`;
+            
+            html += `<div class="security-stat">
+                <span class="security-stat-label">Executed</span>
+                <span class="security-stat-value success">${stats.executed}</span>
+            </div>`;
+            
+            html += `<div class="security-stat">
+                <span class="security-stat-label">Blocked</span>
+                <span class="security-stat-value ${stats.blocked > 0 ? 'danger' : ''}">${stats.blocked}</span>
+            </div>`;
+            
+            html += `<div class="security-stat">
+                <span class="security-stat-label">Pending Approval</span>
+                <span class="security-stat-value ${stats.pending > 0 ? 'danger' : ''}">${stats.pending}</span>
+            </div>`;
+            
+            html += `<div class="security-stat">
+                <span class="security-stat-label">High Risk Commands</span>
+                <span class="security-stat-value">${stats.high_risk}</span>
+            </div>`;
+            
+            html += `<div class="security-stat">
+                <span class="security-stat-label">Threats Detected</span>
+                <span class="security-stat-value ${stats.threats_detected > 0 ? 'danger' : ''}">${stats.threats_detected}</span>
+            </div>`;
+            
+            html += '</div>';
+            
+            // Recent audit entries
+            html += '<div>';
+            html += '<h3 style="margin-bottom: 12px; font-size: 14px; color: #888; text-transform: uppercase;">Recent Activity</h3>';
+            
+            if (audit.entries && audit.entries.length > 0) {
+                audit.entries.reverse().forEach(entry => {
+                    const eventClass = entry.event_type === 'blocked' ? 'blocked' : 
+                                      entry.event_type === 'executed' ? 'executed' : '';
+                    const risk = entry.risk_analysis?.risk || 'unknown';
+                    const riskClass = risk === 'high' || risk === 'critical' ? 'high' : 'low';
+                    
+                    html += `<div class="audit-entry ${eventClass}">
+                        <div class="audit-time">${new Date(entry.timestamp).toLocaleString()}</div>
+                        <div class="audit-command">${escapeHtml(entry.cmd || 'N/A')}</div>
+                        <div>
+                            <span class="audit-risk ${riskClass}">${risk.toUpperCase()}</span>
+                            <span style="color: #888; font-size: 11px;">${entry.event_type.replace(/_/g, ' ').toUpperCase()}</span>
+                        </div>
+                    </div>`;
+                });
+            } else {
+                html += '<p style="color: #888; text-align: center;">No recent activity</p>';
+            }
+            
+            html += '</div>';
+            
+            // CLI instructions
+            html += `<div style="margin-top: 24px; padding: 16px; background: #1a1a2e; border-radius: 8px; border-left: 3px solid #667eea;">
+                <div style="font-size: 12px; color: #667eea; margin-bottom: 6px; font-weight: 600;">📋 CLI Commands</div>
+                <div style="color: #ddd; font-size: 13px; line-height: 1.8;">
+                    <code style="background: #0a0a0a; padding: 2px 6px; border-radius: 3px;">python3 -m control.security_review</code> - Review pending<br>
+                    <code style="background: #0a0a0a; padding: 2px 6px; border-radius: 3px;">python3 -m control.security_review audit 10</code> - View audit log<br>
+                    <code style="background: #0a0a0a; padding: 2px 6px; border-radius: 3px;">python3 -m control.security_review export</code> - Export CSV
+                </div>
+            </div>`;
+            
+            content.innerHTML = html;
+        }
+        
+        // Update security badge
+        function updateSecurityBadge() {
+            fetch('/security/stats')
+                .then(r => r.json())
+                .then(stats => {
+                    const badge = document.getElementById('securityBadge');
+                    if (stats.pending > 0) {
+                        badge.textContent = stats.pending;
+                        badge.style.display = 'inline-block';
+                    } else {
+                        badge.style.display = 'none';
+                    }
+                })
+                .catch(err => console.error('Error updating badge:', err));
+        }
+        
+        // Initialize security features
+        updateSecurityBadge();
+        setInterval(updateSecurityBadge, 30000); // Update every 30s
+    </script>    </script>
+</body>
+</html>
+'''
+
+if __name__ == '__main__':
+    logger.info("=" * 50)
+    logger.info("AVA - DevOps AI Agent v2.1.2")
+    logger.info(f"Knowledge Base: {STATS['total_chunks']} chunks")
+    logger.info(f"Model: {STATS['model']}")
+    logger.info("=" * 50)
+    
+    app.run(host='0.0.0.0', port=5002, debug=False)

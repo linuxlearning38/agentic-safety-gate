@@ -1,0 +1,195 @@
+# control/security_review.py
+# Enhanced CLI tool with security insights
+
+from control.approval import get_pending, update_status, load_queue
+from control.registry import add_to_whitelist
+from control.security_layer import (
+    analyze_command_security,
+    get_recent_threat_summary,
+    security_audit_log
+)
+from datetime import datetime
+import json
+
+def display_security_status():
+    """Show security overview"""
+    summary = get_recent_threat_summary(hours=24)
+    
+    print("\n" + "="*60)
+    print("AGENTGUARD - SECURITY STATUS (Last 24h)")
+    print("="*60)
+    print(f"Total Commands: {summary.get('total_commands', 0)}")
+    print(f"Blocked: {summary.get('blocked', 0)}")
+    print(f"Approved: {summary.get('approved', 0)}")
+    print(f"Threats Detected: {summary.get('threats_detected', 0)}")
+    print(f"High Risk Commands: {summary.get('high_risk_commands', 0)}")
+    
+    if summary.get('threat_types'):
+        print("\nThreat Patterns Detected:")
+        for threat_type, count in summary['threat_types'].items():
+            print(f"  - {threat_type}: {count}")
+    
+    print("="*60 + "\n")
+
+
+def review_with_security():
+    """Enhanced review with security analysis"""
+    
+    # Show security overview
+    display_security_status()
+    
+    pending = get_pending()
+    
+    if not pending:
+        print("✓ No pending approvals\n")
+        return
+    
+    print(f"Pending Approvals: {len(pending)}\n")
+    
+    for idx, item in enumerate(pending, 1):
+        print("\n" + "-"*60)
+        print(f"REQUEST #{idx}")
+        print("-"*60)
+        
+        # Basic info
+        print(f"ID: {item['id']}")
+        print(f"Query: {item['query']}")
+        print(f"Command: {item['command']}")
+        print(f"Time: {item['timestamp']}")
+        
+        # Security analysis
+        cmd = item['command']
+        analysis = analyze_command_security(cmd, item['query'])
+        
+        risk = analysis["risk_analysis"]["risk"]
+        blast_radius = analysis["risk_analysis"]["blast_radius"]
+        threats = analysis["threats"]
+        
+        # Display security info
+        print(f"\n[SECURITY ANALYSIS]")
+        print(f"Risk Level: {risk.upper()}")
+        print(f"Blast Radius: {blast_radius}")
+        print(f"Description: {analysis['risk_analysis']['description']}")
+        
+        if threats:
+            print(f"\n⚠️  THREATS DETECTED ({len(threats)}):")
+            for threat in threats:
+                print(f"  - {threat['type']} (severity: {threat['severity']})")
+                print(f"    {threat['description']}")
+        else:
+            print("\n✓ No threats detected")
+        
+        print(f"\nRecommendation: {analysis['recommendation'].upper()}")
+        print(f"Reason: {analysis['reason']}")
+        
+        # Decision prompt
+        print("\n" + "-"*60)
+        print("OPTIONS:")
+        print("  y = Approve (execute once)")
+        print("  a = Approve + Add to whitelist (auto-approve future)")
+        print("  n = Reject")
+        print("  s = Skip (decide later)")
+        print("-"*60)
+        
+        choice = input("\nYour decision: ").lower()
+        
+        if choice == 'y':
+            update_status(item["id"], "approved")
+            security_audit_log(
+                event_type="approved",
+                cmd=cmd,
+                query=item['query'],
+                risk_analysis=analysis["risk_analysis"],
+                threats=threats,
+                decision="manual_approval"
+            )
+            print("✓ Approved for one-time execution")
+            
+        elif choice == 'a':
+            if risk in ["high", "critical"]:
+                confirm = input(f"⚠️  WARNING: This is a {risk.upper()} risk command. Really add to whitelist? (yes/no): ")
+                if confirm.lower() != "yes":
+                    print("Cancelled - not added to whitelist")
+                    continue
+            
+            update_status(item["id"], "approved")
+            add_to_whitelist(cmd)
+            security_audit_log(
+                event_type="whitelisted",
+                cmd=cmd,
+                query=item['query'],
+                risk_analysis=analysis["risk_analysis"],
+                threats=threats,
+                decision="manual_approval_and_whitelist"
+            )
+            print("✓ Approved and added to permanent whitelist")
+            
+        elif choice == 'n':
+            update_status(item["id"], "rejected")
+            security_audit_log(
+                event_type="rejected",
+                cmd=cmd,
+                query=item['query'],
+                risk_analysis=analysis["risk_analysis"],
+                threats=threats,
+                decision="manual_rejection"
+            )
+            print("✗ Rejected")
+            
+        elif choice == 's':
+            print("⊙ Skipped - remains pending")
+        
+        else:
+            print("Invalid choice - skipped")
+    
+    print("\n" + "="*60)
+    print("Review complete")
+    print("="*60 + "\n")
+
+
+def view_audit_log(last_n=20):
+    """View recent security audit log"""
+    try:
+        with open("/mnt/i/ai-lab/security_audit.json", "r") as f:
+            logs = json.load(f)
+    except:
+        print("No audit log found")
+        return
+    
+    recent = logs[-last_n:]
+    
+    print("\n" + "="*60)
+    print(f"SECURITY AUDIT LOG (Last {len(recent)} entries)")
+    print("="*60 + "\n")
+    
+    for log in recent:
+        timestamp = log["timestamp"][:19]  # Remove microseconds
+        event = log["event_type"]
+        cmd = log["command"]
+        risk = log["risk_level"]
+        
+        icon = {
+            "executed": "✓",
+            "blocked": "✗",
+            "approved": "→",
+            "rejected": "✗",
+            "queued_for_approval": "⊙"
+        }.get(event, "·")
+        
+        print(f"{icon} [{timestamp}] {event.upper()}")
+        print(f"  Command: {cmd}")
+        print(f"  Risk: {risk.upper()}, Decision: {log['decision']}")
+        
+        if log.get("threats_detected"):
+            print(f"  Threats: {[t['type'] for t in log['threats_detected']]}")
+        
+        print()
+
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "audit":
+        view_audit_log(last_n=int(sys.argv[2]) if len(sys.argv) > 2 else 20)
+    else:
+        review_with_security()
