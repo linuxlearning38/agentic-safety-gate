@@ -1406,6 +1406,7 @@ HTML_TEMPLATE = r'''
             display: flex;
             flex-direction: column;
             padding: 16px;
+                    position: relative;
         }
         
         .sidebar-header {
@@ -2064,6 +2065,26 @@ HTML_TEMPLATE = r'''
         <div class="sidebar">
             <div class="sidebar-header">
                 <div class="sidebar-title">AVA</div>
+                <div id="userBadge" style="
+                    margin-top:8px; padding:6px 10px;
+                    background:#1a1a2e; border:1px solid #2a2a4a;
+                    border-radius:8px; font-size:12px; color:#888;
+                    display:flex; align-items:center; justify-content:space-between;
+                ">
+                    <span>
+                        <span style="color:#667eea;">&#9632;</span>
+                        <span id="userBadgeName" style="color:#ccc; margin-left:4px;">...</span>
+                        <span id="userBadgeRole" style="
+                            margin-left:6px; font-size:10px; padding:2px 6px;
+                            border-radius:4px; background:#2a2a4a; color:#888;
+                        "></span>
+                    </span>
+                    <button onclick="logoutAva()" title="Sign out" style="
+                        background:none; border:none; color:#555; cursor:pointer;
+                        font-size:16px; padding:0 2px; line-height:1;
+                    " onmouseover="this.style.color='#ff6b6b'"
+                       onmouseout="this.style.color='#555'">&#x23FB;</button>
+                </div>
             </div>
             
             <button class="sidebar-btn" onclick="newChat()">
@@ -2092,9 +2113,36 @@ HTML_TEMPLATE = r'''
                 <span id="securityBadge" class="badge" style="display: none;"></span>
             </button>
             
-            <div class="sidebar-section">
-                <div class="sidebar-section-title">Recent Chats</div>
-                <div id="recentChats"></div>
+            <!-- Recent Chats removed from sidebar — use History button instead -->
+            <div id="recentChats" style="display:none;"></div>
+
+            < Bottom user badge — like Claude sidebar -->
+            <div id="userBadge" onclick="logoutAva()" title="Click to sign out" style="
+                position:absolute; bottom:0; left:0; right:0;
+                padding:12px 14px;
+                background:#0f0f1a;
+                border-top:1px solid #2a2a4a;
+                display:flex; align-items:center; gap:10px;
+                cursor:pointer; transition:background 0.2s;
+            "
+            onmouseover="this.style.background='#1a1a2e'"
+            onmouseout="this.style.background='#0f0f1a'">
+                <div style="
+                    width:32px; height:32px; border-radius:50%;
+                    background:linear-gradient(135deg,#667eea,#764ba2);
+                    display:flex; align-items:center; justify-content:center;
+                    font-size:14px; font-weight:700; color:white; flex-shrink:0;
+                " id="userAvatar">M</div>
+                <div style="flex:1; min-width:0;">
+                    <div id="userBadgeName" style="
+                        color:#e0e0e0; font-size:13px; font-weight:500;
+                        white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+                    ">...</div>
+                    <div id="userBadgeRole" style="
+                        font-size:11px; color:#667eea; margin-top:1px;
+                    ">...</div>
+                </div>
+                <div title="Sign out" style="color:#444; font-size:14px;">&#x23FB;</div>
             </div>
         </div>
         
@@ -2187,6 +2235,23 @@ HTML_TEMPLATE = r'''
                 <button class="modal-close" onclick="closeModal('settingsModal')">&times;</button>
             </div>
             <div class="modal-body">
+                <!-- Theme Toggle -->
+                <div class="stat-card" style="display:flex; align-items:center; justify-content:space-between;">
+                    <div>
+                        <div class="stat-label">Theme</div>
+                        <div id="themeLabel" style="color:#fff; font-size:13px; margin-top:4px;">Dark Mode</div>
+                    </div>
+                    <label style="position:relative; display:inline-block; width:48px; height:26px; cursor:pointer;">
+                        <input type="checkbox" id="themeToggle" onchange="toggleTheme(this.checked)"
+                            style="opacity:0; width:0; height:0;">
+                        <span id="themeSlider" style="
+                            position:absolute; inset:0; background:#2a2a4a;
+                            border-radius:26px; transition:0.3s;
+                            display:flex; align-items:center; padding:0 4px;
+                            font-size:14px;
+                        ">🌙</span>
+                    </label>
+                </div>
                 <div class="stat-card">
                     <div class="stat-label">Model</div>
                     <div style="color: #fff;">Qwen 2.5 14B (Local)</div>
@@ -2304,6 +2369,17 @@ HTML_TEMPLATE = r'''
         }
 
         function applyRoleUI(role) {
+            // Update user badge
+            const nameEl = document.getElementById('userBadgeName');
+            const roleEl = document.getElementById('userBadgeRole');
+            if (nameEl) nameEl.textContent = window._avaUser || '';
+            const avatarEl = document.getElementById('userAvatar');
+            if (avatarEl && window._avaUser) avatarEl.textContent = window._avaUser[0].toUpperCase();
+            if (roleEl) {
+                roleEl.textContent = role;
+                roleEl.style.background = role === 'admin' ? '#1a3a1a' : '#2a2a4a';
+                roleEl.style.color = role === 'admin' ? '#4caf50' : '#888';
+            }
             // Disable execution buttons for readonly users
             if (role === 'readonly') {
                 document.querySelectorAll('.admin-only').forEach(el => {
