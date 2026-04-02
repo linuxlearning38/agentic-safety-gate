@@ -19,6 +19,15 @@ from control.secure_executor import execute_command_secure, execute_approved_com
 from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
+from control.incident_reporter import (
+    report_tool_execution,
+    report_graph_execution,
+    report_react_execution,
+    report_approved_execution,
+    get_recent_reports,
+    get_report_by_id,
+    get_reports_stats,
+)
 from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt, decode_token
 from control.auth import init_jwt, verify_credentials, require_admin, make_token
 from flask_limiter import Limiter
@@ -783,7 +792,22 @@ def ask():
         graph_name = match_graph(query)
         if graph_name:
             logger.info(f"[*] Command Graph matched: {graph_name}")
+            _graph_t0    = time.time()
             graph_result = execute_graph(graph_name, query)
+            _graph_dur   = time.time() - _graph_t0
+
+            # Report graph execution
+            try:
+                report_graph_execution(
+                    graph_name   = graph_name,
+                    graph_result = graph_result,
+                    triggered_by = get_jwt_identity(),
+                    ip_address   = request.remote_addr,
+                    query        = query,
+                    duration     = _graph_dur,
+                )
+            except Exception as _re:
+                logger.warning(f"[Reporter] Graph report failed: {_re}")
 
             # If a medium-risk step needs approval, pause and tell the user
             if graph_result.paused_at:
@@ -1126,7 +1150,17 @@ def execute_approved_route():
             return jsonify({'error': 'approval_id is required'}), 400
 
         logger.info(f"[Approval] Executing approved command: {approval_id}")
+        _t0    = time.time()
         result = execute_approved_command(approval_id)
+        _dur   = time.time() - _t0
+
+        report_approved_execution(
+            approval_id  = approval_id,
+            result       = result,
+            triggered_by = get_jwt_identity(),
+            ip_address   = request.remote_addr,
+            duration     = _dur,
+        )
 
         if result.get('status') == 'executed':
             return jsonify({
@@ -1195,7 +1229,18 @@ def run_tool_route(tool_name):
             }), 403
 
         logger.info(f"[Tool] Direct run: {tool_name}({tool_args})")
+        _t0    = time.time()
         result = tool_registry.execute(tool_name, tool_args)
+        _dur   = time.time() - _t0
+
+        report_tool_execution(
+            tool_name    = tool_name,
+            tool_args    = tool_args,
+            result       = result,
+            triggered_by = get_jwt_identity(),
+            ip_address   = request.remote_addr,
+            duration     = _dur,
+        )
 
         return jsonify({
             'tool':    tool_name,
@@ -1227,7 +1272,17 @@ def react_run_route():
             return jsonify({'error': 'query is required'}), 400
 
         logger.info(f"[ReAct Direct] Query: {query}")
+        _t0          = time.time()
         react_result = react_loop.run(query)
+        _dur         = time.time() - _t0
+
+        report_react_execution(
+            react_result = react_result,
+            triggered_by = get_jwt_identity(),
+            ip_address   = request.remote_addr,
+            query        = query,
+            duration     = _dur,
+        )
 
         return jsonify({
             'query':        query,
@@ -1250,6 +1305,58 @@ def react_run_route():
 
     except Exception as e:
         logger.error(f"Error in react_run: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# ── Day 7: Incident Report Endpoints ─────────────────────────────────────────
+
+@app.route('/reports', methods=['GET'])
+@require_admin
+def list_reports():
+    """
+    GET /reports?limit=20
+    List recent incident reports (newest first). Admin only.
+    """
+    try:
+        limit   = min(int(request.args.get('limit', 20)), 100)
+        reports = get_recent_reports(limit)
+        return jsonify({
+            'total':   len(reports),
+            'reports': reports,
+        })
+    except Exception as e:
+        logger.error(f"[Reports] list error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/reports/stats', methods=['GET'])
+@require_admin
+def reports_stats():
+    """
+    GET /reports/stats
+    Summary statistics across all reports. Admin only.
+    """
+    try:
+        return jsonify(get_reports_stats())
+    except Exception as e:
+        logger.error(f"[Reports] stats error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/reports/<report_id>', methods=['GET'])
+@require_admin
+def get_report(report_id):
+    """
+    GET /reports/<report_id>
+    Fetch a full report by ID. Admin only.
+    """
+    try:
+        report = get_report_by_id(report_id)
+        if not report:
+            return jsonify({'error': f'Report {report_id} not found'}), 404
+        return jsonify(report)
+    except Exception as e:
+        logger.error(f"[Reports] get error: {e}")
         return jsonify({'error': str(e)}), 500
 
 
