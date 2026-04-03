@@ -97,7 +97,7 @@ LLM_WARMUP_FILE = os.getenv("LLM_WARMUP_FILE", "/tmp/ava_qwen_warmup.lock")
 LLM_WARMUP_PROMPT = os.getenv("LLM_WARMUP_PROMPT", "Reply with only: ready")
 
 # Phase 3: Memory Layer
-MEMORY_PATH = os.getenv("MEMORY_PATH", "/mnt/i/ai-lab/ava_memory.json")
+MEMORY_PATH = os.getenv("MEMORY_PATH", "/home/manoj/ava-data/ava_memory.json")
 _warmup_started = False
 _warmup_lock = threading.Lock()
 
@@ -118,6 +118,7 @@ def save_memory(memory):
         logger.warning(f"Memory save failed: {e}")
 
 def update_memory_issue(query, response_summary):
+    global AVA_MEMORY
     memory = load_memory()
     memory.setdefault("past_issues", []).append({
         "date": datetime.now().isoformat(),
@@ -126,6 +127,7 @@ def update_memory_issue(query, response_summary):
     })
     memory["past_issues"] = memory["past_issues"][-50:]
     save_memory(memory)
+    AVA_MEMORY = memory
 
 AVA_MEMORY = load_memory()
 logger.info(f"Memory loaded: user={AVA_MEMORY.get('user', 'unknown')}, "
@@ -354,14 +356,21 @@ def get_embedding(text):
         logger.error(f"Embedding error: {e}")
         return None
 
-def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_relevance=0.003):
+def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_relevance=0.003, query_intent=None):
     """Phase 3: Hybrid retrieval with context assembly."""
     try:
+        if query_intent is None:
+            query_intent = detect_query_intent(query)
+        if query_intent == "definition":
+            n_policies = max(n_policies, 6)
+            n_blogs = min(n_blogs, 2)
+            min_relevance = max(min_relevance, 0.01)
+
         raw_chunks = hybrid_retriever.query(
             query_text=query,
             n_policies=n_policies,
             n_blogs=n_blogs,
-            blog_min_relevance=0.001,
+            blog_min_relevance=min_relevance,
             format_for_llm=False
         )
         if raw_chunks:
@@ -395,6 +404,18 @@ def is_weak_response(response_text):
                     "i cannot", "no relevant", "i'm not sure", "i am not sure",
                     "i do not have access"]
     return any(signal in response_text.lower() for signal in weak_signals)
+
+def detect_query_intent(query):
+    q = query.lower().strip()
+    if any(k in q for k in ["diagram", "architecture", "flow", "visualize", "draw", "show me"]):
+        return "diagram"
+    if any(k in q for k in ["compare", "difference between", "vs ", "versus"]):
+        return "comparison"
+    if any(q.startswith(prefix) for prefix in ["what is", "what are", "define", "explain "]):
+        return "definition"
+    if any(k in q for k in ["error", "failed", "not working", "broken", "troubleshoot", "debug", "fix"]):
+        return "troubleshooting"
+    return "general"
 
 def build_memory_context():
     if not AVA_MEMORY:
@@ -432,19 +453,89 @@ def force_knowledge_routing(query):
         return True
     return False
 
-def generate_response(query, context):
+_CONFIDENCE_STOP_WORDS = {
+    'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+    'should', 'may', 'might', 'shall', 'can', 'to', 'of', 'in', 'on',
+    'at', 'by', 'for', 'with', 'about', 'from', 'into', 'through',
+    'how', 'what', 'when', 'where', 'why', 'which', 'who', 'i', 'my',
+    'your', 'it', 'its', 'this', 'that', 'and', 'or', 'not', 'if',
+    'me', 'you', 'we', 'they', 'he', 'she', 'us', 'them',
+    'computing', 'using', 'based', 'system', 'systems',
+}
+
+def score_context_confidence(context, query):
+    """Phase 4.5: Score how well retrieved context matches the query.
+
+    Returns 'high', 'medium', or 'low':
+    - high:   2+ chunks with direct keyword overlap ratio > 0.3,
+              AND the most specific token (longest non-stop word) appears
+              in at least 2 chunks. Missing anchor token caps result at 'medium'.
+    - medium: some overlap (ratio 0.1–0.3) or exactly 1 high chunk
+    - low:    weak/no keyword overlap or no chunks
+    """
+    if not context:
+        return 'low'
+
+    query_tokens = set(
+        w.lower().strip('.,?!:;') for w in query.split()
+        if len(w) > 2 and w.lower().strip('.,?!:;') not in _CONFIDENCE_STOP_WORDS
+    )
+    if not query_tokens:
+        return 'low'
+
+    # Anchor token: longest query keyword — most likely to be domain-specific
+    anchor_token = max(query_tokens, key=len)
+
+    high_overlap_count = 0
+    any_overlap = False
+    anchor_chunk_count = 0
+
+    for chunk in context:
+        chunk_lower = chunk.lower()
+        matched = sum(1 for tok in query_tokens if tok in chunk_lower)
+        ratio = matched / len(query_tokens)
+        if ratio > 0.3:
+            high_overlap_count += 1
+            any_overlap = True
+        elif ratio >= 0.1:
+            any_overlap = True
+        if anchor_token in chunk_lower:
+            anchor_chunk_count += 1
+
+    if high_overlap_count >= 2 and anchor_chunk_count >= 2:
+        return 'high'
+    if any_overlap or high_overlap_count >= 1:
+        return 'medium'
+    return 'low'
+
+
+_CONFIDENCE_PREFIXES = {
+    'medium': "Based on related documentation, ",
+    'low': "I don't have a strong match for this, but based on general DevOps knowledge: ",
+}
+
+
+def generate_response(query, context, confidence=None):
     """Phase 3: Structured response with memory, CoT, Mermaid, fail-safe."""
     try:
         memory_ctx = build_memory_context()
+        query_intent = detect_query_intent(query)
         use_structured = is_technical_query(query)
         wants_diagram = any(k in query.lower() for k in [
             "diagram", "architecture", "flow", "show me how", "draw", "visualize", "create a diagram"
         ])
 
-        system_parts = ["You are AVA, a senior DevOps AI assistant.\n\nRULES:\n1. Always respond in English only\n2. When context is provided in <context> tags, extract the exact answer from it\n3. Quote specific config values, commands, and fixes directly from context\n4. Never say information is unavailable when it exists in the context\n5. Be specific, practical, and concise"]
+        system_parts = ["You are AVA, a senior DevOps AI assistant.\n\nRULES:\n1. Always respond in English only\n2. Use the provided context as your primary grounding source\n3. If the context is partial but clearly relevant, give the best direct answer you can and say what is inferred\n4. Do not lead with phrases like 'the context does not directly say' unless the context is genuinely irrelevant\n5. Prefer direct practical answers over meta commentary about the context\n6. Quote specific config values, commands, and fixes directly from context when available\n7. Be specific, practical, and concise"]
 
         if memory_ctx:
             system_parts.append(f"\nUSER CONTEXT (use this to tailor your answers):\n{memory_ctx}")
+
+        if query_intent == "definition":
+            system_parts.append("\nFor definition questions: start with a plain-English definition in the first sentence. Then give 2-4 practical details. If the retrieved context is related but incomplete, combine it with standard DevOps knowledge instead of refusing to answer.")
+
+        if query_intent == "comparison":
+            system_parts.append("\nFor comparison questions: answer with short sections for each option, then end with when to choose each one.")
 
         if use_structured:
             system_parts.append("\nFor technical problems, always structure your answer as:\n\n**Root Cause:** [1-2 sentences]\n**Fix:** [exact commands or config]\n**Why this works:** [1-2 sentences]\n**Watch out for:** [edge cases or caveats]")
@@ -457,7 +548,11 @@ def generate_response(query, context):
         if context:
             trimmed_context = [block[:800] for block in context[:2]]
             context_str = "\n\n---\n\n".join(trimmed_context)
-            user_msg = f"<context>\n{context_str}\n</context>\n\nQuestion: {query}"
+            user_msg = (
+                f"<context>\n{context_str}\n</context>\n\n"
+                f"Question: {query}\n\n"
+                "Answer using the context first, but if the context is only partially relevant, provide the most useful direct answer you can and briefly separate inference from explicit context."
+            )
         else:
             user_msg = f"Answer this DevOps question from your knowledge:\n{query}"
 
@@ -469,7 +564,9 @@ def generate_response(query, context):
             ],
             options={"num_ctx": 4096, "temperature": 0.2}
         )
-        return response["message"]["content"]
+        answer = response["message"]["content"]
+        prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
+        return prefix + answer if prefix else answer
 
     except Exception as e:
         logger.error(f"LLM error: {e}")
@@ -1045,11 +1142,15 @@ def ask():
         else:  # KNOWLEDGE or fallback
             # Handle regular DevOps questions with RAG
             logger.info("[*] Searching knowledge base...")
-            context = query_knowledge_base(query)
+            context = query_knowledge_base(query, query_intent=detect_query_intent(query))
             logger.info(f"[*] Found {len(context)} relevant chunks")
+
+            # Phase 4.5: Score context confidence before generating
+            confidence = score_context_confidence(context, query)
+            logger.info(f"[*] Context confidence: {confidence}")
             logger.info(f"[*] Thinking with {LLM_MODEL}...")
-            
-            response = generate_response(query, context)
+
+            response = generate_response(query, context, confidence=confidence)
 
             # Phase 3: Fail-safe retry
             if context and len(context) < 2 and is_weak_response(response):
@@ -1065,7 +1166,9 @@ def ask():
                     retry_context = hybrid_retriever.assemble_context(
                         retry_chunks, max_articles=5, max_chunks_per_article=4
                     )
-                    response = generate_response(query, retry_context)
+                    retry_confidence = score_context_confidence(retry_context, query)
+                    response = generate_response(query, retry_context, confidence=retry_confidence)
+                    confidence = retry_confidence
                     logger.info("[FAILSAFE] Retry complete")
 
             # Pending 3: Memory auto-update — persist resolved issues
@@ -1073,8 +1176,15 @@ def ask():
                 update_memory_issue(query, response[:200])
                 logger.info("[MEMORY] Issue saved to ava_memory.json")
 
+            # Phase 4.5: Update live stats counters
+            STATS['query_count'] += 1
+            # estimate tokens: rough approximation, 1 token ≈ 4 chars
+            response_tokens = len(response) // 4
+            STATS['total_tokens'] += response_tokens
+            STATS['avg_tokens_per_query'] = STATS['total_tokens'] // STATS['query_count']
+
             elapsed = time.time() - start_time
-            
+
             save_history({
                 'timestamp': datetime.now().isoformat(),
                 'query': query,
@@ -1083,11 +1193,12 @@ def ask():
                 'time_taken': f"{elapsed:.2f}s",
                 'response_preview': response[:200] + '...' if len(response) > 200 else response
             })
-            
+
             return jsonify({
                 'type': 'knowledge',
                 'response': response,
                 'sources_used': len(context),
+                'confidence': confidence,
                 'time_taken': f"{elapsed:.2f}s"
             })
         
@@ -1186,6 +1297,7 @@ def get_history():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/stats', methods=['GET'])
+@jwt_required()
 def get_stats():
     return jsonify(STATS)
 

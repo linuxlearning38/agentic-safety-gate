@@ -4,7 +4,7 @@
 import json
 from pathlib import Path
 
-WHITELIST_FILE = "/mnt/i/ai-lab/control_whitelist.json"
+WHITELIST_FILE = "/home/manoj/ava-data/control_whitelist.json"
 
 # Default approved commands
 APPROVED_COMMANDS = [
@@ -42,14 +42,30 @@ def save_whitelist(commands):
         json.dump(commands, f, indent=2)
 
 def is_approved(cmd):
-    """Check if command is in whitelist"""
+    """Check if command is in whitelist.
+
+    Matching rules:
+    - Single-token entry (e.g. "ls", "git"): exact match only.
+      "ls" does NOT approve "ls /etc/shadow".
+    - Multi-token entry (e.g. "git status", "docker ps"): exact match OR
+      cmd extends the pattern with additional args ("git status --short" is
+      approved by "git status", but "git statusfoo" is not).
+    """
     whitelist = load_whitelist()
-    
-    # Exact match or prefix match
+    if not cmd:
+        return False
     for allowed in whitelist:
-        if cmd == allowed or cmd.startswith(allowed):
-            return True
-    
+        allowed_tokens = allowed.split()
+        if not allowed_tokens:
+            continue
+        if len(allowed_tokens) == 1:
+            # Single-token: must be an exact match
+            if cmd == allowed:
+                return True
+        else:
+            # Multi-token: exact match or cmd adds further args after a space
+            if cmd == allowed or cmd.startswith(allowed + " "):
+                return True
     return False
 
 def add_to_whitelist(cmd):
