@@ -15,7 +15,7 @@ import multiprocessing
 workers         = 2
 worker_class    = "sync"          # sync is correct — AVA uses Ollama (external)
 threads         = 1               # no threading — Ollama calls are blocking
-timeout         = 300             # 5 min — ReAct loops can take 2-3 min
+timeout         = 600             # 5 min — ReAct loops can take 2-3 min
 keepalive       = 5
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -27,7 +27,7 @@ access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s %(D)sμs'
 # ── Process ───────────────────────────────────────────────────────────────────
 pidfile         = "/tmp/ava_gunicorn.pid"
 daemon          = False           # systemd/start_ava.sh manages process
-preload_app     = True            # load app once, fork workers (saves RAM)
+preload_app     = False            # load app once, fork workers (saves RAM)
 
 # ── Security ──────────────────────────────────────────────────────────────────
 limit_request_line    = 4096

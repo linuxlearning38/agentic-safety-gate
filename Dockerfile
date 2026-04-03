@@ -49,6 +49,7 @@ COPY --from=builder /usr/local/bin/gunicorn /usr/local/bin/gunicorn
 COPY web_agent_v2.1_guardrail.py .
 COPY wsgi.py .
 COPY gunicorn.conf.py .
+COPY users.json .
 COPY control/ ./control/
 COPY knowledge_updater/ ./knowledge_updater/
 
