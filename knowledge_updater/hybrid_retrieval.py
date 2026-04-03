@@ -56,7 +56,7 @@ class EmbeddingClient:
             resp = requests.post(
                 self.url,
                 json={"model": self.model, "prompt": text},
-                timeout=15
+                timeout=60
             )
             resp.raise_for_status()
             return resp.json()["embedding"]

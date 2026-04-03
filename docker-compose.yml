@@ -54,10 +54,10 @@ services:
 
     volumes:
       - ./certs:/app/certs:ro
-      - /mnt/i/ai-lab/chromadb:/data/chromadb
-      - /mnt/i/ai-lab/logs:/data/logs
-      - /mnt/i/ai-lab/projects/devops-agent/query_history.json:/data/history/query_history.json
-      - /mnt/i/ai-lab/ava_memory.json:/data/ava_memory.json
+      - /home/manoj/ava-data/chromadb:/data/chromadb
+      - /home/manoj/ava-data/logs:/data/logs
+      - /home/manoj/ava-data/query_history.json:/data/history/query_history.json
+      - /home/manoj/ava-data/ava_memory.json:/data/ava_memory.json
       - /var/run/docker.sock:/var/run/docker.sock
 
     env_file:
@@ -95,5 +95,4 @@ services:
       start_period: 25s
       retries: 3
 
-    user: "0:0"
     restart: unless-stopped

@@ -14,6 +14,7 @@ import os
 import json
 import time
 import logging
+import threading
 from datetime import datetime
 from control.secure_executor import execute_command_secure, execute_approved_command
 from control.tool_registry import registry as tool_registry
@@ -80,15 +81,25 @@ limiter = Limiter(
 )
 logger.info("[RateLimit] Flask-Limiter initialised — default: 30 req/min per user")
 
+
+@app.before_request
+def maybe_start_warmup():
+    start_llm_warmup()
+
 # Configuration
 CHROMA_PATH = os.getenv("CHROMA_PATH", "/mnt/i/ai-lab/chromadb")
 COLLECTION_NAME = "devops_policies_v2"
-HISTORY_FILE = "/mnt/i/ai-lab/projects/devops-agent/query_history.json"
+HISTORY_FILE = os.getenv("HISTORY_FILE", "/mnt/i/ai-lab/projects/devops-agent/query_history.json")
 LLM_MODEL = "qwen2.5:14b"
 EMBED_MODEL = "nomic-embed-text"
+LLM_WARMUP_ENABLED = os.getenv("LLM_WARMUP_ENABLED", "true").lower() == "true"
+LLM_WARMUP_FILE = os.getenv("LLM_WARMUP_FILE", "/tmp/ava_qwen_warmup.lock")
+LLM_WARMUP_PROMPT = os.getenv("LLM_WARMUP_PROMPT", "Reply with only: ready")
 
 # Phase 3: Memory Layer
-MEMORY_PATH = "/mnt/i/ai-lab/ava_memory.json"
+MEMORY_PATH = os.getenv("MEMORY_PATH", "/mnt/i/ai-lab/ava_memory.json")
+_warmup_started = False
+_warmup_lock = threading.Lock()
 
 def load_memory():
     try:
@@ -119,6 +130,50 @@ def update_memory_issue(query, response_summary):
 AVA_MEMORY = load_memory()
 logger.info(f"Memory loaded: user={AVA_MEMORY.get('user', 'unknown')}, "
             f"infra={list(k for k,v in AVA_MEMORY.get('infra', {}).items() if v)}")
+
+
+def _run_llm_warmup():
+    logger.info(f"[Warmup] Starting background warmup for {LLM_MODEL}")
+    t0 = time.time()
+    try:
+        ollama.chat(
+            model=LLM_MODEL,
+            messages=[{"role": "user", "content": LLM_WARMUP_PROMPT}],
+            options={"num_ctx": 4096, "temperature": 0.0},
+            keep_alive="30m",
+        )
+        logger.info(f"[Warmup] {LLM_MODEL} warmed in {time.time() - t0:.2f}s")
+    except Exception as e:
+        logger.warning(f"[Warmup] Failed: {e}")
+    finally:
+        try:
+            if os.path.exists(LLM_WARMUP_FILE):
+                os.remove(LLM_WARMUP_FILE)
+        except Exception as e:
+            logger.warning(f"[Warmup] Could not remove lock file: {e}")
+
+
+def start_llm_warmup():
+    global _warmup_started
+    if not LLM_WARMUP_ENABLED:
+        return
+
+    with _warmup_lock:
+        if _warmup_started:
+            return
+        try:
+            fd = os.open(LLM_WARMUP_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+        except FileExistsError:
+            logger.info("[Warmup] Another worker is already warming the LLM")
+            _warmup_started = True
+            return
+        except Exception as e:
+            logger.warning(f"[Warmup] Could not create lock file: {e}")
+            return
+
+        _warmup_started = True
+        threading.Thread(target=_run_llm_warmup, daemon=True).start()
 
 # Initialize ChromaDB
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
@@ -305,7 +360,7 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
         raw_chunks = hybrid_retriever.query(
             query_text=query,
             n_policies=n_policies,
-            n_blogs=12,
+            n_blogs=n_blogs,
             blog_min_relevance=0.001,
             format_for_llm=False
         )
@@ -382,7 +437,6 @@ def generate_response(query, context):
     try:
         memory_ctx = build_memory_context()
         use_structured = is_technical_query(query)
-        use_cot = is_complex_query(query)
         wants_diagram = any(k in query.lower() for k in [
             "diagram", "architecture", "flow", "show me how", "draw", "visualize", "create a diagram"
         ])
@@ -401,13 +455,11 @@ def generate_response(query, context):
         system_prompt = "\n".join(system_parts)
 
         if context:
-            context_str = "\n\n---\n\n".join(context[:5])
+            trimmed_context = [block[:800] for block in context[:2]]
+            context_str = "\n\n---\n\n".join(trimmed_context)
             user_msg = f"<context>\n{context_str}\n</context>\n\nQuestion: {query}"
         else:
             user_msg = f"Answer this DevOps question from your knowledge:\n{query}"
-
-        if use_cot:
-            user_msg += "\n\nThink step by step before answering."
 
         response = ollama.chat(
             model=LLM_MODEL,
@@ -415,7 +467,7 @@ def generate_response(query, context):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg}
             ],
-            options={"num_ctx": 8192, "temperature": 0.7}
+            options={"num_ctx": 4096, "temperature": 0.2}
         )
         return response["message"]["content"]
 
@@ -425,6 +477,10 @@ def generate_response(query, context):
 
 # Routes
 # ── Auth Endpoints ────────────────────────────────────────────────────────────
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'ok'}), 200
 
 @app.route('/auth/login', methods=['POST'])
 @limiter.limit("10 per minute", key_func=get_remote_address)
