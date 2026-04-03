@@ -407,17 +407,21 @@ def is_weak_response(response_text):
 
 def detect_query_intent(query):
     q = query.lower().strip()
+    # Definition guard runs first — "what is/are" always wins regardless of
+    # other keywords present in the query (e.g. "what is the fix for...")
+    if q.startswith("what is") or q.startswith("what are"):
+        return "definition"
     if any(k in q for k in ["diagram", "architecture", "flow", "visualize", "draw", "show me"]):
         return "diagram"
     if any(k in q for k in ["compare", "difference between", "vs ", "versus"]):
         return "comparison"
-    if any(q.startswith(prefix) for prefix in ["what is", "what are", "define", "explain "]):
+    if any(q.startswith(prefix) for prefix in ["define", "explain "]):
         return "definition"
     if any(k in q for k in ["error", "failed", "not working", "broken", "troubleshoot", "debug", "fix"]):
         return "troubleshooting"
     return "general"
 
-def build_memory_context():
+def build_memory_context(query=None):
     if not AVA_MEMORY:
         return ""
     infra = AVA_MEMORY.get("infra", {})
@@ -429,6 +433,19 @@ def build_memory_context():
         lines.append(f"Their infrastructure stack: {', '.join(active_tools)}")
     if prefs.get("style"):
         lines.append(f"Response style: {prefs['style']}")
+    if query:
+        past_issues = AVA_MEMORY.get("past_issues", [])
+        if past_issues:
+            query_words = {w.lower() for w in query.split() if len(w) >= 4}
+            matches = [
+                issue for issue in past_issues
+                if any(w in issue.get("query", "").lower() for w in query_words)
+            ]
+            if matches:
+                recent = matches[-3:]
+                lines.append("Past fixes for similar issues:")
+                for issue in recent:
+                    lines.append(f"- {issue['query']}: {issue['resolution']}")
     return "\n".join(lines)
 
 def force_knowledge_routing(query):
@@ -519,7 +536,7 @@ _CONFIDENCE_PREFIXES = {
 def generate_response(query, context, confidence=None):
     """Phase 3: Structured response with memory, CoT, Mermaid, fail-safe."""
     try:
-        memory_ctx = build_memory_context()
+        memory_ctx = build_memory_context(query=query)
         query_intent = detect_query_intent(query)
         use_structured = is_technical_query(query)
         wants_diagram = any(k in query.lower() for k in [
@@ -675,6 +692,36 @@ def split_multi_query(query):
         return [query]
     
     return questions
+
+def detect_multiple_questions(query):
+    """Detect and split a message containing multiple questions (max 3).
+
+    Handles two patterns:
+    - Numbered:  "1. How to deploy? 2. What is Docker? 3. ..."
+    - ?-delimited: "How to deploy? What is Docker?"
+
+    Returns a list of stripped question strings. Returns [query] for single questions.
+    """
+    import re
+
+    # Pattern 1: numbered items — "1." / "1)" at word boundary
+    numbered = re.split(r'\s*\d+[.)]\s+', query.strip())
+    numbered = [q.strip() for q in numbered if q.strip()]
+    if len(numbered) >= 2:
+        return [q if q.endswith('?') else q for q in numbered[:3]]
+
+    # Pattern 2: "?" followed by non-whitespace-only content
+    parts = re.split(r'\?\s+', query.strip())
+    parts = [p.strip() for p in parts if p.strip()]
+    if len(parts) >= 2:
+        # Re-attach the "?" to each part except the last (which may already have it)
+        questions = [p + '?' for p in parts[:-1]]
+        last = parts[-1]
+        questions.append(last if last.endswith('?') else last + '?')
+        return questions[:3]
+
+    return [query]
+
 
 def is_greeting(query):
     """Check if query is a greeting"""
@@ -876,58 +923,26 @@ def ask():
                 'time_taken': f"{elapsed:.2f}s"
             })
         
-        # Phase 3: Multi-query splitting disabled - causes fragmentation
-        questions = [query]
+        # Multi-question detection — split and answer each separately
+        questions = detect_multiple_questions(query)
         if len(questions) > 1:
-            logger.info(f"Detected {len(questions)} questions: {questions}")
-            results = []
-            
+            logger.info(f"[*] Multi-question detected: {len(questions)} questions")
+            combined_parts = []
+            total_sources = 0
+
             for idx, q in enumerate(questions, 1):
                 logger.info(f"[{idx}/{len(questions)}] Processing: {q}")
-                part_result = {'question': q, 'number': idx}
-                
-                # Get LLM analysis for this question
-                analysis = analyze_query_with_llm(q)
-                action_type = analysis.get('action')
-                
-                if action_type == 'COMMAND':
-                    # Extract and validate command
-                    cmd = extract_command_from_query(q)
-                    if cmd:
-                        logger.info(f"  -> Executing command: {cmd}")
-                        exec_result = execute_command(cmd, q)
-                        if exec_result.get('success') and exec_result.get('output'):
-                            cmd_analysis = analyze_command_output(cmd, exec_result['output'])
-                            if cmd_analysis:
-                                exec_result['analysis'] = cmd_analysis
-                        part_result['type'] = 'command'
-                        part_result['result'] = exec_result
-                    else:
-                        # Command was blocked by security
-                        part_result['type'] = 'knowledge'
-                        part_result['response'] = "This command was blocked by security restrictions."
-                        part_result['sources_used'] = 0
-                        
-                elif action_type == 'DIRECT_ANSWER':
-                    # Use LLM's direct answer
-                    logger.info(f"  -> Direct answer from LLM")
-                    answer = analysis.get('answer', 'I can help with that.')
-                    part_result['type'] = 'knowledge'
-                    part_result['response'] = answer
-                    part_result['sources_used'] = 0
-                    
-                else:  # KNOWLEDGE or fallback
-                    # Search knowledge base
-                    logger.info(f"  -> Searching knowledge base")
-                    context = query_knowledge_base(q)
-                    response = generate_response(q, context)
-                    part_result['type'] = 'knowledge'
-                    part_result['response'] = response
-                    part_result['sources_used'] = len(context)
-                
-                results.append(part_result)
-            
+                q_context = query_knowledge_base(q, query_intent=detect_query_intent(q))
+                q_confidence = score_context_confidence(q_context, q)
+                q_response = generate_response(q, q_context, confidence=q_confidence)
+                combined_parts.append(
+                    f"---\n\n**Question {idx}:** {q}\n\n{q_response}"
+                )
+                total_sources += len(q_context)
+
+            combined_response = "\n\n".join(combined_parts)
             elapsed = time.time() - start_time
+
             save_history({
                 'timestamp': datetime.now().isoformat(),
                 'query': query,
@@ -935,10 +950,11 @@ def ask():
                 'parts': len(questions),
                 'time_taken': f"{elapsed:.2f}s"
             })
-            
+
             return jsonify({
-                'type': 'multi',
-                'results': results,
+                'type': 'knowledge',
+                'response': combined_response,
+                'sources_used': total_sources,
                 'time_taken': f"{elapsed:.2f}s"
             })
         
