@@ -1,0 +1,120 @@
+chromadb:
+  host: localhost
+  port: 8000
+  persist_directory: /mnt/i/ai-lab/chromadb
+  policies_collection: devops_policies_v2
+  blogs_collection: devops_blogs_v1
+embedding:
+  model: nomic-embed-text
+  ollama_url: http://localhost:11434
+sources:
+- name: AWS DevOps
+  url: https://aws.amazon.com/blogs/devops/
+  rss: https://aws.amazon.com/blogs/devops/feed/
+  max_articles: 10
+  min_content_length: 500
+  enabled: true
+- name: Cloudflare Blog
+  url: https://blog.cloudflare.com
+  rss: https://blog.cloudflare.com/rss/
+  max_articles: 8
+  min_content_length: 500
+  enabled: true
+- name: Kubernetes Blog
+  url: https://kubernetes.io/blog/
+  rss: https://kubernetes.io/feed.xml
+  max_articles: 8
+  min_content_length: 400
+  enabled: true
+- name: HashiCorp Blog
+  url: https://www.hashicorp.com/blog
+  rss: https://www.hashicorp.com/blog/feed.xml
+  max_articles: 8
+  min_content_length: 500
+  enabled: false
+  request_delay: 6
+- name: Spacelift Blog
+  url: https://spacelift.io/blog
+  rss: https://spacelift.io/blog/rss.xml
+  max_articles: 8
+  min_content_length: 500
+  enabled: false
+- name: Pulumi Blog
+  url: https://www.pulumi.com/blog/
+  rss: https://www.pulumi.com/blog/rss.xml
+  max_articles: 8
+  min_content_length: 400
+  enabled: true
+- name: Datadog Engineering
+  url: https://www.datadoghq.com/blog/engineering/
+  rss: https://www.datadoghq.com/blog/engineering/feed/
+  max_articles: 8
+  min_content_length: 400
+  enabled: false
+- name: Azure DevOps Blog
+  url: https://devblogs.microsoft.com/devops/
+  rss: https://devblogs.microsoft.com/devops/feed/
+  max_articles: 8
+  min_content_length: 400
+  enabled: true
+- name: Jenkins Blog
+  url: https://www.jenkins.io/blog/
+  rss: https://www.jenkins.io/blog/rss.xml
+  max_articles: 8
+  min_content_length: 400
+  enabled: false
+- name: Red Hat Blog
+  url: https://www.redhat.com/en/blog
+  rss: https://www.redhat.com/en/rss/blog
+  max_articles: 8
+  min_content_length: 400
+  enabled: true
+- name: Ubuntu Blog
+  url: https://ubuntu.com/blog
+  rss: https://ubuntu.com/blog/feed
+  max_articles: 6
+  min_content_length: 400
+  enabled: true
+- name: Ansible Blog
+  url: https://www.redhat.com/en/blog
+  rss: https://www.redhat.com/en/rss/blog?tags=ansible
+  max_articles: 8
+  min_content_length: 400
+  enabled: true
+- name: GCP Blog
+  url: https://cloudblog.withgoogle.com/products/devops-sre/
+  rss: https://cloudblog.withgoogle.com/products/devops-sre/rss/
+  max_articles: 8
+  min_content_length: 400
+  enabled: true
+chunking:
+  chunk_size: 400
+  chunk_overlap: 50
+  min_chunk_size: 150
+quality:
+  min_score: 0.4
+  signals:
+    has_code_blocks: 0.25
+    has_headers: 0.1
+    word_count_min: 300
+    word_count_ideal: 1200
+    technical_keywords: 0.2
+    no_paywall_signals: 0.15
+dedup:
+  check_url: true
+  check_content_hash: true
+  hash_algorithm: sha256
+limits:
+  max_new_chunks_per_run: 200
+  weak_source_threshold: 5
+scraper:
+  request_timeout: 15
+  delay_between_requests: 2
+  max_retries: 2
+  user_agent: AVA-KnowledgeBot/2.0 (local research assistant; non-commercial)
+scheduler:
+  enabled: true
+  cron: 0 2 * * 0
+  log_file: /mnt/i/ai-lab/logs/knowledge_updater.log
+  run_report: /mnt/i/ai-lab/reports/knowledge_update_report.json
+dry_run: false
