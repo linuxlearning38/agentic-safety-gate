@@ -1,22 +1,49 @@
-.env
-*.log
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual env
+venv/
+.venv/
+
+# Environment & secrets
+.env
+*.key
+*.pem
+*.crt
+certs/
+
+# Runtime data files
+query_history.json
+users.json
+financial_report.json
+
+# Logs
+*.log
+logs/
+
+# Local backups (use git tags instead)
+backup/
+backups/
+archive/
+
+# Database / data
 postgres_data/
 redis_data/
-venv/
-__pycache__/
-*.pyc
-.env
+*.sqlite3
+chromadb/
+chroma_db/
 
+# OS
+.DS_Store
+Thumbs.db
 
-financial_report.json
-venv/
+# Misc
 *.bak
-*.pyc
-__pycache__/
-devops_agent.py
-devops_shell_agent.py
-query_ollama.py
-update_ui.py
-users.json
+scan_output.txt
+security_audit.json
