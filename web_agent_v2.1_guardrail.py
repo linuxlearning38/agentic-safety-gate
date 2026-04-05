@@ -87,9 +87,9 @@ def maybe_start_warmup():
     start_llm_warmup()
 
 # Configuration
-CHROMA_PATH = os.getenv("CHROMA_PATH", "/mnt/i/ai-lab/chromadb")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "/home/manoj/ava-data/chroma_db")
 COLLECTION_NAME = "devops_policies_v2"
-HISTORY_FILE = os.getenv("HISTORY_FILE", "/mnt/i/ai-lab/projects/devops-agent/query_history.json")
+HISTORY_FILE = os.getenv("HISTORY_FILE", "/home/manoj/ava-data/query_history.json")
 LLM_MODEL = "qwen2.5:14b"
 EMBED_MODEL = "nomic-embed-text"
 LLM_WARMUP_ENABLED = os.getenv("LLM_WARMUP_ENABLED", "true").lower() == "true"
@@ -141,7 +141,7 @@ def _run_llm_warmup():
         ollama.chat(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": LLM_WARMUP_PROMPT}],
-            options={"num_ctx": 4096, "temperature": 0.0},
+            options={"num_ctx": 8192, "temperature": 0.0},
             keep_alive="30m",
         )
         logger.info(f"[Warmup] {LLM_MODEL} warmed in {time.time() - t0:.2f}s")
