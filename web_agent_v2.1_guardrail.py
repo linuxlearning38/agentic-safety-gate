@@ -87,7 +87,7 @@ def maybe_start_warmup():
     start_llm_warmup()
 
 # Configuration
-CHROMA_PATH = os.getenv("CHROMA_PATH", "/home/manoj/ava-data/chroma_db")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "/home/manoj/ava-data/chromadb")
 COLLECTION_NAME = "devops_policies_v2"
 HISTORY_FILE = os.getenv("HISTORY_FILE", "/home/manoj/ava-data/query_history.json")
 LLM_MODEL = "qwen2.5:14b"
