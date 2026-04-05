@@ -563,7 +563,7 @@ def generate_response(query, context, confidence=None):
         system_prompt = "\n".join(system_parts)
 
         if context:
-            trimmed_context = [block[:800] for block in context[:2]]
+            trimmed_context = [block[:800] for block in context[:5]]
             context_str = "\n\n---\n\n".join(trimmed_context)
             user_msg = (
                 f"<context>\n{context_str}\n</context>\n\n"
@@ -579,7 +579,7 @@ def generate_response(query, context, confidence=None):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg}
             ],
-            options={"num_ctx": 4096, "temperature": 0.2}
+            options={"num_ctx": 8192, "temperature": 0.2}
         )
         answer = response["message"]["content"]
         prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
@@ -1194,8 +1194,8 @@ def ask():
 
             # Phase 4.5: Update live stats counters
             STATS['query_count'] += 1
-            # estimate tokens: rough approximation, 1 token ≈ 4 chars
-            response_tokens = len(response) // 4
+            # token count: word count approximation (more accurate than char/4)
+            response_tokens = len(response.split())
             STATS['total_tokens'] += response_tokens
             STATS['avg_tokens_per_query'] = STATS['total_tokens'] // STATS['query_count']
 
@@ -1607,7 +1607,7 @@ def get_security_stats_route():
         from datetime import timedelta
         
         # Load audit log
-        audit_log_path = "/mnt/i/ai-lab/security_audit.json"
+        audit_log_path = os.getenv("SECURITY_AUDIT_LOG", "/home/manoj/ava-data/security_audit.json")
         if os.path.exists(audit_log_path):
             with open(audit_log_path, 'r') as f:
                 audit_log = json.load(f)
@@ -1642,7 +1642,7 @@ def get_audit_log_route():
     try:
         count = int(request.args.get('count', 10))
         
-        audit_log_path = "/mnt/i/ai-lab/security_audit.json"
+        audit_log_path = os.getenv("SECURITY_AUDIT_LOG", "/home/manoj/ava-data/security_audit.json")
         if os.path.exists(audit_log_path):
             with open(audit_log_path, 'r') as f:
                 audit_log = json.load(f)
