@@ -115,6 +115,6 @@ scraper:
 scheduler:
   enabled: true
   cron: 0 2 * * 0
-  log_file: /mnt/i/ai-lab/logs/knowledge_updater.log
-  run_report: /mnt/i/ai-lab/reports/knowledge_update_report.json
+  log_file: /home/manoj/ava-data/logs/knowledge_updater.log
+  run_report: /home/manoj/ava-data/reports/knowledge_update_report.json
 dry_run: false
