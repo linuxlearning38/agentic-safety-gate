@@ -1,7 +1,7 @@
 chromadb:
   host: localhost
   port: 8000
-  persist_directory: /mnt/i/ai-lab/chromadb
+  persist_directory: /home/manoj/ava-data/chroma_db
   policies_collection: devops_policies_v2
   blogs_collection: devops_blogs_v1
 embedding:
