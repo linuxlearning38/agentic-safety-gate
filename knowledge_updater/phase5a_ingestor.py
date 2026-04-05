@@ -27,7 +27,7 @@ logging.basicConfig(
 logger = logging.getLogger("ava.phase5a_ingestor")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CHROMA_PATH   = os.getenv("CHROMA_PATH",  "/home/manoj/ava-data/chroma_db")
+CHROMA_PATH   = os.getenv("CHROMA_PATH",  "/home/manoj/ava-data/chromadb")
 OLLAMA_HOST   = os.getenv("OLLAMA_HOST",  "http://localhost:11434")
 EMBED_MODEL   = "nomic-embed-text"
 
