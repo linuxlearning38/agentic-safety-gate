@@ -91,6 +91,15 @@ class HybridRetriever:
             config["chromadb"]["blogs_collection"],
             required=False
         )
+        # Phase 5A: new collections
+        self.fixes_collection = self._get_collection(
+            "devops_fixes_v1",
+            required=False
+        )
+        self.patterns_collection = self._get_collection(
+            "devops_patterns_v1",
+            required=False
+        )
 
     def _get_collection(self, name: str, required: bool = True):
         try:
@@ -267,6 +276,18 @@ class HybridRetriever:
                 logger.info(f"Keyword injection: added {len(forced)} fsGroupChangePolicy chunks")
                 blog_chunks = forced + blog_chunks
 
+        # Phase 5A: query new collections based on intent
+        fixes_chunks = []
+        patterns_chunks = []
+        if query_intent == "troubleshooting":
+            fixes_chunks = self._query_collection(
+                self.fixes_collection, embedding, 4, "fixes"
+            )
+        else:
+            patterns_chunks = self._query_collection(
+                self.patterns_collection, embedding, 2, "patterns"
+            )
+
         all_chunks = policy_chunks + blog_chunks
         if query_intent == "definition":
             for chunk in all_chunks:
@@ -292,13 +313,15 @@ class HybridRetriever:
         elapsed = round((time.time() - start) * 1000, 1)
         logger.info(
             f"Hybrid retrieval: {len(policy_chunks)} policy + "
-            f"{len(blog_chunks_filtered)} blog chunks in {elapsed}ms"
+            f"{len(blog_chunks_filtered)} blog + "
+            f"{len(fixes_chunks)} fixes + "
+            f"{len(patterns_chunks)} patterns chunks in {elapsed}ms"
         )
 
         if not format_for_llm:
-            return policy_chunks + blog_chunks_filtered
+            return policy_chunks + blog_chunks_filtered + fixes_chunks + patterns_chunks
 
-        return self._format_context(policy_chunks, blog_chunks_filtered)
+        return self._format_context(policy_chunks, blog_chunks_filtered, fixes_chunks, patterns_chunks)
 
     # ─────────────────────────────────────────────────────────────────────────
     # Phase 3: Context Assembly
@@ -372,7 +395,13 @@ class HybridRetriever:
         )
         return merged
 
-    def _format_context(self, policy_chunks: list, blog_chunks: list) -> str:
+    def _format_context(
+        self,
+        policy_chunks: list,
+        blog_chunks: list,
+        fixes_chunks: list = None,
+        patterns_chunks: list = None
+    ) -> str:
         sections = []
 
         if policy_chunks:
@@ -392,6 +421,18 @@ class HybridRetriever:
                 )
                 sections.append(chunk.content)
 
+        if fixes_chunks:
+            sections.append("\n### Known Fixes & Solutions")
+            for i, chunk in enumerate(fixes_chunks, 1):
+                sections.append(f"\n[F{i}] Relevance: {chunk.relevance_score:.0%}")
+                sections.append(chunk.content)
+
+        if patterns_chunks:
+            sections.append("\n### Infrastructure Patterns")
+            for i, chunk in enumerate(patterns_chunks, 1):
+                sections.append(f"\n[PT{i}] Relevance: {chunk.relevance_score:.0%}")
+                sections.append(chunk.content)
+
         return "\n".join(sections)
 
     def status(self) -> dict:
@@ -400,5 +441,11 @@ class HybridRetriever:
             "policies_chunks": self.policies_collection.count() if self.policies_collection else 0,
             "blogs_collection": self.config["chromadb"]["blogs_collection"],
             "blogs_chunks": self.blogs_collection.count() if self.blogs_collection else 0,
-            "blogs_ready": self.blogs_collection is not None
+            "blogs_ready": self.blogs_collection is not None,
+            "fixes_collection": "devops_fixes_v1",
+            "fixes_chunks": self.fixes_collection.count() if self.fixes_collection else 0,
+            "fixes_ready": self.fixes_collection is not None,
+            "patterns_collection": "devops_patterns_v1",
+            "patterns_chunks": self.patterns_collection.count() if self.patterns_collection else 0,
+            "patterns_ready": self.patterns_collection is not None,
         }
