@@ -13,6 +13,7 @@ Falls back to policies-only if devops_blogs_v1 doesn't exist yet.
 """
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -154,6 +155,66 @@ class HybridRetriever:
             logger.error(f"Keyword fetch failed: {e}")
             return []
 
+    def _detect_query_intent(self, query_text: str) -> str:
+        q = query_text.lower().strip()
+        if any(q.startswith(prefix) for prefix in ["what is", "what are", "define", "explain "]):
+            return "definition"
+        if any(k in q for k in ["compare", "difference between", "vs ", "versus"]):
+            return "comparison"
+        if any(k in q for k in ["error", "failed", "not working", "broken", "troubleshoot", "debug", "fix"]):
+            return "troubleshooting"
+        return "general"
+
+    def _extract_core_terms(self, query_text: str) -> list:
+        q = query_text.lower().strip()
+        for prefix in ["what is ", "what are ", "define ", "explain "]:
+            if q.startswith(prefix):
+                q = q[len(prefix):]
+                break
+        q = re.sub(r"[^\w\s\-]", " ", q)
+        q = re.sub(r"\s+", " ", q).strip()
+        stop_words = {
+            "a", "an", "the", "is", "are", "for", "of", "to", "in", "on", "and",
+            "or", "with", "me", "about", "please"
+        }
+        return [term for term in q.split() if term and term not in stop_words]
+
+    def _definition_bonus(self, chunk: RetrievedChunk, query_text: str, core_terms: list) -> int:
+        if not core_terms:
+            return 0
+
+        text = chunk.content.lower()
+        early_text = text[:200]
+        title = (chunk.metadata.get("title", "") or "").lower()
+        source = (chunk.metadata.get("source", "") or "").lower()
+        phrase = " ".join(core_terms)
+        bonus = 0
+
+        if phrase and phrase in text:
+            bonus += 18
+        if phrase and phrase in early_text:
+            bonus += 16
+        if phrase and phrase in title:
+            bonus += 10
+        if any(term in source for term in core_terms):
+            bonus += 4
+
+        matched_terms = sum(1 for term in core_terms if term in text)
+        bonus += matched_terms * 3
+
+        definition_patterns = [
+            f"{phrase} is",
+            f"{phrase} are",
+            "used to",
+            "determines whether",
+            "is a diagnostic",
+            "is used to",
+        ]
+        if any(pattern.strip() and pattern in text for pattern in definition_patterns):
+            bonus += 12
+
+        return bonus
+
     def query(
         self,
         query_text: str,
@@ -163,6 +224,8 @@ class HybridRetriever:
         format_for_llm: bool = True
     ):
         start = time.time()
+        query_intent = self._detect_query_intent(query_text)
+        core_terms = self._extract_core_terms(query_text)
 
         embedding = self.embedder.embed(query_text)
         if not embedding:
@@ -171,8 +234,11 @@ class HybridRetriever:
         policy_chunks = self._query_collection(
             self.policies_collection, embedding, n_policies, "policies"
         )
+        blog_fetch_count = max(n_blogs, 20)
+        if query_intent == "definition":
+            blog_fetch_count = max(n_blogs, 8)
         blog_chunks = self._query_collection(
-            self.blogs_collection, embedding, max(n_blogs, 20), "blogs"
+            self.blogs_collection, embedding, blog_fetch_count, "blogs"
         )
 
         # Keyword boost — chunks containing query words rank higher
@@ -200,11 +266,23 @@ class HybridRetriever:
             if forced:
                 logger.info(f"Keyword injection: added {len(forced)} fsGroupChangePolicy chunks")
                 blog_chunks = forced + blog_chunks
+
+        all_chunks = policy_chunks + blog_chunks
+        if query_intent == "definition":
+            for chunk in all_chunks:
+                bonus = self._definition_bonus(chunk, query_text, core_terms)
+                if bonus:
+                    chunk.distance = max(0, chunk.distance - bonus)
+
         for chunk in blog_chunks:
             keyword_hits = sum(1 for w in query_words if w in chunk.content.lower())
             # Extra boost for high-value technical terms
             bonus = sum(3 for term in BOOST_TERMS if term.lower() in chunk.content.lower())
             chunk.distance = max(0, chunk.distance - (keyword_hits * 5) - bonus)
+
+        if query_intent == "definition":
+            policy_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
+            blog_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
 
         blog_chunks_filtered = [
             c for c in blog_chunks if c.relevance_score >= blog_min_relevance
