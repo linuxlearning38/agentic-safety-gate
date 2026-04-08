@@ -812,6 +812,302 @@ SEED_PATTERNS = [
 ]
 
 
+# ── Seed Data: AVA Self-Architecture ─────────────────────────────────────────
+AVA_ARCHITECTURE = [
+    {
+        "name": "AVA System Overview",
+        "category": "ava_system",
+        "description": "AVA is an Autonomous DevOps AI Assistant running locally on WSL2 Ubuntu. Built by Manoj, Delhi. Production URL: https://172.24.212.81:5443",
+        "implementation": """
+RUNTIME STACK:
+- OS: WSL2 Ubuntu on Windows 11
+- GPU: RTX 5060 Ti 16GB GDDR7
+- RAM: 32GB DDR4 (24GB allocated to WSL2)
+- CPU: Ryzen 1600 (6 cores)
+
+DOCKER CONTAINERS (docker compose):
+- ava-agent      → Flask/Gunicorn app on :5443 (HTTPS)
+- agent_postgres → PostgreSQL 15 on :5432
+- agent_redis    → Redis 7 on :6379
+- opa            → Open Policy Agent on :8181
+
+PROCESS INSIDE ava-agent:
+- Gunicorn (2 workers) serving Flask app
+- Main file: web_agent_v2.1_guardrail.py
+- WSGI entry: wsgi.py
+- Gunicorn config: gunicorn.conf.py
+""",
+        "benefits": "AVA runs fully offline. No data leaves the machine. All inference is local.",
+        "tradeoffs": "Response time 4-12s due to local LLM inference.",
+        "example": "curl -sk https://localhost:5443/health",
+        "tags": "ava, system, architecture, overview, runtime"
+    },
+    {
+        "name": "AVA AI Models",
+        "category": "ava_system",
+        "description": "LLM and embedding models used by AVA for inference and RAG",
+        "implementation": """
+LLM MODEL:
+- Model: qwen2.5:14b (Q4_K_M quantization)
+- Provider: Ollama (running as systemd service)
+- Ollama host: http://host.docker.internal:11434
+- Models path: /mnt/i/ai-lab/models
+- Keep-alive: 30 minutes
+- Context window: 8192 tokens
+- Temperature: 0.2 (responses), 0.0 (warmup)
+- Vision model: llava:13b (for image analysis)
+
+EMBEDDING MODEL:
+- Model: nomic-embed-text
+- Provider: Ollama
+- Used for: ChromaDB vector embeddings
+- Dimensions: 768
+
+WARMUP:
+- LLM warmed on startup in background thread
+- Warmup time: ~23 seconds
+- Prevents cold-start on first query
+""",
+        "benefits": "Fully offline inference. No API costs. RTX 5060 Ti handles 14B model at 4-8s response.",
+        "tradeoffs": "Model size limits to 14B for fast responses. 32B used only for complex reasoning.",
+        "example": "OLLAMA_HOST=0.0.0.0 OLLAMA_MODELS=/mnt/i/ai-lab/models ollama serve",
+        "tags": "ava, models, ollama, qwen, llm, embedding, nomic"
+    },
+    {
+        "name": "AVA ChromaDB Knowledge Base",
+        "category": "ava_system",
+        "description": "AVA's vector database with 4 collections storing DevOps knowledge",
+        "implementation": """
+CHROMADB PATH: /home/manoj/ava-data/chromadb
+DOCKER MOUNT: /home/manoj/ava-data/chromadb -> /data/chromadb
+CHROMA_PATH env: /data/chromadb (inside container)
+
+COLLECTIONS:
+1. devops_policies_v2   — 3,885 chunks
+   Source: mrcloudbook.com DevOps policies
+   Content: Kubernetes, Docker, AWS, Linux policies
+
+2. devops_blogs_v1      — 2,513 chunks
+   Sources: AWS, Cloudflare, K8s, Pulumi, Azure,
+            Red Hat, Ubuntu, GCP blogs
+   Content: Technical blog articles
+
+3. devops_fixes_v1      — 20+ chunks
+   Content: Real DevOps troubleshooting fixes
+   Covers: K8s errors, Docker, Terraform, Linux, AWS
+
+4. devops_patterns_v1   — 50+ chunks
+   Content: Infrastructure patterns, best practices
+   Covers: K8s, CI/CD, AWS, Terraform, Observability
+
+TOTAL: ~6,500+ chunks
+TARGET: 50,000+ chunks (Phase 5A goal)
+""",
+        "benefits": "Local vector search. No external API needed. All 4 collections queried per request.",
+        "tradeoffs": "NTFS mount causes ChromaDB errors — must use WSL-native ext4 path.",
+        "example": "python3 knowledge_updater/phase5a_ingestor.py",
+        "tags": "ava, chromadb, knowledge-base, collections, rag, vectors"
+    },
+    {
+        "name": "AVA File Structure",
+        "category": "ava_system",
+        "description": "Key files and folders in AVA's codebase",
+        "implementation": """
+PROJECT ROOT: /mnt/i/ai-lab/projects/devops-agent/
+GITHUB: https://github.com/linuxlearning38/agentic-safety-gate (private)
+
+CORE FILES:
+- web_agent_v2.1_guardrail.py  <- MAIN APP (1700+ lines)
+- wsgi.py                       <- Gunicorn WSGI entry
+- gunicorn.conf.py              <- 2 workers, preload=False
+- docker-compose.yml            <- Full stack definition
+- Dockerfile                    <- Python 3.11, non-root ava user
+- requirements.txt              <- All Python dependencies
+
+CONTROL MODULE (control/):
+- auth.py           <- JWT authentication (24h tokens)
+- registry.py       <- Tool registry + whitelist (token-aware)
+- react_loop.py     <- ReAct reasoning loop (5 iterations max)
+- secure_executor.py <- shell=False command execution
+- security_layer.py  <- OPA policy integration
+- incident_reporter.py <- JSON incident reports
+- vuln_scanner.py   <- Trivy + Lynis integration
+- approval.py       <- Human-in-loop approval queue
+- logger.py         <- Structured audit logging
+
+KNOWLEDGE UPDATER (knowledge_updater/):
+- ingestor.py         <- RSS scraper + ChromaDB ingestor
+- hybrid_retrieval.py <- 4-collection RAG retrieval
+- phase5a_ingestor.py <- New collections + seed data
+- scraper.py          <- BeautifulSoup web scraper
+- scheduler.py        <- Cron-based knowledge updates
+- config.yaml         <- Blog sources + ChromaDB config
+
+DATA PATHS (/home/manoj/ava-data/):
+- chromadb/           <- ChromaDB vector store
+- ava_memory.json     <- User memory (Manoj's infra stack)
+- query_history.json  <- Past query history
+- control_whitelist.json <- Approved commands
+- logs/               <- Access + error logs
+- reports/            <- Incident + security reports
+""",
+        "benefits": "Clean separation of concerns. Control module is independent of knowledge module.",
+        "tradeoffs": "Main file is 1700+ lines — candidate for refactoring in Phase 6.",
+        "example": "docker exec ava-agent ls /app/",
+        "tags": "ava, files, structure, codebase, architecture"
+    },
+    {
+        "name": "AVA Request Pipeline",
+        "category": "ava_system",
+        "description": "How a query flows through AVA from HTTP request to response",
+        "implementation": """
+REQUEST FLOW:
+POST /ask
+  |
+JWT validation (control/auth.py)
+  |
+Rate limiting (Flask-Limiter, 30 req/min)
+  |
+detect_multiple_questions() -> split if 2-3 questions
+  |
+For each question:
+  |
+detect_query_intent() -> definition|comparison|diagram|troubleshooting|general
+  |
+hybrid_retrieval.query()
+  |- devops_policies_v2  (n=6 for definition, n=4 for others)
+  |- devops_blogs_v1     (n=2)
+  |- devops_fixes_v1     (n=4 if troubleshooting)
+  +- devops_patterns_v1  (n=2 if not troubleshooting)
+  |
+score_context_confidence() -> high|medium|low
+  |
+build_memory_context() -> inject Manoj's infra + past fixes
+  |
+generate_response() -> Qwen2.5:14b via Ollama
+  |
+ReAct loop (if command needed) -> OPA gate -> execute
+  |
+JSON response: {response, confidence, intent, sources_used}
+
+RESPONSE TIMES:
+- Definition: 4-7s
+- Comparison: 5-8s
+- Troubleshooting: 6-10s
+- Diagram (Mermaid): 4-6s
+- Multi-question (3x): 15-25s
+""",
+        "benefits": "Every query is grounded in RAG context. Confidence scoring prevents hallucination. Memory injection personalizes responses.",
+        "tradeoffs": "Sequential multi-question adds latency. No streaming — complete JSON response only.",
+        "example": "curl -sk https://localhost:5443/ask -H 'Authorization: Bearer TOKEN' -d '{\"query\":\"What is readiness probe?\"}'",
+        "tags": "ava, pipeline, request-flow, rag, inference, architecture"
+    },
+    {
+        "name": "AVA Security Architecture",
+        "category": "ava_system",
+        "description": "All security layers in AVA — from network to command execution",
+        "implementation": """
+LAYER 1 — NETWORK:
+- TLS 1.3 (RSA 4096 self-signed cert)
+- HTTPS only on :5443
+- HTTP on :5002 redirects to HTTPS
+
+LAYER 2 — AUTHENTICATION:
+- JWT tokens (24h expiry)
+- Roles: admin (full access), readonly (no execution)
+- bcrypt password hashing
+- Login: POST /auth/login
+
+LAYER 3 — RATE LIMITING:
+- Flask-Limiter: 30 req/min per user
+- 429 JSON response on breach
+
+LAYER 4 — COMMAND SAFETY (control/registry.py):
+- Token-aware whitelist matching
+- shell=False (no shell injection)
+- Risk levels: LOW/MEDIUM/HIGH
+- 'ls /etc/shadow' BLOCKED even if 'ls' is whitelisted
+
+LAYER 5 — OPA POLICY GATE:
+- Open Policy Agent on :8181
+- Rego policies in policies/infrastructure.rego
+- All commands validated before execution
+
+LAYER 6 — CONFIDENCE SCORING:
+- high (>0.85): auto-execute
+- medium (0.6-0.85): suggest + wait
+- low (<0.6): alert only, no execution
+
+LAYER 7 — CONTAINER:
+- Non-root user: ava (uid 1001)
+- Read-only certs mount
+- No privileged mode
+""",
+        "benefits": "7-layer defense. OPA is last gate before any execution. Confidence score prevents risky auto-execution.",
+        "tradeoffs": "7 layers add ~50ms overhead per request. JWT secret must be rotated periodically.",
+        "example": "docker exec ava-agent id  # shows: uid=1001(ava)",
+        "tags": "ava, security, jwt, opa, tls, whitelist, confidence"
+    },
+    {
+        "name": "AVA Phase Roadmap",
+        "category": "ava_system",
+        "description": "AVA's development phases from current state to autonomous control plane",
+        "implementation": """
+COMPLETED:
+- Phase 1: Flask agent + ChromaDB RAG + OPA security
+- Phase 2: RSS scraper + knowledge updater
+- Phase 3: Mermaid diagrams + LLaVA image analysis + blog ingestion
+- Phase 4: JWT + TLS + Docker + ReAct loop + Trivy/Lynis
+- Phase 4.5: Confidence scoring + memory injection + multi-question
+- Phase 5A Day 1: 4 collections + 20 fixes + 50 patterns seeded
+
+IN PROGRESS:
+- Phase 5A: Knowledge expansion to 50,000+ chunks
+
+UPCOMING:
+- Phase 5B: Webhook triggers + multi-turn conversation + SQLite
+- Phase 5C: Self-healing module (auto-detect + fix known issues)
+- Phase 5D: Jira + Slack + PagerDuty API integration
+- Phase 5E: Terraform template provisioning (AWS/Azure/GCP)
+- Phase 5F: Docker Compose installer + packaging
+- Phase 6: Full autonomous control plane
+
+COMMERCIAL TARGET:
+- Indian enterprises (DPDP Act data localization)
+- Banks, government, manufacturing (air-gapped)
+- Replaces Watson/Accenture myWizard at 0/month recurring cost
+""",
+        "benefits": "Clear roadmap. Each phase builds on previous. Commercial value increases with each phase.",
+        "tradeoffs": "AWS SAA-C03 exam (August 9, 2026) runs in parallel — time management critical.",
+        "example": "AVA Phase 6 = Level 4 autonomy: Jira ticket -> provision infra -> deploy -> test -> close ticket",
+        "tags": "ava, roadmap, phases, commercial, autonomous, devops"
+    },
+]
+
+
+def seed_ava_architecture():
+    """Ingest AVA's own system architecture into devops_patterns_v1."""
+    logger.info(f"Seeding {len(AVA_ARCHITECTURE)} AVA architecture entries into '{COLLECTION_PATTERNS}'...")
+    ok = 0
+    fail = 0
+    for item in AVA_ARCHITECTURE:
+        text = _pattern_to_text(item)
+        meta = {
+            "name":       item["name"][:200],
+            "category":   item["category"],
+            "tags":       item["tags"],
+            "source":     "ava_self_architecture",
+            "collection": COLLECTION_PATTERNS,
+        }
+        if ingest_text_to_collection(COLLECTION_PATTERNS, text, meta):
+            ok += 1
+        else:
+            fail += 1
+        time.sleep(0.1)
+    logger.info(f"AVA architecture seed complete: {ok} ingested, {fail} failed")
+    return ok, fail
+
+
 def _pattern_to_text(p: dict) -> str:
     """Convert a pattern dict to a formatted text chunk for embedding."""
     return (
@@ -896,6 +1192,10 @@ if __name__ == "__main__":
     # Step 2b: seed patterns
     print("\n--- Seeding devops_patterns_v1 ---")
     ok_p, fail_p = seed_patterns_collection()
+
+    # Step 2c: seed AVA self-architecture
+    print("\n--- Seeding AVA architecture into devops_patterns_v1 ---")
+    ok_a, fail_a = seed_ava_architecture()
 
     # Step 3: stats
     print("\n--- Collection Stats ---")
