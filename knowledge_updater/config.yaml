@@ -1,7 +1,7 @@
 chromadb:
   host: localhost
   port: 8000
-  persist_directory: /home/manoj/ava-data/chroma_db
+  persist_directory: /home/manoj/ava-data/chromadb
   policies_collection: devops_policies_v2
   blogs_collection: devops_blogs_v1
 embedding:
@@ -87,6 +87,62 @@ sources:
   max_articles: 8
   min_content_length: 400
   enabled: true
+- name: Netflix Tech Blog
+  url: https://netflixtechblog.com/
+  rss: https://netflixtechblog.com/feed
+  max_articles: 15
+  min_content_length: 500
+  enabled: true
+  request_delay: 3
+- name: GitHub Engineering
+  url: https://github.blog/engineering/
+  rss: https://github.blog/engineering.atom
+  max_articles: 15
+  min_content_length: 500
+  enabled: true
+  request_delay: 3
+- name: Uber Engineering
+  url: https://www.uber.com/en-IN/blog/engineering/
+  rss: https://eng.uber.com/feed/
+  max_articles: 10
+  min_content_length: 500
+  enabled: true
+  request_delay: 3
+- name: Google SRE
+  url: https://sre.google/blog/
+  rss: https://sre.google/blog/feed.xml
+  max_articles: 10
+  min_content_length: 400
+  enabled: true
+  request_delay: 3
+- name: Martin Fowler
+  url: https://martinfowler.com/
+  rss: https://martinfowler.com/feed.atom
+  max_articles: 10
+  min_content_length: 400
+  enabled: true
+  request_delay: 3
+- name: The New Stack
+  url: https://thenewstack.io/
+  rss: https://thenewstack.io/feed/
+  max_articles: 15
+  min_content_length: 400
+  enabled: true
+  request_delay: 3
+- name: Docker Blog
+  url: https://www.docker.com/blog/
+  rss: https://www.docker.com/blog/feed/
+  max_articles: 15
+  min_content_length: 400
+  enabled: true
+  request_delay: 3
+- name: Grafana Blog
+  url: https://grafana.com/blog/
+  rss: https://grafana.com/blog/index.xml
+  max_articles: 10
+  min_content_length: 400
+  enabled: true
+  request_delay: 3
 chunking:
   chunk_size: 400
   chunk_overlap: 50
