@@ -9,6 +9,7 @@ from flask_cors import CORS
 import chromadb
 from knowledge_updater.hybrid_retrieval import HybridRetriever
 import ollama
+import re
 import subprocess
 import os
 import json
@@ -368,6 +369,25 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
     try:
         if query_intent is None:
             query_intent = detect_query_intent(query)
+
+        # ava_self: patterns-first, no blogs, minimal policy
+        if query_intent == "ava_self":
+            embedding = hybrid_retriever.embedder.embed(query)
+            if not embedding:
+                return []
+            patterns = hybrid_retriever._query_collection(
+                hybrid_retriever.patterns_collection, embedding, 6, "patterns"
+            )
+            policies = hybrid_retriever._query_collection(
+                hybrid_retriever.policies_collection, embedding, 2, "policies"
+            )
+            all_chunks = patterns + policies
+            if all_chunks:
+                assembled = hybrid_retriever.assemble_context(all_chunks)
+                logger.info(f"[ava_self] {len(patterns)} pattern + {len(policies)} policy chunks → {len(assembled)} blocks")
+                return assembled if assembled else [c.content for c in all_chunks]
+            return []
+
         if query_intent == "definition":
             n_policies = max(n_policies, 6)
             n_blogs = min(n_blogs, 2)
@@ -414,6 +434,16 @@ def is_weak_response(response_text):
 
 def detect_query_intent(query):
     q = query.lower().strip()
+    # AVA self-knowledge guard — before all others
+    _ava_patterns = [
+        "your architecture", "your files", "your containers", "your models",
+        "your pipeline", "how do you work", "your ports", "your services",
+        "your stack", "your components", "your docker", "your database",
+        "are you running", "do you run", "what containers", "what services",
+        "what ports", "what models", "what are you running",
+    ]
+    if any(k in q for k in _ava_patterns) or re.search(r'\bava\b', q):
+        return "ava_self"
     # Definition guard runs first — "what is/are" always wins regardless of
     # other keywords present in the query (e.g. "what is the fix for...")
     if q.startswith("what is") or q.startswith("what are"):
@@ -556,6 +586,9 @@ def generate_response(query, context, confidence=None, prior_messages=None):
 
         if memory_ctx:
             system_parts.append(f"\nUSER CONTEXT (use this to tailor your answers):\n{memory_ctx}")
+
+        if query_intent == "ava_self":
+            system_parts.append("\nYou are AVA. The context below describes YOUR OWN architecture, containers, files, and runtime stack. Answer in first person using this context — do not say 'the system' or 'the assistant', say 'I' or 'my'. Be specific about ports, services, and components you see in the context.")
 
         if query_intent == "definition":
             system_parts.append("\nFor definition questions: start with a plain-English definition in the first sentence. Then give 2-4 practical details. If the retrieved context is related but incomplete, combine it with standard DevOps knowledge instead of refusing to answer.")
@@ -971,7 +1004,13 @@ def ask():
             })
         
         # ── Phase 4: Command Graph — deterministic diagnostics ──────────────
-        graph_name = match_graph(query)
+        # Skip command graph for knowledge/troubleshooting questions that don't
+        # explicitly request command execution. Graph is for live diagnostics only.
+        _graph_explicit = any(k in query.lower() for k in [
+            "run kubectl", "execute", "apply the fix", "apply this", "run this",
+            "run the", "kubectl apply", "kubectl exec", "diagnose now", "check now",
+        ])
+        graph_name = match_graph(query) if _graph_explicit or detect_query_intent(query) not in ("troubleshooting", "definition", "ava_self") else None
         if graph_name:
             logger.info(f"[*] Command Graph matched: {graph_name}")
             _graph_t0    = time.time()
@@ -1056,6 +1095,16 @@ def ask():
             "diagnose", "debug", "troubleshoot", "why is", "what's wrong",
         ]
         is_problem_query = any(s in query.lower() for s in react_signals)
+
+        # Troubleshooting knowledge questions → KNOWLEDGE branch, not ReAct.
+        # Only use ReAct when user explicitly asks to run/execute something.
+        _explicit_execution = any(k in query.lower() for k in [
+            "run kubectl", "execute", "apply the fix", "apply this", "run this",
+            "run the", "kubectl apply", "kubectl exec",
+        ])
+        _query_intent_here = detect_query_intent(query)
+        if _query_intent_here == "troubleshooting" and not _explicit_execution:
+            is_problem_query = False
 
         if is_problem_query and not any(k in query.lower() for k in [
             "how to", "how do", "what is", "explain", "best practice",
