@@ -370,23 +370,42 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
         if query_intent is None:
             query_intent = detect_query_intent(query)
 
-        # ava_self: patterns-first, no blogs, minimal policy
+        # ava_self: exact system facts first, then patterns, minimal policy, no blogs
         if query_intent == "ava_self":
+            about = _get_about_data()
+            c = about["containers"]
+            m = about["models"]
+            kb = about["knowledge_base"]
+            facts_block = (
+                "AVA System Facts:\n"
+                f"version={about['version']} | phase={about['phase']} | "
+                f"built_by={about['built_by']} | runtime={about['runtime']}\n\n"
+                "Containers and ports:\n"
+                + "\n".join(
+                    f"  {name}: port {info['port']} — {info['stack']}"
+                    for name, info in c.items()
+                )
+                + f"\n\nModels:\n"
+                f"  LLM: {m['llm']}\n"
+                f"  Embedding: {m['embedding']}\n"
+                f"  Vision: {m['vision']}\n"
+                f"  Ollama host: {m['ollama_host']}\n\n"
+                "Knowledge base chunks:\n"
+                + "\n".join(f"  {col}: {count}" for col, count in kb.items())
+            )
+
             embedding = hybrid_retriever.embedder.embed(query)
             if not embedding:
-                return []
+                return [facts_block]
             patterns = hybrid_retriever._query_collection(
                 hybrid_retriever.patterns_collection, embedding, 6, "patterns"
             )
             policies = hybrid_retriever._query_collection(
                 hybrid_retriever.policies_collection, embedding, 2, "policies"
             )
-            all_chunks = patterns + policies
-            if all_chunks:
-                assembled = hybrid_retriever.assemble_context(all_chunks)
-                logger.info(f"[ava_self] {len(patterns)} pattern + {len(policies)} policy chunks → {len(assembled)} blocks")
-                return assembled if assembled else [c.content for c in all_chunks]
-            return []
+            assembled = hybrid_retriever.assemble_context(patterns + policies) if (patterns or policies) else []
+            logger.info(f"[ava_self] facts + {len(patterns)} pattern + {len(policies)} policy chunks → {len(assembled)} blocks")
+            return [facts_block] + (assembled if assembled else [c.content for c in patterns + policies])
 
         if query_intent == "definition":
             n_policies = max(n_policies, 6)
@@ -636,6 +655,48 @@ def generate_response(query, context, confidence=None, prior_messages=None):
 
 # Routes
 # ── Auth Endpoints ────────────────────────────────────────────────────────────
+
+def _get_about_data() -> dict:
+    """Return AVA system facts. Called by /about and ava_self context injection."""
+    _collections = [
+        "devops_policies_v2", "devops_blogs_v1",
+        "devops_fixes_v1", "devops_patterns_v1",
+    ]
+    kb = {}
+    for col in _collections:
+        try:
+            kb[col] = chroma_client.get_collection(col).count()
+        except Exception:
+            kb[col] = 0
+
+    return {
+        "version": "2.1.2",
+        "phase": "Phase 5B Complete",
+        "built_by": "Manoj, Delhi",
+        "github": "linuxlearning38/agentic-safety-gate",
+        "runtime": "WSL2 Ubuntu, RTX 5060 Ti 16GB, Ryzen 1600, 32GB RAM",
+        "containers": {
+            "ava-agent":       {"port": 5443, "proto": "HTTPS", "stack": "Flask/Gunicorn, 2 workers"},
+            "agent_postgres":  {"port": 5432, "stack": "PostgreSQL 15"},
+            "agent_redis":     {"port": 6379, "stack": "Redis 7"},
+            "agent_opa":       {"port": 8181, "stack": "Open Policy Agent"},
+            "agent_vault":     {"port": 8200, "stack": "HashiCorp Vault"},
+        },
+        "models": {
+            "llm":       "qwen2.5:14b (Q4_K_M quantization)",
+            "embedding": "nomic-embed-text",
+            "vision":    "llava:13b",
+            "ollama_host": "http://host.docker.internal:11434",
+        },
+        "knowledge_base": kb,
+    }
+
+
+@app.route('/about', methods=['GET'])
+def about():
+    """Public endpoint — no JWT required. Returns AVA system info."""
+    return jsonify(_get_about_data())
+
 
 @app.route('/health', methods=['GET'])
 def health_check():
