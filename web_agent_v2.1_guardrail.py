@@ -23,6 +23,7 @@ from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
 from control import vuln_scanner          # Day 8 — Trivy + Lynis
 from control import database as db        # Phase 5B — SQLite layer
+from control.self_healer import healer    # Phase 5C — self-healing engine
 from control.incident_reporter import (
     report_tool_execution,
     report_graph_execution,
@@ -194,6 +195,10 @@ hybrid_retriever = HybridRetriever(_ku_config, existing_client=chroma_client)
 
 # Phase 5B: SQLite init (auto-migrates ava_memory.json on first run)
 db.init_db()
+
+# Phase 5C: background health monitor
+from control.monitor import start_monitor
+start_monitor()
 
 # Command whitelist - expanded for server management
 ALLOWED_COMMANDS = [
@@ -1424,55 +1429,17 @@ def webhook():
 
         logger.info(f"[Webhook] Alert received: {alert_msg[:120]}")
 
-        # Run through full AVA pipeline
+        # Phase 5C: classify + heal via SelfHealer
+        issue        = healer.detect_issue(source="webhook", message=alert_msg)
+        healing      = healer.heal(issue, dry_run=False)
+        heal_action  = healing.get("action_taken", "none")
+        logger.info(f"[Webhook] SelfHealer → {heal_action} | issue={issue['issue_type']}")
+
+        # Also run through full AVA knowledge pipeline for a human-readable response
         query_intent = detect_query_intent(alert_msg)
-        context = query_knowledge_base(alert_msg, query_intent=query_intent)
-        confidence = score_context_confidence(context, alert_msg)
-        response = generate_response(alert_msg, context, confidence=confidence)
-
-        conf_score = {"high": 1.0, "medium": 0.65, "low": 0.3}.get(confidence, 0.0)
-        action_taken = "none"
-
-        if conf_score >= 0.85:
-            # High confidence + LOW risk → attempt auto-execute if a command is suggested
-            logger.info(f"[Webhook] High confidence ({confidence}) — checking for auto-executable fix")
-            action_taken = "auto_execute_attempted"
-            # Log to audit
-            try:
-                db.add_audit(
-                    event_type="webhook_high_confidence",
-                    details=f"alert={alert_msg[:200]} | response={response[:300]}",
-                    user="webhook",
-                )
-            except Exception:
-                pass
-
-        elif conf_score >= 0.6:
-            # Medium confidence → queue for approval
-            logger.info(f"[Webhook] Medium confidence ({confidence}) — queued for approval")
-            action_taken = "queued_for_approval"
-            try:
-                db.add_approval(command=alert_msg[:500], risk_level="medium")
-                db.add_audit(
-                    event_type="webhook_approval_queued",
-                    details=f"alert={alert_msg[:200]}",
-                    user="webhook",
-                )
-            except Exception as _dbe:
-                logger.warning(f"[Webhook] DB write failed: {_dbe}")
-
-        else:
-            # Low confidence → incident report only
-            logger.info(f"[Webhook] Low confidence ({confidence}) — incident report only")
-            action_taken = "incident_report"
-            try:
-                db.add_audit(
-                    event_type="webhook_low_confidence",
-                    details=f"alert={alert_msg[:200]}",
-                    user="webhook",
-                )
-            except Exception:
-                pass
+        context      = query_knowledge_base(alert_msg, query_intent=query_intent)
+        confidence   = score_context_confidence(context, alert_msg)
+        response     = generate_response(alert_msg, context, confidence=confidence)
 
         # Persist to query history
         try:
@@ -1487,15 +1454,82 @@ def webhook():
             logger.warning(f"[Webhook] save_query failed: {_dbe}")
 
         return jsonify({
-            "status": "ok",
-            "message": response[:600],
-            "confidence": confidence,
-            "action_taken": action_taken,
+            "status":        "ok",
+            "message":       response[:600],
+            "confidence":    confidence,
+            "action_taken":  heal_action,
+            "healing": {
+                "issue_type":   issue["issue_type"],
+                "severity":     issue["severity"],
+                "heal_confidence": issue["confidence"],
+                "command_used": healing.get("command_used"),
+                "result":       healing.get("result"),
+                "risk_level":   healing.get("risk_level"),
+            },
         })
 
     except Exception as e:
         logger.error(f"[Webhook] Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/heal', methods=['POST'])
+@require_admin
+def manual_heal():
+    """
+    Phase 5C — Manually trigger a healing action.
+    Body: {"issue_type": "disk_full", "target": "worker-1", "dry_run": true}
+    """
+    try:
+        data       = request.json or {}
+        issue_type = data.get("issue_type", "").strip()
+        target     = data.get("target", "unknown")
+        dry_run    = bool(data.get("dry_run", True))
+
+        if not issue_type:
+            return jsonify({"error": "issue_type is required"}), 400
+        from control.self_healer import HEALING_PLAYBOOK
+        if issue_type not in HEALING_PLAYBOOK:
+            return jsonify({
+                "error": f"Unknown issue_type '{issue_type}'",
+                "valid": list(HEALING_PLAYBOOK.keys()),
+            }), 400
+
+        issue = {
+            "issue_type": issue_type,
+            "severity":   "MEDIUM",
+            "confidence": 0.90,   # manual trigger — assume high confidence
+            "source":     f"manual:{get_jwt_identity()}",
+            "entities": {
+                "name":         target,
+                "namespace":    data.get("namespace", "default"),
+                "pod_name":     target,
+                "node_name":    target,
+                "service_name": target,
+                "new_limit":    data.get("new_limit", "512Mi"),
+                "old_limit":    data.get("old_limit", "256Mi"),
+                "new_replicas": str(data.get("new_replicas", 3)),
+                "old_replicas": str(data.get("old_replicas", 1)),
+            },
+        }
+
+        result = healer.heal(issue, dry_run=dry_run)
+        return jsonify({"status": "ok", "dry_run": dry_run, **result})
+
+    except Exception as e:
+        logger.error(f"[/heal] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/healing/history', methods=['GET'])
+@jwt_required()
+def healing_history():
+    """Phase 5C — Returns last 20 self-healing audit entries."""
+    try:
+        history = healer.get_healing_history(20)
+        return jsonify({"history": history, "total": len(history)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/upload', methods=['POST'])
