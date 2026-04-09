@@ -283,9 +283,12 @@ class HybridRetriever:
             fixes_chunks = self._query_collection(
                 self.fixes_collection, embedding, 4, "fixes"
             )
-        else:
             patterns_chunks = self._query_collection(
                 self.patterns_collection, embedding, 2, "patterns"
+            )
+        else:
+            patterns_chunks = self._query_collection(
+                self.patterns_collection, embedding, 4, "patterns"
             )
 
         all_chunks = policy_chunks + blog_chunks
