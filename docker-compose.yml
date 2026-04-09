@@ -58,6 +58,7 @@ services:
       - /home/manoj/ava-data/logs:/data/logs
       - /home/manoj/ava-data/query_history.json:/data/history/query_history.json
       - /home/manoj/ava-data/ava_memory.json:/data/ava_memory.json
+      - /home/manoj/ava-data/ava.db:/data/ava.db
       - /var/run/docker.sock:/var/run/docker.sock
 
     env_file:
@@ -71,6 +72,8 @@ services:
       GUNICORN_ERROR_LOG:  /data/logs/ava_error.log
       OLLAMA_HOST:         http://host.docker.internal:11434
       FLASK_ENV:           production
+      WEBHOOK_SECRET:      ${WEBHOOK_SECRET:-ava-webhook-2026}
+      DB_PATH:             ${DB_PATH:-/data/ava.db}
 
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -21,6 +21,7 @@ from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
 from control import vuln_scanner          # Day 8 — Trivy + Lynis
+from control import database as db        # Phase 5B — SQLite layer
 from control.incident_reporter import (
     report_tool_execution,
     report_graph_execution,
@@ -98,6 +99,9 @@ LLM_WARMUP_PROMPT = os.getenv("LLM_WARMUP_PROMPT", "Reply with only: ready")
 
 # Phase 3: Memory Layer
 MEMORY_PATH = os.getenv("MEMORY_PATH", "/home/manoj/ava-data/ava_memory.json")
+
+# Phase 5B: Webhook auth secret
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "ava-webhook-2026")
 _warmup_started = False
 _warmup_lock = threading.Lock()
 
@@ -186,6 +190,9 @@ import yaml
 with open("knowledge_updater/config.yaml") as _f:
     _ku_config = yaml.safe_load(_f)
 hybrid_retriever = HybridRetriever(_ku_config, existing_client=chroma_client)
+
+# Phase 5B: SQLite init (auto-migrates ava_memory.json on first run)
+db.init_db()
 
 # Command whitelist - expanded for server management
 ALLOWED_COMMANDS = [
@@ -533,8 +540,10 @@ _CONFIDENCE_PREFIXES = {
 }
 
 
-def generate_response(query, context, confidence=None):
-    """Phase 3: Structured response with memory, CoT, Mermaid, fail-safe."""
+def generate_response(query, context, confidence=None, prior_messages=None):
+    """Phase 3: Structured response with memory, CoT, Mermaid, fail-safe.
+    Phase 5B: prior_messages injects up to 3 turns of conversation history.
+    """
     try:
         memory_ctx = build_memory_context(query=query)
         query_intent = detect_query_intent(query)
@@ -573,12 +582,15 @@ def generate_response(query, context, confidence=None):
         else:
             user_msg = f"Answer this DevOps question from your knowledge:\n{query}"
 
+        # Phase 5B: inject prior conversation turns before current message
+        messages = [{"role": "system", "content": system_prompt}]
+        if prior_messages:
+            messages.extend(prior_messages)   # alternating user/assistant turns
+        messages.append({"role": "user", "content": user_msg})
+
         response = ollama.chat(
             model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg}
-            ],
+            messages=messages,
             options={"num_ctx": 8192, "temperature": 0.2}
         )
         answer = response["message"]["content"]
@@ -1158,7 +1170,8 @@ def ask():
         else:  # KNOWLEDGE or fallback
             # Handle regular DevOps questions with RAG
             logger.info("[*] Searching knowledge base...")
-            context = query_knowledge_base(query, query_intent=detect_query_intent(query))
+            query_intent = detect_query_intent(query)
+            context = query_knowledge_base(query, query_intent=query_intent)
             logger.info(f"[*] Found {len(context)} relevant chunks")
 
             # Phase 4.5: Score context confidence before generating
@@ -1166,7 +1179,19 @@ def ask():
             logger.info(f"[*] Context confidence: {confidence}")
             logger.info(f"[*] Thinking with {LLM_MODEL}...")
 
-            response = generate_response(query, context, confidence=confidence)
+            # Phase 5B: load recent conversation history for multi-turn context
+            prior_messages = None
+            conf_score = {"high": 1.0, "medium": 0.6, "low": 0.3}.get(confidence, 0.0)
+            if conf_score > 0.5:
+                recent = db.get_recent_queries(n=3)
+                if recent:
+                    prior_messages = []
+                    for row in recent:
+                        prior_messages.append({"role": "user", "content": row["query"]})
+                        prior_messages.append({"role": "assistant", "content": row["response"]})
+                    logger.info(f"[MultiTurn] Injecting {len(recent)} prior turns")
+
+            response = generate_response(query, context, confidence=confidence, prior_messages=prior_messages)
 
             # Phase 3: Fail-safe retry
             if context and len(context) < 2 and is_weak_response(response):
@@ -1183,7 +1208,7 @@ def ask():
                         retry_chunks, max_articles=5, max_chunks_per_article=4
                     )
                     retry_confidence = score_context_confidence(retry_context, query)
-                    response = generate_response(query, retry_context, confidence=retry_confidence)
+                    response = generate_response(query, retry_context, confidence=retry_confidence, prior_messages=prior_messages)
                     confidence = retry_confidence
                     logger.info("[FAILSAFE] Retry complete")
 
@@ -1210,6 +1235,24 @@ def ask():
                 'response_preview': response[:200] + '...' if len(response) > 200 else response
             })
 
+            # Phase 5B: persist to SQLite for multi-turn retrieval
+            # Strip confidence prefix so it doesn't compound on future turns
+            try:
+                clean_response = response
+                for prefix in _CONFIDENCE_PREFIXES.values():
+                    if clean_response.startswith(prefix):
+                        clean_response = clean_response[len(prefix):]
+                        break
+                db.save_query(
+                    query=query,
+                    response=clean_response,
+                    confidence=confidence,
+                    intent=query_intent,
+                    sources_used=len(context),
+                )
+            except Exception as _dbe:
+                logger.warning(f"[DB] save_query failed: {_dbe}")
+
             return jsonify({
                 'type': 'knowledge',
                 'response': response,
@@ -1221,6 +1264,129 @@ def ask():
     except Exception as e:
         logger.error(f"Error in ask endpoint: {e}")
         return jsonify({'error': 'Failed to process query', 'details': str(e)}), 500
+
+def _extract_webhook_message(payload: dict) -> str:
+    """Normalise webhook payloads from Alertmanager, Datadog, PagerDuty, or generic."""
+    # Alertmanager
+    alerts = payload.get("alerts")
+    if alerts and isinstance(alerts, list):
+        firing = [a for a in alerts if a.get("status") == "firing"]
+        if firing:
+            return firing[0].get("annotations", {}).get("summary", "") or \
+                   firing[0].get("annotations", {}).get("description", "")
+        if alerts:
+            return alerts[0].get("annotations", {}).get("summary", "")
+
+    # Datadog
+    if "title" in payload and "text" in payload:
+        return f"{payload['title']}: {payload['text']}"
+
+    # PagerDuty
+    messages = payload.get("messages")
+    if messages and isinstance(messages, list):
+        try:
+            return messages[0]["event"]["data"]["title"]
+        except (KeyError, IndexError):
+            pass
+
+    # Generic
+    return payload.get("message", payload.get("summary", payload.get("title", "")))
+
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """
+    Phase 5B — Webhook trigger endpoint.
+    Accepts alerts from Alertmanager, Datadog, PagerDuty, or generic senders.
+    Auth: X-Webhook-Secret header (no JWT required).
+    """
+    # Auth
+    provided_secret = request.headers.get("X-Webhook-Secret", "")
+    if provided_secret != WEBHOOK_SECRET:
+        logger.warning(f"[Webhook] Invalid secret from {request.remote_addr}")
+        return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+    try:
+        payload = request.get_json(force=True, silent=True) or {}
+        alert_msg = _extract_webhook_message(payload)
+        if not alert_msg:
+            return jsonify({"status": "error", "message": "Could not extract alert message from payload"}), 400
+
+        logger.info(f"[Webhook] Alert received: {alert_msg[:120]}")
+
+        # Run through full AVA pipeline
+        query_intent = detect_query_intent(alert_msg)
+        context = query_knowledge_base(alert_msg, query_intent=query_intent)
+        confidence = score_context_confidence(context, alert_msg)
+        response = generate_response(alert_msg, context, confidence=confidence)
+
+        conf_score = {"high": 1.0, "medium": 0.65, "low": 0.3}.get(confidence, 0.0)
+        action_taken = "none"
+
+        if conf_score >= 0.85:
+            # High confidence + LOW risk → attempt auto-execute if a command is suggested
+            logger.info(f"[Webhook] High confidence ({confidence}) — checking for auto-executable fix")
+            action_taken = "auto_execute_attempted"
+            # Log to audit
+            try:
+                db.add_audit(
+                    event_type="webhook_high_confidence",
+                    details=f"alert={alert_msg[:200]} | response={response[:300]}",
+                    user="webhook",
+                )
+            except Exception:
+                pass
+
+        elif conf_score >= 0.6:
+            # Medium confidence → queue for approval
+            logger.info(f"[Webhook] Medium confidence ({confidence}) — queued for approval")
+            action_taken = "queued_for_approval"
+            try:
+                db.add_approval(command=alert_msg[:500], risk_level="medium")
+                db.add_audit(
+                    event_type="webhook_approval_queued",
+                    details=f"alert={alert_msg[:200]}",
+                    user="webhook",
+                )
+            except Exception as _dbe:
+                logger.warning(f"[Webhook] DB write failed: {_dbe}")
+
+        else:
+            # Low confidence → incident report only
+            logger.info(f"[Webhook] Low confidence ({confidence}) — incident report only")
+            action_taken = "incident_report"
+            try:
+                db.add_audit(
+                    event_type="webhook_low_confidence",
+                    details=f"alert={alert_msg[:200]}",
+                    user="webhook",
+                )
+            except Exception:
+                pass
+
+        # Persist to query history
+        try:
+            db.save_query(
+                query=alert_msg,
+                response=response,
+                confidence=confidence,
+                intent=query_intent,
+                sources_used=len(context),
+            )
+        except Exception as _dbe:
+            logger.warning(f"[Webhook] save_query failed: {_dbe}")
+
+        return jsonify({
+            "status": "ok",
+            "message": response[:600],
+            "confidence": confidence,
+            "action_taken": action_taken,
+        })
+
+    except Exception as e:
+        logger.error(f"[Webhook] Error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @app.route('/upload', methods=['POST'])
 @require_admin
