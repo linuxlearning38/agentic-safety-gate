@@ -1,779 +1,28 @@
 {
-  "generated_at": "2026-04-08T10:16:43.165953+00:00",
+  "generated_at": "2026-04-08T10:19:46.954058+00:00",
   "chroma_path": "/home/manoj/ava-data/chromadb",
-  "total_chunks_before": 8900,
+  "total_chunks_before": 8780,
   "total_chunks_after": 8780,
-  "total_usable": 8862,
-  "purged": 120,
+  "total_usable": 8742,
+  "purged": 0,
   "exact_duplicates": {
-    "groups": 118,
-    "extra_copies": 120,
-    "detail": [
-      {
-        "hash": "e29e40432aede24d112a2030a2d4f5623fe697a83d57f7d9c52631ba90c304a4",
-        "copies": [
-          {
-            "collection": "devops_policies_v2",
-            "id": "blog_how-to-install-ollama-on-ubuntu-24-04-docker-compose_chunk_12",
-            "text_preview": "x with useradd command? The useradd command is one of the most fundamental tools for user management in Linux \u2026 Jan 21, "
-          },
-          {
-            "collection": "devops_policies_v2",
-            "id": "blog_how-to-achieve-zero-downtime-in-docker_chunk_13",
-            "text_preview": "x with useradd command? The useradd command is one of the most fundamental tools for user management in Linux \u2026 Jan 21, "
-          }
-        ]
-      },
-      {
-        "hash": "8cadcb289ea33428c600245010808b25d9ef1df167e1df317675c8ba7ac89d56",
-        "copies": [
-          {
-            "collection": "devops_policies_v2",
-            "id": "blog_ci-cd-pipeline-for-uptime-kuma-get-real-time-call-alerts-for-server-downtime-open-source-monitoring_chunk_19",
-            "text_preview": " you have: Your AWS account Your website files About 45 \u2026 Aug 21, 2025 \u00b7 13 min read How to Install\u00a0docker-ai\u00a0on Ubuntu "
-          },
-          {
-            "collection": "devops_policies_v2",
-            "id": "blog_how-to-install-jfrog-artifactory-on-ubuntu-22-o4_chunk_6",
-            "text_preview": " you have: Your AWS account Your website files About 45 \u2026 Aug 21, 2025 \u00b7 13 min read How to Install\u00a0docker-ai\u00a0on Ubuntu "
-          }
-        ]
-      },
-      {
-        "hash": "31ce973ba2cd0ccbb8d2b58ab9ebaac9404532a1d17889defc94b936bfa97190",
-        "copies": [
-          {
-            "collection": "devops_policies_v2",
-            "id": "blog_scriptvault-a-wiki-of-installation-scripts_chunk_12",
-            "text_preview": " is one of the most fundamental tools for user management in Linux \u2026 Jan 21, 2026 \u00b7 11 min read How to Deploy website on"
-          },
-          {
-            "collection": "devops_policies_v2",
-            "id": "blog_open-source-project-implementing-devsecops-for-openai-chatbot-ui-deployment-devsecops_chunk_33",
-            "text_preview": "is one of the most fundamental tools for user management in Linux \u2026 Jan 21, 2026 \u00b7 11 min read How to Deploy website on "
-          }
-        ]
-      },
-      {
-        "hash": "d0d0adacaa7f3acd5f766c9ecf594ec53aa8cb361e882cdf3682b1ef95ab28f1",
-        "copies": [
-          {
-            "collection": "devops_policies_v2",
-            "id": "blog_reddit-clone-app-deployment-with-devsecops-ingress_chunk_22",
-            "text_preview": "on AWS Amplify Prerequisites \ud83d\udccbBefore starting, make sure you have: Your AWS account Your website files About 45 \u2026 Aug 21"
-          },
-          {
-            "collection": "devops_policies_v2",
-            "id": "blog_devsecops-ci-cd-pipeline-for-an-uber-clone_chunk_24",
-            "text_preview": "on AWS Amplify Prerequisites \ud83d\udccbBefore starting, make sure you have: Your AWS account Your website files About 45 \u2026 Aug 21"
-          }
-        ]
-      },
-      {
-        "hash": "14deee2cf80ac17c03f5eacc3b549b72f84b07bbba1fdb072b13ac0f3b66c866",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e204cd12969021f7_0006",
-            "text_preview": "Article: Standardizing construct properties with AWS CDK Property Injection  ound: false     // Required by security pol"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e204cd12969021f7_0008",
-            "text_preview": "Article: Standardizing construct properties with AWS CDK Property Injection  ound: false     // Required by security pol"
-          }
-        ]
-      },
-      {
-        "hash": "471951e78252ba9ed4272b7ea807c500c29ebe97a42998dad4ce96d8790c442a",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e204cd12969021f7_0020",
-            "text_preview": "Article: Standardizing construct properties with AWS CDK Property Injection  niqueId = SecurityGroup.PROPERTY_INJECTION_"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e204cd12969021f7_0022",
-            "text_preview": "Article: Standardizing construct properties with AWS CDK Property Injection  niqueId = SecurityGroup.PROPERTY_INJECTION_"
-          }
-        ]
-      },
-      {
-        "hash": "0fb6102a4ef6dc9b6e9507a607764e8e56a45f1841a0ffafa9c324a1e334be7c",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e204cd12969021f7_0030",
-            "text_preview": "Article: Standardizing construct properties with AWS CDK Property Injection  lIpv6Outbound: false,       ...props     })"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e204cd12969021f7_0033",
-            "text_preview": "Article: Standardizing construct properties with AWS CDK Property Injection  lIpv6Outbound: false,       ...props     })"
-          }
-        ]
-      },
-      {
-        "hash": "91d26b82030d790b83139008ed9cbf1a32bfe245a4b5f09968b341ef650b08bd",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_aa7be04a49984641_0020",
-            "text_preview": "Article: Choosing between Amazon ECS Blue/Green Native or AWS CodeDeploy in AWS CDK  ``` const service = new ecs.Fargate"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_aa7be04a49984641_0023",
-            "text_preview": "Article: Choosing between Amazon ECS Blue/Green Native or AWS CodeDeploy in AWS CDK  ``` const service = new ecs.Fargate"
-          }
-        ]
-      },
-      {
-        "hash": "1253f243bd0b0f8d25c0f31db313ff474e20793285543c42e4e3057f881cebb5",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_aa7be04a49984641_0021",
-            "text_preview": "Article: Choosing between Amazon ECS Blue/Green Native or AWS CodeDeploy in AWS CDK  ERVICE,   deploymentAlarms: {     a"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_aa7be04a49984641_0024",
-            "text_preview": "Article: Choosing between Amazon ECS Blue/Green Native or AWS CodeDeploy in AWS CDK  ERVICE,   deploymentAlarms: {     a"
-          }
-        ]
-      },
-      {
-        "hash": "8d0c70ed62ee07db663d26163b7595c85a0207a82183d01992b3c28f383498f0",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e861d964d6fc83af_0032",
-            "text_preview": "Article: Building a scalable code modernization solution with AWS Transform custom  ``` cd .. python3 utilities/invoke-a"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e861d964d6fc83af_0033",
-            "text_preview": "Article: Building a scalable code modernization solution with AWS Transform custom  ``` cd .. python3 utilities/invoke-a"
-          }
-        ]
-      },
-      {
-        "hash": "0c017372334ec0c75dde7767a544a34ba2067331e78211b45ddee30df19b9d9c",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e861d964d6fc83af_0037",
-            "text_preview": "Article: Building a scalable code modernization solution with AWS Transform custom  ``` python3 utilities/invoke-api.py "
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e861d964d6fc83af_0039",
-            "text_preview": "Article: Building a scalable code modernization solution with AWS Transform custom  ``` python3 utilities/invoke-api.py "
-          }
-        ]
-      },
-      {
-        "hash": "054c277161356383603c680c0c8f82c83c866b0a71469a442913b02bf7264852",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e861d964d6fc83af_0038",
-            "text_preview": "Article: Building a scalable code modernization solution with AWS Transform custom  /source/spring-petclinic -x -t\"},   "
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e861d964d6fc83af_0040",
-            "text_preview": "Article: Building a scalable code modernization solution with AWS Transform custom  /source/spring-petclinic -x -t\"},   "
-          }
-        ]
-      },
-      {
-        "hash": "d8baf9b907147405115d49fe6633b220d533eb8a9bf2eb7bb0578f8b659aea1d",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e861d964d6fc83af_0047",
-            "text_preview": "Article: Building a scalable code modernization solution with AWS Transform custom  ``` s3://atx-custom-output-{account-"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e861d964d6fc83af_0049",
-            "text_preview": "Article: Building a scalable code modernization solution with AWS Transform custom  ``` s3://atx-custom-output-{account-"
-          }
-        ]
-      },
-      {
-        "hash": "08e12ad0fa73ce9798a83c408f65400d45c02fd258fc5de9d752100f1c8ed5e5",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e861d964d6fc83af_0053",
-            "text_preview": "Article: Building a scalable code modernization solution with AWS Transform custom  me}/{timestamp}{conversation-id}/ ./"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_e861d964d6fc83af_0055",
-            "text_preview": "Article: Building a scalable code modernization solution with AWS Transform custom  me}/{timestamp}{conversation-id}/ ./"
-          }
-        ]
-      },
-      {
-        "hash": "a49cb3f38616d598f8f9862ea96ec681c3bf4d64625a85044f78483e72a3571d",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_a7658b949d680b90_0020",
-            "text_preview": "Article: AWS Transform custom: AI-driven Java modernization to reduce tech debt  ``` {   \"codeRepositoryPath\": \"/path/to"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_a7658b949d680b90_0022",
-            "text_preview": "Article: AWS Transform custom: AI-driven Java modernization to reduce tech debt  ``` {   \"codeRepositoryPath\": \"/path/to"
-          }
-        ]
-      },
-      {
-        "hash": "59ed54fe5de2fda38a0881ece4f3ab09fac1551548784eae10a7f0918797dff5",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_a7658b949d680b90_0021",
-            "text_preview": "Article: AWS Transform custom: AI-driven Java modernization to reduce tech debt  transformation of a gradle app , also i"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_a7658b949d680b90_0023",
-            "text_preview": "Article: AWS Transform custom: AI-driven Java modernization to reduce tech debt  transformation of a gradle app , also i"
-          }
-        ]
-      },
-      {
-        "hash": "8f397442b626d02af6bda46e1b150bbd1ddcb8716e74a0b6d5f999a6a66641c4",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_90bd2c6c8b8217ca_0045",
-            "text_preview": "Article: Best Practices for Deploying AWS DevOps Agent in Production  ly specifies which resources from that tool to use"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_90bd2c6c8b8217ca_0049",
-            "text_preview": "Article: Best Practices for Deploying AWS DevOps Agent in Production  ly specifies which resources from that tool to use"
-          }
-        ]
-      },
-      {
-        "hash": "bec00e7a3c93f073e593fbb83826ea64ea0c07c551bf6b81e684f5995ecf8700",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_90bd2c6c8b8217ca_0046",
-            "text_preview": "Article: Best Practices for Deploying AWS DevOps Agent in Production  mmerceNonProd\u201d associates development repositories"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_90bd2c6c8b8217ca_0050",
-            "text_preview": "Article: Best Practices for Deploying AWS DevOps Agent in Production  mmerceNonProd\u201d associates development repositories"
-          }
-        ]
-      },
-      {
-        "hash": "2631f2590993100a72adba0e512a749d5635819ed9f649b83a91e709075a978b",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_90bd2c6c8b8217ca_0056",
-            "text_preview": "Article: Best Practices for Deploying AWS DevOps Agent in Production  name: 'Test', role: testRole, stage: 'test' }, ]; "
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_90bd2c6c8b8217ca_0059",
-            "text_preview": "Article: Best Practices for Deploying AWS DevOps Agent in Production  name: 'Test', role: testRole, stage: 'test' }, ]; "
-          }
-        ]
-      },
-      {
-        "hash": "a243a9dd5dafa18202bca45a11a44a20ac76837d3d4b90194a15f8757ef2c121",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c3b6a43e8258f398_0034",
-            "text_preview": "Article: From AI agent prototype to product: Lessons from building AWS DevOps Agent  testingof only the agent surface ar"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c3b6a43e8258f398_0038",
-            "text_preview": "Article: From AI agent prototype to product: Lessons from building AWS DevOps Agent  testingof only the agent surface ar"
-          }
-        ]
-      },
-      {
-        "hash": "0fe52a117741666e6be11653dfcb3497c83f0c42c25ca164c0b5fc6df3d9070f",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_bac6a10dd0d72934_0011",
-            "text_preview": "Article: A one-line Kubernetes fix that saved 600 hours a year  ``` $ kubectl events --for=pod/atlantis-0 LAST SEEN   TY"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_bac6a10dd0d72934_0013",
-            "text_preview": "Article: A one-line Kubernetes fix that saved 600 hours a year  ``` $ kubectl events --for=pod/atlantis-0 LAST SEEN   TY"
-          }
-        ]
-      },
-      {
-        "hash": "6068a598f875b62437c2a05004403aff2bade691049c28f143eebe5a1fa30de3",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_bac6a10dd0d72934_0012",
-            "text_preview": "Article: A one-line Kubernetes fix that saved 600 hours a year  net 22s         Normal    Pulling                  Pod/a"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_bac6a10dd0d72934_0014",
-            "text_preview": "Article: A one-line Kubernetes fix that saved 600 hours a year  net 22s         Normal    Pulling                  Pod/a"
-          }
-        ]
-      },
-      {
-        "hash": "e4c0858aac8ef8b65daaa425c571de61ccf484fb413776d86d1b097f6c557f09",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_bac6a10dd0d72934_0019",
-            "text_preview": "Article: A one-line Kubernetes fix that saved 600 hours a year  ``` [operation_generator.go:664] \"MountVolume.MountDevic"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_bac6a10dd0d72934_0022",
-            "text_preview": "Article: A one-line Kubernetes fix that saved 600 hours a year  ``` [operation_generator.go:664] \"MountVolume.MountDevic"
-          }
-        ]
-      },
-      {
-        "hash": "da8153f387e3d1fb9bb6a6afba27bcd6b876150e4d967e9ecd6c9a7a960bbee8",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_bac6a10dd0d72934_0020",
-            "text_preview": "Article: A one-line Kubernetes fix that saved 600 hours a year  3-2d9b-46ed-a4d3-cba885f9f48a\\\") device mount path \\\"/st"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_bac6a10dd0d72934_0023",
-            "text_preview": "Article: A one-line Kubernetes fix that saved 600 hours a year  3-2d9b-46ed-a4d3-cba885f9f48a\\\") device mount path \\\"/st"
-          }
-        ]
-      },
-      {
-        "hash": "db0ca8ada9f16e7f599e58088e44ebfa69d6f43f6dd0f94a6aa59d65a4bb398c",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_bac6a10dd0d72934_0021",
-            "text_preview": "Article: A one-line Kubernetes fix that saved 600 hours a year  volumes=[], failed to process volumes=[]: context deadli"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_bac6a10dd0d72934_0024",
-            "text_preview": "Article: A one-line Kubernetes fix that saved 600 hours a year  volumes=[], failed to process volumes=[]: context deadli"
-          }
-        ]
-      },
-      {
-        "hash": "c56fb4c414aa2452185710af0eea3adc9303b17f883d5cbeb84a7e62a7ba89c6",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0009",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  rs RPC API you define.) let chatRoomRpcStub = ...;  // Load a worker to run "
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0012",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  rs RPC API you define.) let chatRoomRpcStub = ...;  // Load a worker to run "
-          }
-        ]
-      },
-      {
-        "hash": "1fdb3a830891c2d346bef842eeeca56b958b3fd8cfcc4af91cd49fd0831de474",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0043",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  de to your agent, both for simplicity and security. With HTTP, you are more "
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0045",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  de to your agent, both for simplicity and security. With HTTP, you are more "
-          }
-        ]
-      },
-      {
-        "hash": "54fe2e5e50d4a49a6300d41e0c6b0a43228e3b9ccb8bdc28e1c21efd15c93967",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0059",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  createWorker } from \"@cloudflare/worker-bundler\";  const worker = env.LOADER"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0062",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  createWorker } from \"@cloudflare/worker-bundler\";  const worker = env.LOADER"
-          }
-        ]
-      },
-      {
-        "hash": "fae47df34f22a479b79bd2aa8d7b0b5d09abc68063cf12f0633ed894ec78f3f2",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0060",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  'hono';         import { cors } from 'hono/cors';          const app = new H"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0063",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  'hono';         import { cors } from 'hono/cors';          const app = new H"
-          }
-        ]
-      },
-      {
-        "hash": "831af30e4718a032da044c3f2d9d56cebf1436dfd11129b9651a49ccd0a9362e",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0069",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  or, resolveProvider } from \"@cloudflare/codemode\";  const workspace = new Wo"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0074",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  or, resolveProvider } from \"@cloudflare/codemode\";  const workspace = new Wo"
-          }
-        ]
-      },
-      {
-        "hash": "fc2bef581fd37d62c098b03b55514c9d79279996d1ff59cf3c83aee24ea4ede2",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0070",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  \u00e2\u0080\u0094 resolved when needed, not at construction });  // Code runs in an isolat"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0075",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  \u00e2\u0080\u0094 resolved when needed, not at construction });  // Code runs in an isolat"
-          }
-        ]
-      },
-      {
-        "hash": "cc1bedd500b0a11d769691bc395193c09325d53543803f72fae42b1fe252d8cd",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0071",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  // The LLM writes this code; `state.*` calls dispatch back to the host via R"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0076",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  // The LLM writes this code; `state.*` calls dispatch back to the host via R"
-          }
-        ]
-      },
-      {
-        "hash": "3694bee6bcb763f5d861172a0c6fad2a28a42c8f69f47de25a40ebda8812e4d6",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0072",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  ([       { kind: \"replace\", path: \"/src/app.ts\",         search: \"42\", repla"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_c4803364f87c3d99_0077",
-            "text_preview": "Article: Sandboxing AI agents, 100x faster  ([       { kind: \"replace\", path: \"/src/app.ts\",         search: \"42\", repla"
-          }
-        ]
-      },
-      {
-        "hash": "6c320a7d119455f72c3ee4bd79396929eedee3801430174fe8527ca0b85bc789",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_a3819e47b7d3f95a_0029",
-            "text_preview": "Article: Powering the agents: Workers AI now runs large models, starting with Kimi K2.5  ``` curl -X POST \\ \"https://api"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_a3819e47b7d3f95a_0031",
-            "text_preview": "Article: Powering the agents: Workers AI now runs large models, starting with Kimi K2.5  ``` curl -X POST \\ \"https://api"
-          }
-        ]
-      },
-      {
-        "hash": "bd450f1cc1096a2403d2ec3c82f46341e3dc442a20dd9a89679c800358f0620e",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_a3819e47b7d3f95a_0043",
-            "text_preview": "Article: Powering the agents: Workers AI now runs large models, starting with Kimi K2.5  ``` // (1.) Push a request in q"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_a3819e47b7d3f95a_0046",
-            "text_preview": "Article: Powering the agents: Workers AI now runs large models, starting with Kimi K2.5  ``` // (1.) Push a request in q"
-          }
-        ]
-      },
-      {
-        "hash": "7520975faa8c1a4b462ae6b7ad26e3e23cdb240b877c87e3a542ba0fc6e5ff8a",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_a3819e47b7d3f95a_0044",
-            "text_preview": "Article: Powering the agents: Workers AI now runs large models, starting with Kimi K2.5  more requests in a batch>} ]; }"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_a3819e47b7d3f95a_0047",
-            "text_preview": "Article: Powering the agents: Workers AI now runs large models, starting with Kimi K2.5  more requests in a batch>} ]; }"
-          }
-        ]
-      },
-      {
-        "hash": "656c0890ad38e4d556dab24c3f8d1bd74a5cfb2440303a6e7bad5ef1ca4e150a",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0011",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  ``` apiVersion:networking.k8s.io/v1kind:Ingressmetada"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0013",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  ``` apiVersion:networking.k8s.io/v1kind:Ingressmetada"
-          }
-        ]
-      },
-      {
-        "hash": "73acc0f1f6367b0c2b6df7fbd62b93366f2190eba3e5e036192cf7b4fba7d3f3",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0020",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  ``` apiVersion:gateway.networking.k8s.io/v1kind:Gatew"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0025",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  ``` apiVersion:gateway.networking.k8s.io/v1kind:Gatew"
-          }
-        ]
-      },
-      {
-        "hash": "b06c39225aa5dab6423563759b090c84c06f81bf3d01236dc8386b3829fc0841",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0021",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  TTPStls:certificateRefs:-group:\"\"kind:Secretname:my-s"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0026",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  TTPStls:certificateRefs:-group:\"\"kind:Secretname:my-s"
-          }
-        ]
-      },
-      {
-        "hash": "3f1c06890745e85ca36ac41693011d8a40f25283133ce0f8e5e976f7859a99b0",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0022",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  my-host-example-comnamespace:my-nsspec:hostnames:- my"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0027",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  my-host-example-comnamespace:my-nsspec:hostnames:- my"
-          }
-        ]
-      },
-      {
-        "hash": "72e651061a2c030a159bae5a1bb1065a4e1613305ddc26519e6069a88a145c67",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0023",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  tionallowMethods:- GET- PUT- POST- DELETE- PATCH- OPT"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0028",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  tionallowMethods:- GET- PUT- POST- DELETE- PATCH- OPT"
-          }
-        ]
-      },
-      {
-        "hash": "d3b3b3240904b1de5764f26307d5f4b9d1e70532a487a529a5fb5bc82cbc01a5",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0024",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  le-com-ssl-redirectnamespace:my-nsspec:hostnames:- my"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0029",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  le-com-ssl-redirectnamespace:my-nsspec:hostnames:- my"
-          }
-        ]
-      },
-      {
-        "hash": "f7e0ab699b42924c5e0554a63f1f9b399b822c90edb4399a711626fff221d5d8",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0032",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  ``` \u250c\u2500 WARN  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0037",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  ``` \u250c\u2500 WARN  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
-          }
-        ]
-      },
-      {
-        "hash": "8c40ce73af7e94e028ae1955b6bddf380bee1f4d96edaa75260b2e0b398b2d8c",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0033",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  \u2500\u2500\u2500\u2500\u2500 \u2502  Using case-insensitive regex path matches. Y"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0038",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  \u2500\u2500\u2500\u2500\u2500 \u2502  Using case-insensitive regex path matches. Y"
-          }
-        ]
-      },
-      {
-        "hash": "71914c1277b381edf3e7ec1c543ff8302f05cfdb18843ca33961bebccc77fb87",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0034",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  . See documentation: https://gateway-api.sigs.k8s.io/"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0039",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  . See documentation: https://gateway-api.sigs.k8s.io/"
-          }
-        ]
-      },
-      {
-        "hash": "e5665a838cb74e9fa01b9cf39113ea40cedcc3ec1fe1c4c33d24e6981de8407c",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0035",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  eway API implementations have reasonable body size an"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0040",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  eway API implementations have reasonable body size an"
-          }
-        ]
-      },
-      {
-        "hash": "31a48b1dbabbb193606355c9ea11a476fbea485005c8738b4634b7a3ee75ca34",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0036",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  onfiguring URL normalization (RFC 3986, Section 6). P"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0041",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  onfiguring URL normalization (RFC 3986, Section 6). P"
-          }
-        ]
-      },
-      {
-        "hash": "11a8e3b838a683406e4af17427e98bb170a4f58a51861329701891aa3b99c153",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0050",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  ``` ---apiVersion:gateway.networking.k8s.io/v1kind:Ga"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0053",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  ``` ---apiVersion:gateway.networking.k8s.io/v1kind:Ga"
-          }
-        ]
-      },
-      {
-        "hash": "68d49a624e5da2c82e15481b600ee1e5cdefb4a3c10a4f6e42a81aeb097d6033",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0051",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  eway.networking.k8s.io/v1kind:HTTPRoutemetadata:annot"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0054",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  eway.networking.k8s.io/v1kind:HTTPRoutemetadata:annot"
-          }
-        ]
-      },
-      {
-        "hash": "31a6dfebb5bbed41445a9837b2562a9d7bb8a1c237b3e3b6dd777e470a3326c4",
-        "copies": [
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0052",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  redentials:trueallowHeaders:- DNT...allowMethods:- GE"
-          },
-          {
-            "collection": "devops_blogs_v1",
-            "id": "blog_532837f249e5f1b9_0055",
-            "text_preview": "Article: Announcing Ingress2Gateway 1.0: Your Path to Gateway API  redentials:trueallowHeaders:- DNT...allowMethods:- GE"
-          }
-        ]
-      }
-    ]
+    "groups": 0,
+    "extra_copies": 0,
+    "detail": []
   },
   "collection_health": {
     "devops_policies_v2": {
-      "total_chunks": 3885,
-      "dup_candidates": 4,
+      "total_chunks": 3881,
+      "dup_candidates": 0,
       "low_quality": 38,
       "low_quality_pct": 1.0,
-      "usable_chunks": 3847,
+      "usable_chunks": 3843,
       "usable_pct": 99.0,
-      "avg_length": 1020.0,
+      "avg_length": 1021.0,
       "length_histogram": {
         "0-100": 17,
-        "100-300": 125,
-        "300-800": 260,
+        "100-300": 124,
+        "300-800": 257,
         "800-3000": 3410,
         "3000+": 73
       },
@@ -788,22 +37,22 @@
       "needs_refresh": false
     },
     "devops_blogs_v1": {
-      "total_chunks": 4938,
-      "dup_candidates": 116,
+      "total_chunks": 4822,
+      "dup_candidates": 0,
       "low_quality": 0,
       "low_quality_pct": 0.0,
-      "usable_chunks": 4938,
+      "usable_chunks": 4822,
       "usable_pct": 100.0,
       "avg_length": 409.0,
       "length_histogram": {
         "0-100": 0,
-        "100-300": 638,
-        "300-800": 4193,
+        "100-300": 627,
+        "300-800": 4088,
         "800-3000": 107,
         "3000+": 0
       },
       "flag_counts": {
-        "low_tech_density": 877,
+        "low_tech_density": 860,
         "pure_code": 3
       },
       "embed_pct_good": 100.0,
@@ -7974,14 +7223,6 @@
         "length": 433
       },
       {
-        "id": "blog_c4803364f87c3d99_0012",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 403
-      },
-      {
         "id": "blog_c4803364f87c3d99_0014",
         "score": 90,
         "flags": [
@@ -8135,14 +7376,6 @@
       },
       {
         "id": "blog_c4803364f87c3d99_0069",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 370
-      },
-      {
-        "id": "blog_c4803364f87c3d99_0074",
         "score": 90,
         "flags": [
           "low_tech_density"
@@ -8870,14 +8103,6 @@
         "length": 478
       },
       {
-        "id": "blog_a3819e47b7d3f95a_0031",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 478
-      },
-      {
         "id": "blog_a3819e47b7d3f95a_0037",
         "score": 90,
         "flags": [
@@ -8911,22 +8136,6 @@
       },
       {
         "id": "blog_a3819e47b7d3f95a_0044",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 364
-      },
-      {
-        "id": "blog_a3819e47b7d3f95a_0046",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 477
-      },
-      {
-        "id": "blog_a3819e47b7d3f95a_0047",
         "score": 90,
         "flags": [
           "low_tech_density"
@@ -9342,14 +8551,6 @@
         "length": 449
       },
       {
-        "id": "blog_532837f249e5f1b9_0038",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 449
-      },
-      {
         "id": "blog_532837f249e5f1b9_0045",
         "score": 90,
         "flags": [
@@ -9710,14 +8911,6 @@
         "length": 501
       },
       {
-        "id": "blog_fe0e4dfa6d5a688d_0036",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 471
-      },
-      {
         "id": "blog_fe0e4dfa6d5a688d_0044",
         "score": 90,
         "flags": [
@@ -9838,38 +9031,6 @@
         "length": 485
       },
       {
-        "id": "blog_9f5bcff2dc928ac8_0037",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 470
-      },
-      {
-        "id": "blog_9f5bcff2dc928ac8_0038",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 485
-      },
-      {
-        "id": "blog_9f5bcff2dc928ac8_0039",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 474
-      },
-      {
-        "id": "blog_9f5bcff2dc928ac8_0041",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 485
-      },
-      {
         "id": "blog_9f5bcff2dc928ac8_0046",
         "score": 90,
         "flags": [
@@ -9950,30 +9111,6 @@
         "length": 336
       },
       {
-        "id": "blog_9f5bcff2dc928ac8_0061",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 385
-      },
-      {
-        "id": "blog_9f5bcff2dc928ac8_0062",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 441
-      },
-      {
-        "id": "blog_9f5bcff2dc928ac8_0063",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 348
-      },
-      {
         "id": "blog_9f5bcff2dc928ac8_0065",
         "score": 90,
         "flags": [
@@ -9999,22 +9136,6 @@
       },
       {
         "id": "blog_9f5bcff2dc928ac8_0071",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 449
-      },
-      {
-        "id": "blog_9f5bcff2dc928ac8_0072",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 488
-      },
-      {
-        "id": "blog_9f5bcff2dc928ac8_0074",
         "score": 90,
         "flags": [
           "low_tech_density"
@@ -13342,14 +12463,6 @@
         "length": 312
       },
       {
-        "id": "blog_3525f70b39491bbe_0019",
-        "score": 90,
-        "flags": [
-          "low_tech_density"
-        ],
-        "length": 380
-      },
-      {
         "id": "blog_dc78bf54e5722b04_0000",
         "score": 90,
         "flags": [
@@ -15012,7 +14125,7 @@
     }
   ],
   "recommendations": {
-    "purge_exact_dups": true,
+    "purge_exact_dups": false,
     "refresh_collections": [],
     "scrape_for_gaps": []
   }
