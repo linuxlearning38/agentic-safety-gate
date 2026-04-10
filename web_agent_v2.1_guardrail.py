@@ -374,6 +374,7 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
     try:
         if query_intent is None:
             query_intent = detect_query_intent(query)
+        entities = _extract_query_entities(query)
 
         # ava_self: exact system facts first, then patterns, minimal policy, no blogs
         if query_intent == "ava_self":
@@ -412,6 +413,11 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
             logger.info(f"[ava_self] facts + {len(patterns)} pattern + {len(policies)} policy chunks → {len(assembled)} blocks")
             return [facts_block] + (assembled if assembled else [c.content for c in patterns + policies])
 
+        if query_intent == "architecture":
+            n_policies = max(n_policies, 6)
+            n_blogs = max(n_blogs, 4)
+            min_relevance = max(min_relevance, 0.008)
+
         if query_intent == "definition":
             n_policies = max(n_policies, 6)
             n_blogs = min(n_blogs, 2)
@@ -424,16 +430,37 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
             blog_min_relevance=min_relevance,
             format_for_llm=False
         )
+        if entities:
+            boosted_chunks = []
+            keyword_limit = 6 if query_intent == "architecture" else 4
+            for collection in [
+                getattr(hybrid_retriever, "patterns_collection", None),
+                getattr(hybrid_retriever, "fixes_collection", None),
+                getattr(hybrid_retriever, "policies_collection", None),
+                getattr(hybrid_retriever, "blogs_collection", None),
+            ]:
+                boosted_chunks.extend(hybrid_retriever._keyword_fetch(collection, entities, limit=keyword_limit))
+            if boosted_chunks:
+                seen = {chunk.content for chunk in (raw_chunks or [])}
+                for chunk in boosted_chunks:
+                    if chunk.content not in seen:
+                        raw_chunks.append(chunk)
+                        seen.add(chunk.content)
         if raw_chunks:
             assembled = hybrid_retriever.assemble_context(raw_chunks)
             if assembled:
+                if _needs_strict_grounding(query_intent, query):
+                    assembled = [_build_grounding_block(query, assembled, query_intent)] + assembled
                 logger.info(f"Context assembly: {len(raw_chunks)} chunks -> {len(assembled)} merged blocks")
                 return assembled
-            return [chunk.content for chunk in raw_chunks]
+            raw_docs = [chunk.content for chunk in raw_chunks]
+            if _needs_strict_grounding(query_intent, query):
+                raw_docs = [_build_grounding_block(query, raw_docs, query_intent)] + raw_docs
+            return raw_docs
         embedding = get_embedding(query)
         if not embedding:
             return []
-        results = collection.query(query_embeddings=[embedding], n_results=n_results)
+        results = hybrid_retriever.policies_collection.query(query_embeddings=[embedding], n_results=n_results)
         return results["documents"][0] if results["documents"] else []
     except Exception as e:
         logger.error(f"Query error: {e}")
@@ -456,8 +483,486 @@ def is_weak_response(response_text):
                     "i do not have access"]
     return any(signal in response_text.lower() for signal in weak_signals)
 
+_MEMORY_FACT_KEY = "chat_facts"
+_ENTITY_STOP_WORDS = {
+    "what", "which", "when", "where", "why", "how", "the", "this", "that",
+    "with", "from", "into", "about", "only", "using", "between", "difference",
+    "previous", "asked", "mentioned", "remember", "exactly", "respond", "format",
+    "json", "risk", "level", "rollback", "action", "taken", "command", "confidence",
+    "issue", "type", "your", "ava", "please", "show", "tell", "explain", "describe",
+}
+_INFRA_COMPONENTS = [
+    "aws", "azure", "gcp", "kubernetes", "docker", "linux", "terraform",
+    "eks", "aks", "gke", "ec2", "ecs", "ecr", "lambda", "s3", "rds",
+    "vpc", "iam", "route53", "cloudfront", "alb", "nlb", "virtual network",
+    "subnet", "application gateway", "cosmos db", "service bus", "event hub",
+    "blob storage", "cloud sql", "bigquery", "pubsub", "cloud run",
+    "cloud functions", "gcs", "firestore", "ingress", "service mesh", "istio",
+    "envoy", "helm", "prometheus", "grafana", "argo", "jenkins", "nginx",
+    "redis", "postgres", "mysql", "cassandra", "elasticsearch", "spark",
+    "kafka", "samza", "mantis", "zuul", "resilience4j", "evcache", "netty",
+    "cdn", "open connect",
+]
+_GENERIC_HALLUCINATION_TERMS = {
+    "frontend", "backend", "event sourcing", "microservices architecture",
+}
+
+def _normalize_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
+
+def _chat_payload(response_text="", response_type="knowledge", ok=True, confidence=None,
+                  sources_used=0, time_taken="", **extra):
+    payload = {
+        "ok": ok,
+        "type": response_type,
+        "response": _normalize_text(response_text),
+        "sources_used": sources_used or 0,
+        "time_taken": time_taken or "",
+    }
+    if confidence is not None:
+        payload["confidence"] = confidence
+    payload.update(extra)
+    return payload
+
+def _record_query(query, response, intent, elapsed, sources_used=0, confidence=None):
+    response_text = _normalize_text(response)
+    save_history({
+        'timestamp': datetime.now().isoformat(),
+        'query': query,
+        'type': intent,
+        'sources_used': sources_used,
+        'time_taken': f"{elapsed:.2f}s",
+        'response_preview': response_text[:200] + '...' if len(response_text) > 200 else response_text,
+    })
+    try:
+        clean_response = response_text
+        for prefix in _CONFIDENCE_PREFIXES.values():
+            if clean_response.startswith(prefix):
+                clean_response = clean_response[len(prefix):]
+                break
+        db.save_query(
+            query=query,
+            response=clean_response,
+            confidence=confidence,
+            intent=intent,
+            sources_used=sources_used,
+        )
+    except Exception as _dbe:
+        logger.warning(f"[DB] save_query failed: {_dbe}")
+
+def _normalize_fact_key(label):
+    return re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
+
+def _fact_aliases(label):
+    base = _normalize_fact_key(label)
+    aliases = {base}
+    if not base:
+        return aliases
+    simplified = re.sub(r'_(name|id|value|details?)$', '', base)
+    if simplified:
+        aliases.add(simplified)
+        aliases.add(f"{simplified}_name")
+        aliases.add(f"{simplified}_id")
+    aliases.add(base.replace("_name", ""))
+    aliases.add(base.replace("_id", ""))
+    return {alias.strip("_") for alias in aliases if alias.strip("_")}
+
+def _extract_query_entities(query):
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-:/+.]{2,}", query)
+    entities = []
+    lower_query = query.lower()
+    for component in _INFRA_COMPONENTS:
+        if component in lower_query:
+            entities.append(component)
+    for token in tokens:
+        lower = token.lower()
+        if lower in _ENTITY_STOP_WORDS:
+            continue
+        if any(ch.isupper() for ch in token) or "-" in token or lower in {
+            "kafka", "zuul", "cassandra", "evcache", "nginx", "kubernetes",
+            "docker", "redis", "postgres", "vault", "opa", "oomkilled",
+            "crashloopbackoff", "readiness", "liveness", "probe",
+        }:
+            entities.append(token)
+        elif len(token) >= 5:
+            entities.append(token)
+    deduped = []
+    seen = set()
+    for entity in entities:
+        key = entity.lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(entity)
+    return deduped[:8]
+
+def _diagram_entities_from_text(*texts):
+    combined = "\n".join(_normalize_text(text) for text in texts if text)
+    return _extract_query_entities(combined)
+
+def _hallucination_terms(response_text, entities):
+    text = _normalize_text(response_text).lower()
+    entity_terms = {e.lower() for e in entities}
+    problems = []
+    for term in _GENERIC_HALLUCINATION_TERMS:
+        if term in text and term not in entity_terms:
+            problems.append(term)
+    return problems
+
+def _repair_architecture_answer(response_text, entities):
+    text = _normalize_text(response_text).strip()
+    if not text:
+        return text
+    lines = [line for line in text.splitlines() if line.strip()]
+    if entities:
+        entity_lower = [e.lower() for e in entities]
+        filtered = []
+        for line in lines:
+            lower = line.lower()
+            if any(term in lower for term in _GENERIC_HALLUCINATION_TERMS) and not any(e in lower for e in entity_lower):
+                continue
+            filtered.append(line)
+        lines = filtered or lines
+        if not any(any(e in line.lower() for e in entity_lower) for line in lines):
+            lines.insert(0, "Components: " + ", ".join(entities))
+    return "\n".join(lines)
+
+def _build_diagram_grounding_block(question, context_blocks, extracted_entities):
+    lines = [
+        "Diagram grounding rules:",
+        "- Use only components visible in the diagram analysis or supported by retrieved context.",
+        "- Do not introduce technologies that are not grounded.",
+        "- Explain request flow and data flow only when grounded by the input/context.",
+    ]
+    if extracted_entities:
+        lines.append("Diagram entities detected: " + ", ".join(extracted_entities))
+    if context_blocks:
+        lines.append("Grounded diagram facts:")
+        relevant = _extract_relevant_context_lines(context_blocks, extracted_entities, limit=10)
+        lines.extend(f"- {line}" for line in relevant[:10])
+    return "\n".join(lines)
+
+def _needs_strict_grounding(query_intent, query):
+    if query_intent in {"ava_self", "healing_incident", "follow_up", "memory_recall", "memory_store", "architecture"}:
+        return True
+    q = query.lower()
+    return any(term in q for term in ["diagram", "architecture", "request flow", "data flow", "components"])
+
+def _extract_relevant_context_lines(context_blocks, entities, limit=8):
+    if not context_blocks:
+        return []
+    if not entities:
+        lines = []
+        for block in context_blocks[:3]:
+            for line in block.splitlines():
+                cleaned = line.strip(" -\t")
+                if cleaned:
+                    lines.append(cleaned)
+                if len(lines) >= limit:
+                    return lines
+        return lines
+
+    matches = []
+    for block in context_blocks:
+        for line in block.splitlines():
+            cleaned = line.strip(" -\t")
+            if not cleaned:
+                continue
+            lower = cleaned.lower()
+            if any(entity.lower() in lower for entity in entities):
+                matches.append(cleaned)
+            if len(matches) >= limit:
+                return matches
+    return matches
+
+def _build_grounding_block(query, context_blocks, query_intent):
+    entities = _extract_query_entities(query)
+    matched_lines = _extract_relevant_context_lines(context_blocks, entities)
+    lines = [f"Grounded intent: {query_intent}"]
+    if entities:
+        lines.append("Entities detected: " + ", ".join(entities))
+    if matched_lines:
+        lines.append("Relevant facts from context:")
+        lines.extend(f"- {line}" for line in matched_lines[:8])
+    else:
+        lines.append("Relevant facts from context: none confidently matched.")
+    return "\n".join(lines)
+
+def _grounding_confident_enough(query, context_blocks, confidence):
+    if confidence == "high":
+        return True
+    entities = _extract_query_entities(query)
+    if not entities:
+        return confidence in {"medium", "high"} and bool(context_blocks)
+    matched_lines = _extract_relevant_context_lines(context_blocks, entities)
+    return len(matched_lines) >= 2
+
+def _load_chat_facts():
+    return db.get_memory(_MEMORY_FACT_KEY, {}) or {}
+
+def _save_chat_fact(label, value):
+    facts = _load_chat_facts()
+    label = label.strip().lower()
+    key = _normalize_fact_key(label)
+    facts[key] = {
+        "label": label,
+        "value": value.strip(),
+        "updated_at": datetime.now().isoformat(),
+    }
+    db.save_memory(_MEMORY_FACT_KEY, facts)
+    return facts[key]
+
+def _parse_memory_statement(statement):
+    text = statement.strip().strip(". ")
+    if not text:
+        return None
+    if "=" in text:
+        left, right = text.split("=", 1)
+        label = left.strip().replace("_", " ")
+        value = right.strip().strip(". ")
+        if label and value:
+            return {"label": label, "value": value}
+    m = re.match(r"(?:my\s+)?(.+?)\s+is\s+(.+)", text, re.IGNORECASE)
+    if m:
+        label = m.group(1).strip()
+        value = m.group(2).strip().strip(". ")
+        if label and value:
+            return {"label": label, "value": value}
+    return None
+
+def _extract_memory_request(query):
+    m = re.match(
+        r"\s*remember this(?: exactly)?\s*:\s*(.+?)(?:[.?!]\s*(what.+))?\s*$",
+        query,
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    fact = _parse_memory_statement(m.group(1))
+    if not fact:
+        return None
+    follow_up = (m.group(2) or "").strip()
+    return {"fact": fact, "follow_up": follow_up}
+
+def _extract_recall_label(query):
+    patterns = [
+        r"what is my (.+?)[\?]?$",
+        r"what (.+?) did i just mention[\?]?$",
+        r"what did i just mention about my (.+?)[\?]?$",
+    ]
+    q = query.strip().lower()
+    for pattern in patterns:
+        m = re.match(pattern, q, re.IGNORECASE)
+        if m:
+            label = m.group(1).strip().replace("_", " ")
+            return label
+    return None
+
+def _recall_chat_fact(label):
+    if not label:
+        return None
+    facts = _load_chat_facts()
+    wanted_aliases = _fact_aliases(label)
+    for alias in wanted_aliases:
+        if alias in facts:
+            return facts[alias]
+    for fact in facts.values():
+        stored_label = fact.get("label", "")
+        stored_aliases = _fact_aliases(stored_label)
+        if wanted_aliases & stored_aliases:
+            return fact
+        if label.lower() == stored_label.lower() or label.lower() in stored_label.lower():
+            return fact
+    return None
+
+def _get_recent_prior_messages(n=4):
+    recent = db.get_recent_queries(n=n)
+    prior_messages = []
+    for row in recent:
+        prior_messages.append({"role": "user", "content": _normalize_text(row.get("query"))})
+        prior_messages.append({"role": "assistant", "content": _normalize_text(row.get("response"))})
+    return prior_messages
+
+def _get_recent_distinct_turns(limit=6):
+    rows = db.get_recent_queries(n=limit * 2)
+    useful = []
+    for row in reversed(rows):
+        query = _normalize_text(row.get("query")).strip()
+        if not query:
+            continue
+        intent = _normalize_text(row.get("intent")).strip().lower()
+        if intent == "follow_up":
+            continue
+        useful.append({
+            "query": query,
+            "response": _normalize_text(row.get("response")).strip(),
+            "intent": intent,
+        })
+        if len(useful) >= limit:
+            break
+    return list(reversed(useful))
+
+def _summarize_topic(query):
+    cleaned = _normalize_text(query).strip()
+    if not cleaned:
+        return "an earlier topic"
+    return cleaned[0].lower() + cleaned[1:] if len(cleaned) > 1 else cleaned.lower()
+
+def _build_follow_up_response(query):
+    recent = _get_recent_distinct_turns(limit=4)
+    if not recent:
+        return "I don't have enough recent conversation context to answer that follow-up reliably."
+
+    last_turn = recent[-1]
+    previous_turn = recent[-2] if len(recent) >= 2 else None
+    last_query = _normalize_text(last_turn.get("query"))
+    last_response = _normalize_text(last_turn.get("response"))
+
+    q = query.lower().strip()
+    if "previous thing" in q or "previous question" in q:
+        if previous_turn:
+            previous_query = _normalize_text(previous_turn.get("query"))
+            return (
+                f"Your previous question was about {_summarize_topic(last_query)}.\n\n"
+                f"The question before that was about {_summarize_topic(previous_query)}.\n\n"
+                f"So this one is different because it focuses on {_summarize_topic(last_query)}, whereas the earlier one focused on {_summarize_topic(previous_query)}."
+            )
+        return (
+            f"Your most recent previous question was about {_summarize_topic(last_query)}.\n\n"
+            f"The answer to that was:\n{last_response}"
+        )
+
+    return (
+        f"Your most recent previous question was: {last_query}\n\n"
+        f"The answer to that was:\n{last_response}"
+    )
+
+def _looks_like_invalid_json_wrapper(response_text):
+    text = _normalize_text(response_text).strip()
+    if not text.startswith("{") or '"issue_type"' not in text:
+        return False
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return False
+    return (
+        parsed.get("issue_type") == "definition"
+        and "action_taken" in parsed
+        and "command" in parsed
+    )
+
+def _repair_definition_wrapper(response_text):
+    text = _normalize_text(response_text).strip()
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return text
+    action_taken = _normalize_text(parsed.get("action_taken")).strip()
+    if action_taken:
+        return action_taken
+    return text
+
+def _is_follow_up_query(query):
+    q = query.lower().strip()
+    return any(phrase in q for phrase in [
+        "previous thing", "previous question", "previous thing i asked",
+        "previous thing i said", "what did i just say", "what did i just ask",
+    ])
+
+def _json_only_requested(query):
+    q = query.lower()
+    return "respond only in this json format" in q or "return valid json only" in q or "json only" in q
+
+def _is_healing_query(query):
+    q = query.lower()
+    incident_terms = [
+        "crashloopbackoff", "oomkilled", "oom killed", "disk full", "disk usage",
+        "service is down", "service down", "imagepullbackoff", "image pull error",
+        "node not ready", "cert expiry", "certificate expiry", "95% full",
+    ]
+    action_terms = [
+        "healing action", "what should you do", "what would you do",
+        "classify the issue type", "auto-execute or queue", "dry-run",
+        "dry run", "respond only in this json format",
+    ]
+    state_terms = [" is down", " is 95%", " is in ", " would you take", " rollback", " risk level"]
+    return any(term in q for term in incident_terms) and (
+        any(term in q for term in action_terms) or any(term in q for term in state_terms)
+    )
+
+def _predict_heal_action(confidence, risk_level):
+    if confidence >= 0.85 and risk_level == "LOW":
+        return "auto_execute"
+    if confidence >= 0.6:
+        return "queued_for_approval"
+    return "incident_logged"
+
+def _format_playbook_template(template, entities):
+    if not template:
+        return None
+    try:
+        return template.format(**(entities or {}))
+    except Exception:
+        return template
+
+def _build_healing_response(query):
+    issue = healer.detect_issue(source="chat", message=query)
+    playbook = healer.get_healing_action(issue.get("issue_type", ""))
+    entities = issue.get("entities", {})
+    command = _format_playbook_template(playbook.get("command"), entities) if playbook else None
+    rollback = _format_playbook_template(playbook.get("rollback"), entities) if playbook else None
+    risk_level = playbook.get("risk_level", "UNKNOWN") if playbook else "UNKNOWN"
+    action_taken = _predict_heal_action(float(issue.get("confidence", 0.0)), risk_level)
+
+    body = {
+        "issue_type": issue.get("issue_type", "unknown"),
+        "confidence": round(float(issue.get("confidence", 0.0)), 2),
+        "command": command or "",
+        "risk_level": risk_level,
+        "rollback": rollback or "None",
+        "action_taken": action_taken,
+    }
+
+    if _json_only_requested(query):
+        response_text = json.dumps({
+            "issue_type": body["issue_type"],
+            "command": body["command"],
+            "risk_level": body["risk_level"],
+            "rollback": body["rollback"],
+            "action_taken": body["action_taken"],
+        }, ensure_ascii=False)
+    else:
+        response_text = (
+            f"Issue Type: {body['issue_type']}\n"
+            f"Confidence: {body['confidence']}\n"
+            f"Command: {body['command'] or 'No command available'}\n"
+            f"Risk Level: {body['risk_level']}\n"
+            f"Rollback: {body['rollback']}\n"
+            f"Action Taken: {body['action_taken']}"
+        )
+
+    return response_text, body
+
 def detect_query_intent(query):
     q = query.lower().strip()
+    if q.startswith("remember this"):
+        return "memory_store"
+    if _extract_recall_label(q):
+        return "memory_recall"
+    if _is_follow_up_query(q):
+        return "follow_up"
+    if _is_healing_query(q):
+        return "healing_incident"
+    if any(k in q for k in ["diagram", "architecture", "request flow", "data flow", "component", "sequence flow", "topology"]):
+        return "architecture"
     # AVA self-knowledge guard — before all others
     _ava_patterns = [
         "your architecture", "your files", "your containers", "your models",
@@ -472,8 +977,6 @@ def detect_query_intent(query):
     # other keywords present in the query (e.g. "what is the fix for...")
     if q.startswith("what is") or q.startswith("what are"):
         return "definition"
-    if any(k in q for k in ["diagram", "architecture", "flow", "visualize", "draw", "show me"]):
-        return "diagram"
     if any(k in q for k in ["compare", "difference between", "vs ", "versus"]):
         return "comparison"
     if any(q.startswith(prefix) for prefix in ["define", "explain "]):
@@ -588,6 +1091,37 @@ def score_context_confidence(context, query):
     return 'low'
 
 
+def _apply_confidence_rules(confidence: str, context: list, query: str) -> str:
+    """FIX 2: Rule-based confidence override — more reliable than LLM guess."""
+
+    # Rule 1: No context at all → always low
+    if not context or len(context) == 0:
+        return "low"
+
+    # Rule 2: Very short context (< 2 chunks) → medium max
+    if len(context) < 2:
+        return "medium" if confidence == "high" else confidence
+
+    # Rule 3: Query is vague/short (< 5 words) → medium max
+    if len(query.split()) < 5:
+        return "medium" if confidence == "high" else confidence
+
+    # Rule 4: Memory/follow-up queries with no DB history → medium
+    if any(k in query.lower() for k in ["remember", "what did i", "previous", "last time"]):
+        try:
+            recent = db.get_recent_queries(n=1)
+            if not recent:
+                return "low"
+        except Exception:
+            return "low"
+
+    # Rule 5: Healing queries — confidence from playbook, not LLM
+    if any(k in query.lower() for k in ["crashloop", "oomkilled", "disk full", "service down"]):
+        return confidence  # healer already sets this correctly
+
+    return confidence
+
+
 _CONFIDENCE_PREFIXES = {
     'medium': "Based on related documentation, ",
     'low': "I don't have a strong match for this, but based on general DevOps knowledge: ",
@@ -602,8 +1136,10 @@ def generate_response(query, context, confidence=None, prior_messages=None):
         memory_ctx = build_memory_context(query=query)
         query_intent = detect_query_intent(query)
         use_structured = is_technical_query(query)
+        strict_grounding = _needs_strict_grounding(query_intent, query)
+        extracted_entities = _diagram_entities_from_text(query, "\n".join(context or []))
         wants_diagram = any(k in query.lower() for k in [
-            "diagram", "architecture", "flow", "show me how", "draw", "visualize", "create a diagram"
+            "draw", "visualize", "create a diagram", "show me a diagram", "render diagram", "mermaid"
         ])
 
         system_parts = ["You are AVA, a senior DevOps AI assistant.\n\nRULES:\n1. Always respond in English only\n2. Use the provided context as your primary grounding source\n3. If the context is partial but clearly relevant, give the best direct answer you can and say what is inferred\n4. Do not lead with phrases like 'the context does not directly say' unless the context is genuinely irrelevant\n5. Prefer direct practical answers over meta commentary about the context\n6. Quote specific config values, commands, and fixes directly from context when available\n7. Be specific, practical, and concise"]
@@ -620,16 +1156,27 @@ def generate_response(query, context, confidence=None, prior_messages=None):
         if query_intent == "comparison":
             system_parts.append("\nFor comparison questions: answer with short sections for each option, then end with when to choose each one.")
 
+        if query_intent == "architecture":
+            system_parts.append("\nFor architecture and diagram questions, structure the answer exactly as: Components, Request Flow, Data Flow, Key Technologies, and Why They Are Used. Use only technologies and relationships explicitly present in the context.")
+            if extracted_entities:
+                system_parts.append("\nGrounded entities you must account for: " + ", ".join(extracted_entities))
+
         if use_structured:
             system_parts.append("\nFor technical problems, always structure your answer as:\n\n**Root Cause:** [1-2 sentences]\n**Fix:** [exact commands or config]\n**Why this works:** [1-2 sentences]\n**Watch out for:** [edge cases or caveats]")
 
         if wants_diagram:
             system_parts.append("\nIMPORTANT: When asked for any diagram, architecture, or flow - ALWAYS output ONLY a mermaid diagram. Start with ```mermaid on its own line. Use graph LR for horizontal layouts, graph TD for vertical. Make nodes descriptive. After the diagram add a brief explanation.")
 
+        if strict_grounding:
+            system_parts.append("\nSTRICT GROUNDING MODE: ONLY use the provided context. Do not use general knowledge or fill gaps from model memory. If the grounded context is insufficient, say exactly: 'I don't have enough grounded context to answer that reliably.'")
+
         system_prompt = "\n".join(system_parts)
 
+        if strict_grounding and not _grounding_confident_enough(query, context or [], confidence):
+            return "I don't have enough grounded context to answer that reliably."
+
         if context:
-            trimmed_context = [block[:800] for block in context[:5]]
+            trimmed_context = [block[:900] for block in context[:6]]
             context_str = "\n\n---\n\n".join(trimmed_context)
             user_msg = (
                 f"<context>\n{context_str}\n</context>\n\n"
@@ -648,9 +1195,12 @@ def generate_response(query, context, confidence=None, prior_messages=None):
         response = ollama.chat(
             model=LLM_MODEL,
             messages=messages,
-            options={"num_ctx": 8192, "temperature": 0.2}
+            options={"num_ctx": 8192, "temperature": 0.0 if strict_grounding else 0.2}
         )
         answer = response["message"]["content"]
+        if query_intent == "architecture":
+            if _hallucination_terms(answer, extracted_entities):
+                answer = _repair_architecture_answer(answer, extracted_entities)
         prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
         return prefix + answer if prefix else answer
 
@@ -676,7 +1226,7 @@ def _get_about_data() -> dict:
 
     return {
         "version": "2.1.2",
-        "phase": "Phase 5B Complete",
+        "phase": "Phase 5C Complete",
         "built_by": "Manoj, Delhi",
         "github": "linuxlearning38/agentic-safety-gate",
         "runtime": "WSL2 Ubuntu, RTX 5060 Ti 16GB, Ryzen 1600, 32GB RAM",
@@ -703,9 +1253,43 @@ def about():
     return jsonify(_get_about_data())
 
 
+def _check_dependencies() -> dict:
+    """Check if critical dependencies are alive."""
+    status = {"redis": False, "opa": False, "ollama": False}
+
+    # Redis check — use raw socket (redis package may not be installed)
+    try:
+        import socket as _socket
+        s = _socket.create_connection(("agent_redis", 6379), timeout=1)
+        s.sendall(b"PING\r\n")
+        reply = s.recv(16)
+        s.close()
+        status["redis"] = reply.startswith(b"+PONG")
+    except Exception:
+        pass
+
+    # OPA check
+    try:
+        import requests as _requests
+        resp = _requests.get("http://agent_opa:8181/health", timeout=1)
+        status["opa"] = resp.status_code == 200
+    except Exception:
+        pass
+
+    # Ollama check
+    try:
+        import requests as _requests
+        resp = _requests.get("http://host.docker.internal:11434/api/tags", timeout=2)
+        status["ollama"] = resp.status_code == 200
+    except Exception:
+        pass
+
+    return status
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({'status': 'ok'}), 200
+    return jsonify({'status': 'ok', 'dependencies': _check_dependencies()}), 200
 
 @app.route('/auth/login', methods=['POST'])
 @limiter.limit("10 per minute", key_func=get_remote_address)
@@ -1009,11 +1593,83 @@ def ask():
     try:
         data = request.json
         query = data.get('query', '').strip()
-        
+
         if not query:
             return jsonify({'error': 'No query provided'}), 400
-        
+
+        # FIX 1: Dependency health gate — abort early if LLM is down
+        deps = _check_dependencies()
+        if not deps["ollama"]:
+            logger.warning("[/ask] Ollama unavailable — returning 503")
+            return jsonify({
+                "error":        "ollama_unavailable",
+                "confidence":   "low",
+                "response":     "LLM service is unavailable. Cannot process query.",
+                "dependencies": deps,
+            }), 503
+
         logger.info(f"Query: {query}")
+
+        memory_request = _extract_memory_request(query)
+        if memory_request:
+            fact = memory_request["fact"]
+            saved = _save_chat_fact(fact["label"], fact["value"])
+            follow_up = memory_request["follow_up"]
+            if follow_up:
+                response = f"Your {saved['label']} is {saved['value']}."
+            else:
+                response = f"Okay — I'll remember that your {saved['label']} is {saved['value']}."
+            elapsed = time.time() - start_time
+            _record_query(query, response, "memory", elapsed, confidence="high")
+            return jsonify(_chat_payload(
+                response,
+                response_type="memory",
+                confidence="high",
+                time_taken=f"{elapsed:.2f}s",
+            ))
+
+        recall_label = _extract_recall_label(query)
+        if recall_label:
+            fact = _recall_chat_fact(recall_label)
+            response = (
+                f"Your {fact['label']} is {fact['value']}."
+                if fact else
+                f"I don't have a stored value for your {recall_label} yet."
+            )
+            confidence = "high" if fact else "low"
+            elapsed = time.time() - start_time
+            _record_query(query, response, "memory", elapsed, confidence=confidence)
+            return jsonify(_chat_payload(
+                response,
+                response_type="memory",
+                confidence=confidence,
+                time_taken=f"{elapsed:.2f}s",
+            ))
+
+        if _is_follow_up_query(query):
+            response = _build_follow_up_response(query)
+            elapsed = time.time() - start_time
+            _record_query(query, response, "follow_up", elapsed, sources_used=1, confidence="high")
+            return jsonify(_chat_payload(
+                response,
+                response_type="knowledge",
+                confidence="high",
+                sources_used=1,
+                time_taken=f"{elapsed:.2f}s",
+            ))
+
+        if _is_healing_query(query):
+            response, healing_meta = _build_healing_response(query)
+            elapsed = time.time() - start_time
+            _record_query(query, response, "healing_incident", elapsed, confidence="high")
+            return jsonify(_chat_payload(
+                response,
+                response_type="healing",
+                confidence="high",
+                time_taken=f"{elapsed:.2f}s",
+                healing=healing_meta,
+                action_taken=healing_meta.get("action_taken"),
+            ))
         
         # Handle greetings
         if is_greeting(query):
@@ -1027,12 +1683,11 @@ def ask():
                 'time_taken': f"{elapsed:.2f}s"
             })
             
-            return jsonify({
-                'type': 'knowledge',
-                'response': response,
-                'sources_used': 0,
-                'time_taken': f"{elapsed:.2f}s"
-            })
+            return jsonify(_chat_payload(
+                response,
+                response_type='knowledge',
+                time_taken=f"{elapsed:.2f}s"
+            ))
         
         # Multi-question detection — split and answer each separately
         questions = detect_multiple_questions(query)
@@ -1062,12 +1717,12 @@ def ask():
                 'time_taken': f"{elapsed:.2f}s"
             })
 
-            return jsonify({
-                'type': 'knowledge',
-                'response': combined_response,
-                'sources_used': total_sources,
-                'time_taken': f"{elapsed:.2f}s"
-            })
+            return jsonify(_chat_payload(
+                combined_response,
+                response_type='knowledge',
+                sources_used=total_sources,
+                time_taken=f"{elapsed:.2f}s"
+            ))
         
         # ── Phase 4: Command Graph — deterministic diagnostics ──────────────
         # Skip command graph for knowledge/troubleshooting questions that don't
@@ -1099,9 +1754,8 @@ def ask():
             # If a medium-risk step needs approval, pause and tell the user
             if graph_result.paused_at:
                 elapsed = time.time() - start_time
-                return jsonify({
-                    'type':        'knowledge',
-                    'response':    (
+                return jsonify(_chat_payload(
+                    (
                         f"⚠️ **Approval Required**\n\n"
                         f"I ran the `{graph_name}` diagnostic and reached a step that "
                         f"needs your approval before continuing:\n\n"
@@ -1111,10 +1765,11 @@ def ask():
                         f"```bash\npython3 -m control.security_review\n```\n\n"
                         f"Steps completed so far:\n{graph_result.summary_for_ui()}"
                     ),
-                    'sources_used': 0,
-                    'time_taken':  f"{elapsed:.2f}s",
-                    'graph_used':  graph_name,
-                })
+                    response_type='knowledge',
+                    sources_used=0,
+                    time_taken=f"{elapsed:.2f}s",
+                    graph_used=graph_name,
+                ))
 
             # Build context from live tool outputs → send to LLM for analysis
             context_blocks = graph_result.to_context_blocks()
@@ -1137,17 +1792,17 @@ def ask():
                 'time_taken': f"{elapsed:.2f}s",
             })
 
-            return jsonify({
-                'type':        'knowledge',
-                'response':    response,
-                'sources_used': len(context_blocks),
-                'time_taken':  f"{elapsed:.2f}s",
-                'graph_used':  graph_name,
-                'steps_run':   [
+            return jsonify(_chat_payload(
+                response,
+                response_type='knowledge',
+                sources_used=len(context_blocks),
+                time_taken=f"{elapsed:.2f}s",
+                graph_used=graph_name,
+                steps_run=[
                     {'tool': s['tool'], 'status': s['status']}
                     for s in graph_result.steps_run
                 ],
-            })
+            ))
         # ── End Command Graph ───────────────────────────────────────────────
 
         # ── Phase 4: ReAct Loop — for complex/unknown problems ─────────────
@@ -1194,12 +1849,12 @@ def ask():
                 'time_taken':  f"{elapsed:.2f}s",
             })
 
-            return jsonify({
-                'type':       'knowledge',
-                'response':   react_result.final_answer or "I was unable to complete the diagnostic. Please check kubectl is available in this environment.",
-                'sources_used': react_result.iterations,
-                'time_taken': f"{elapsed:.2f}s",
-                'react_trace': [
+            return jsonify(_chat_payload(
+                react_result.final_answer or "I was unable to complete the diagnostic. Please check kubectl is available in this environment.",
+                response_type='knowledge',
+                sources_used=react_result.iterations,
+                time_taken=f"{elapsed:.2f}s",
+                react_trace=[
                     {
                         'iteration':    s.iteration,
                         'thought':      s.thought[:200],
@@ -1209,7 +1864,7 @@ def ask():
                     }
                     for s in react_result.steps
                 ],
-            })
+            ))
         # ── End ReAct Loop ──────────────────────────────────────────────────
 
         # Phase 3: Force KNOWLEDGE routing for how/why/fix queries
@@ -1247,20 +1902,21 @@ def ask():
                     'time_taken': f"{elapsed:.2f}s"
                 })
                 
-                return jsonify({
-                    'type': 'command',
-                    'result': result,
-                    'time_taken': f"{elapsed:.2f}s"
-                })
+                return jsonify(_chat_payload(
+                    result.get('output') or result.get('error') or result.get('reason') or "",
+                    response_type='command',
+                    time_taken=f"{elapsed:.2f}s",
+                    result=result,
+                ))
             else:
                 # Command blocked by security
                 elapsed = time.time() - start_time
-                return jsonify({
-                    'type': 'knowledge',
-                    'response': "This command was blocked by security restrictions.",
-                    'sources_used': 0,
-                    'time_taken': f"{elapsed:.2f}s"
-                })
+                return jsonify(_chat_payload(
+                    "This command was blocked by security restrictions.",
+                    response_type='knowledge',
+                    sources_used=0,
+                    time_taken=f"{elapsed:.2f}s"
+                ))
                 
         elif action_type == 'DIRECT_ANSWER':
             # Use LLM's direct answer
@@ -1275,12 +1931,12 @@ def ask():
                 'time_taken': f"{elapsed:.2f}s"
             })
             
-            return jsonify({
-                'type': 'knowledge',
-                'response': answer,
-                'sources_used': 0,
-                'time_taken': f"{elapsed:.2f}s"
-            })
+            return jsonify(_chat_payload(
+                answer,
+                response_type='knowledge',
+                sources_used=0,
+                time_taken=f"{elapsed:.2f}s"
+            ))
         
         else:  # KNOWLEDGE or fallback
             # Handle regular DevOps questions with RAG
@@ -1291,22 +1947,18 @@ def ask():
 
             # Phase 4.5: Score context confidence before generating
             confidence = score_context_confidence(context, query)
+            confidence = _apply_confidence_rules(confidence, context, query)
             logger.info(f"[*] Context confidence: {confidence}")
             logger.info(f"[*] Thinking with {LLM_MODEL}...")
 
             # Phase 5B: load recent conversation history for multi-turn context
-            prior_messages = None
-            conf_score = {"high": 1.0, "medium": 0.6, "low": 0.3}.get(confidence, 0.0)
-            if conf_score > 0.5:
-                recent = db.get_recent_queries(n=3)
-                if recent:
-                    prior_messages = []
-                    for row in recent:
-                        prior_messages.append({"role": "user", "content": row["query"]})
-                        prior_messages.append({"role": "assistant", "content": row["response"]})
-                    logger.info(f"[MultiTurn] Injecting {len(recent)} prior turns")
+            prior_messages = _get_recent_prior_messages(n=3)
+            if prior_messages:
+                logger.info(f"[MultiTurn] Injecting {len(prior_messages) // 2} prior turns")
 
             response = generate_response(query, context, confidence=confidence, prior_messages=prior_messages)
+            if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
+                response = _repair_definition_wrapper(response)
 
             # Phase 3: Fail-safe retry
             if context and len(context) < 2 and is_weak_response(response):
@@ -1323,7 +1975,10 @@ def ask():
                         retry_chunks, max_articles=5, max_chunks_per_article=4
                     )
                     retry_confidence = score_context_confidence(retry_context, query)
+                    retry_confidence = _apply_confidence_rules(retry_confidence, retry_context, query)
                     response = generate_response(query, retry_context, confidence=retry_confidence, prior_messages=prior_messages)
+                    if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
+                        response = _repair_definition_wrapper(response)
                     confidence = retry_confidence
                     logger.info("[FAILSAFE] Retry complete")
 
@@ -1368,17 +2023,21 @@ def ask():
             except Exception as _dbe:
                 logger.warning(f"[DB] save_query failed: {_dbe}")
 
-            return jsonify({
-                'type': 'knowledge',
-                'response': response,
-                'sources_used': len(context),
-                'confidence': confidence,
-                'time_taken': f"{elapsed:.2f}s"
-            })
+            return jsonify(_chat_payload(
+                response,
+                response_type='knowledge',
+                sources_used=len(context),
+                confidence=confidence,
+                time_taken=f"{elapsed:.2f}s"
+            ))
         
     except Exception as e:
         logger.error(f"Error in ask endpoint: {e}")
-        return jsonify({'error': 'Failed to process query', 'details': str(e)}), 500
+        return jsonify(_chat_payload(
+            f"Failed to process query: {e}",
+            response_type='error',
+            ok=False
+        )), 500
 
 def _extract_webhook_message(payload: dict) -> str:
     """Normalise webhook payloads from Alertmanager, Datadog, PagerDuty, or generic."""
@@ -1557,11 +2216,32 @@ def upload_file():
                 model="llava:13b",
                 messages=[{
                     "role": "user",
-                    "content": "Analyze this diagram in detail. Identify all components, their relationships, data flows, and architecture patterns. Provide specific technical insights.",
+                    "content": (
+                        "Analyze this infrastructure or system diagram. "
+                        "List only the technologies, services, components, arrows, layers, and labels that are actually visible. "
+                        "Do not invent missing technologies. "
+                        "If unsure, say what is unclear."
+                    ),
                     "images": [image_data]
                 }]
             )
-            analysis = vision_response['message']['content']
+            vision_analysis = vision_response['message']['content']
+            diagram_entities = _diagram_entities_from_text(filename, vision_analysis)
+            diagram_query = (
+                f"Analyze this infrastructure diagram for {filename}. "
+                f"Focus on these detected components: {', '.join(diagram_entities) if diagram_entities else 'unknown components'}."
+            )
+            diagram_context = [
+                _build_diagram_grounding_block(diagram_query, [vision_analysis], diagram_entities)
+            ]
+            kb_context = query_knowledge_base(diagram_query, query_intent="architecture")
+            if kb_context:
+                diagram_context.extend(kb_context[:5])
+            analysis = generate_response(
+                diagram_query,
+                diagram_context,
+                confidence="high" if diagram_entities else "medium",
+            )
             elapsed = time.time() - start_time
             save_history({
                 'timestamp': datetime.now().isoformat(),
@@ -3280,11 +3960,12 @@ HTML_TEMPLATE = r'''
             const chatArea = document.getElementById('chatArea');
             const messageDiv = document.createElement('div');
             messageDiv.className = 'message';
+            data = normalizeChatData(data);
             
             let content = '';
             
             // Handle multi-part responses
-            if (data.type === 'multi') {
+            if (data.type === 'multi' && Array.isArray(data.results)) {
                 content = '<div style="margin: 8px 0;">';
                 content += `<div style="font-size: 13px; color: #667eea; margin-bottom: 12px; font-weight: 600;">📋 Processing ${data.results.length} questions...</div>`;
                 
@@ -3323,7 +4004,7 @@ HTML_TEMPLATE = r'''
                 content += '</div>';
             }
             // Handle single command response
-            else if (data.type === 'command') {
+            else if (data.type === 'command' && data.result) {
                 if (data.result.blocked) {
                     content = `<div style="color: #ff6b6b; padding: 12px; background: #2a1a1a; border-left: 3px solid #ff6b6b; border-radius: 6px;">
                         <strong>🛡️ Command Blocked</strong><br>
@@ -3357,7 +4038,7 @@ HTML_TEMPLATE = r'''
                 }
             } else {
                 // Handle single knowledge response
-                content = formatResponse(data.response || data.analysis);
+                content = formatResponse(data.response);
             }
             
             messageDiv.innerHTML = `
@@ -3365,7 +4046,7 @@ HTML_TEMPLATE = r'''
                 <div class="message-content">
                     <div class="message-header">
                         <span class="message-author">AVA</span>
-                        <span class="message-meta">${data.sources_used ? data.sources_used + ' sources • ' : ''}${data.time_taken}</span>
+                        <span class="message-meta">${data.sources_used ? data.sources_used + ' sources • ' : ''}${data.time_taken || ''}</span>
                     </div>
                     <div class="message-text">${content}</div>
                     <div class="message-actions">
@@ -3415,7 +4096,7 @@ HTML_TEMPLATE = r'''
             })
             .catch(err => {
                 removeLoadingMessage();
-                alert('Error: ' + err.message);
+                addAVAMessage({ type: 'error', response: 'Error: ' + (err && err.message ? err.message : 'Unknown error') });
             })
             .finally(() => {
                 // Re-enable input and button
@@ -3466,6 +4147,7 @@ HTML_TEMPLATE = r'''
         }
         
         function formatResponse(text) {
+            text = safeString(text);
             // Handle mermaid code blocks FIRST
             text = text.replace(/```mermaid\n([\s\S]*?)```/g, function(match, diagram) {
                 return '<div class="mermaid-placeholder" data-diagram="' + encodeURIComponent(diagram.trim()) + '" style="background:#1a1a2e;padding:16px;border-radius:8px;margin:8px 0;text-align:center;color:#888;">Loading diagram...</div>';
@@ -3552,8 +4234,35 @@ HTML_TEMPLATE = r'''
         
         function escapeHtml(text) {
             const div = document.createElement('div');
-            div.textContent = text;
+            div.textContent = safeString(text);
             return div.innerHTML;
+        }
+
+        function safeString(value) {
+            if (value === null || value === undefined) return '';
+            if (typeof value === 'string') return value;
+            if (typeof value === 'object') {
+                try { return JSON.stringify(value, null, 2); }
+                catch (e) { return String(value); }
+            }
+            return String(value);
+        }
+
+        function normalizeChatData(data) {
+            const normalized = data && typeof data === 'object' ? Object.assign({}, data) : {};
+            normalized.type = safeString(normalized.type || 'knowledge');
+            normalized.response = safeString(
+                normalized.response ?? normalized.message ?? normalized.analysis ?? normalized.error ?? ''
+            );
+            normalized.time_taken = safeString(normalized.time_taken || '');
+            normalized.sources_used = Number(normalized.sources_used || 0);
+            if (!normalized.result || typeof normalized.result !== 'object') {
+                normalized.result = null;
+            }
+            if (!Array.isArray(normalized.results)) {
+                normalized.results = [];
+            }
+            return normalized;
         }
         
         function copyMessage(button) {
