@@ -13,6 +13,7 @@ every command before it runs.
 
 import logging
 import re
+import subprocess
 from datetime import datetime, timezone
 
 from control import database as db
@@ -197,13 +198,19 @@ _CLASSIFIERS: list[tuple[list[str], str, str]] = [
 
 # ─── Entity extraction helpers ────────────────────────────────────────────────
 
+_ENTITY_SKIP = {
+    "the", "a", "an", "my", "our", "this", "that", "pod", "deployment",
+    "in", "is", "are", "was", "were", "at", "on", "of", "to", "for",
+    "not", "has", "have", "its", "it", "be", "been",
+}
+
 def _extract_entities(message: str) -> dict:
-    """Best-effort extraction of pod/deployment/node names from alert text."""
-    m = message.lower()
+    """Extract pod, deployment, namespace, node, service names from alert message."""
     entities: dict[str, str] = {
         "name":         "unknown",
-        "namespace":    "default",
         "pod_name":     "unknown",
+        "deployment":   "unknown",
+        "namespace":    "default",
         "node_name":    "unknown",
         "service_name": "unknown",
         "new_limit":    "512Mi",
@@ -212,37 +219,63 @@ def _extract_entities(message: str) -> dict:
         "old_replicas": "1",
     }
 
-    # Pod / deployment name — grab token that looks like a k8s resource
-    pod_match = re.search(
-        r"\b([\w][\w\-]{2,}(?:-[\w]+)+)\b",  # hyphenated k8s names
-        message
-    )
-    if pod_match:
-        raw = pod_match.group(1)
-        entities["pod_name"] = raw
-        # Strip trailing random pod suffix (last 2 hyphen-segments if long hash)
-        parts = raw.split("-")
-        if len(parts) > 2 and len(parts[-1]) >= 5:
-            entities["name"] = "-".join(parts[:-2]) or raw
-        elif len(parts) > 1 and len(parts[-1]) >= 5:
-            entities["name"] = "-".join(parts[:-1]) or raw
-        else:
-            entities["name"] = raw
+    # Pod / deployment name — ordered from most to least specific
+    pod_patterns = [
+        r'pod[s]?\s+([a-zA-Z0-9][-a-zA-Z0-9]*)',
+        r'([a-zA-Z0-9][-a-zA-Z0-9]*)\s+pod',
+        r'deployment[/\s]+([a-zA-Z0-9][-a-zA-Z0-9]*)',
+        r'([a-zA-Z0-9][-a-zA-Z0-9]*)-deployment',
+        r'([a-zA-Z0-9][-a-zA-Z0-9]*)\s+is\s+in',
+        r'([a-zA-Z0-9][-a-zA-Z0-9]*)\s+container',
+        # fallback: any hyphenated k8s-style name
+        r'\b([\w][\w\-]{2,}(?:-[\w]+)+)\b',
+    ]
+    for pattern in pod_patterns:
+        match = re.search(pattern, message, re.IGNORECASE)
+        if match:
+            name = match.group(1).lower()
+            if name not in _ENTITY_SKIP:
+                entities["pod_name"]     = name
+                entities["deployment"]   = name
+                entities["name"]         = name   # playbook templates use {name}
+                entities["service_name"] = name
+                break
 
     # Namespace
-    ns_match = re.search(r"\bnamespace[=: ]+(\S+)", m)
-    if ns_match:
-        entities["namespace"] = ns_match.group(1).strip("\"',")
+    ns_patterns = [
+        r'namespace[s]?\s+([a-zA-Z0-9][-a-zA-Z0-9]*)',
+        r'namespace[=:]\s*([a-zA-Z0-9][-a-zA-Z0-9]*)',
+        r'in\s+(production|staging|default|kube-system|monitoring)\b',
+    ]
+    for pat in ns_patterns:
+        ns_match = re.search(pat, message, re.IGNORECASE)
+        if ns_match:
+            entities["namespace"] = ns_match.group(1).lower()
+            break
+    if "kube-system" in message.lower():
+        entities["namespace"] = "kube-system"
 
     # Node name
-    node_match = re.search(r"\bnode[=: ]+(\S+)", m)
+    node_match = re.search(r'node[s]?\s+([a-zA-Z0-9][-a-zA-Z0-9]*)', message, re.IGNORECASE)
+    if not node_match:
+        node_match = re.search(r'\bnode[=:]\s*(\S+)', message, re.IGNORECASE)
     if node_match:
-        entities["node_name"] = node_match.group(1).strip("\"',")
+        entities["node_name"] = node_match.group(1).lower().strip("\"',")
 
-    # Service name
-    svc_match = re.search(r"\bservice[=: ]+(\S+)", m)
+    # Service name (explicit override)
+    svc_match = re.search(r'service[s]?\s+([a-zA-Z0-9][-a-zA-Z0-9]*)', message, re.IGNORECASE)
+    if not svc_match:
+        svc_match = re.search(r'\bservice[=:]\s*(\S+)', message, re.IGNORECASE)
     if svc_match:
-        entities["service_name"] = svc_match.group(1).strip("\"',")
+        entities["service_name"] = svc_match.group(1).lower().strip("\"',")
+
+    # Memory hints  (e.g. "512Mi", "2GB")
+    mem_match = re.search(r'(\d+)\s*(Mi|Gi|MB|GB)', message, re.IGNORECASE)
+    if mem_match:
+        val  = int(mem_match.group(1))
+        unit = mem_match.group(2).replace("MB", "Mi").replace("GB", "Gi")
+        entities["old_limit"] = f"{val}{unit}"
+        entities["new_limit"] = f"{val * 2}{unit}"
 
     return entities
 
@@ -283,6 +316,7 @@ class SelfHealer:
             "suggested_action": playbook_entry.get("description", "No action defined"),
             "confidence":       round(confidence, 3),
             "source":           source,
+            "message":          message,
             "entities":         entities,
         }
         logger.info(
@@ -323,12 +357,15 @@ class SelfHealer:
 
         risk_level = playbook["risk_level"]
 
-        # Build command — fill template variables from entities
-        try:
-            cmd = playbook["command"].format(**entities)
-        except KeyError as exc:
-            cmd = playbook["command"]   # leave unfilled placeholder if entity missing
-            logger.warning(f"[SelfHealer] Template key missing: {exc} — using raw command")
+        # Build command — fill template variables from entities via string replace
+        # (avoids KeyError when entity keys don't exactly match template placeholders)
+        cmd      = playbook["command"]
+        rollback = playbook.get("rollback") or ""
+        for key, val in entities.items():
+            placeholder = "{" + key + "}"
+            cmd      = cmd.replace(placeholder, val)
+            if rollback:
+                rollback = rollback.replace(placeholder, val)
 
         # ── Decision ladder ──────────────────────────────────────────────────
         if confidence >= 0.85 and risk_level == "LOW":
@@ -363,6 +400,14 @@ class SelfHealer:
         except Exception as _e:
             logger.warning(f"[SelfHealer] audit write failed: {_e}")
 
+        # Verify healing only when a command actually ran
+        if action_taken == "auto_executed":
+            verification = self.verify_healing(
+                issue_type, entities, wait_seconds=5
+            )
+        else:
+            verification = {"resolved": None, "status": "not_executed", "details": ""}
+
         diag = DIAGNOSTIC_PLAYBOOK.get(issue_type, {})
         out = {
             "action_taken":        action_taken,
@@ -372,6 +417,7 @@ class SelfHealer:
             "possible_causes":     diag.get("possible_causes", []),
             "diagnostic_commands": diag.get("diagnostic_commands", []),
             "needs_more_info":     diag.get("needs_more_info", False),
+            "verification":        verification,
             "timestamp":           ts,
         }
         logger.info(f"[SelfHealer] heal: {action_taken} | cmd={cmd[:80]}")
@@ -396,6 +442,68 @@ class SelfHealer:
         except Exception as e:
             logger.error(f"[SelfHealer] history query failed: {e}")
             return []
+
+    # ── 5. verify ─────────────────────────────────────────────────────────────
+
+    def verify_healing(self, issue_type: str, entities: dict, wait_seconds: int = 10) -> dict:
+        """
+        After executing a fix, wait and verify if issue is resolved.
+        Returns: {resolved: bool|None, status: str, details: str}
+        """
+        import time
+        time.sleep(wait_seconds)
+
+        result: dict = {"resolved": False, "status": "unknown", "details": ""}
+
+        try:
+            if issue_type == "pod_crash":
+                cmd = [
+                    "kubectl", "get", "deployment",
+                    entities.get("deployment", "unknown"),
+                    "-n", entities.get("namespace", "default"),
+                    "-o", "jsonpath={.status.readyReplicas}",
+                ]
+                out = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=10, shell=False
+                )
+                if out.returncode == 0 and out.stdout.strip().isdigit():
+                    ready = int(out.stdout.strip())
+                    result["resolved"] = ready > 0
+                    result["status"]   = "healthy" if ready > 0 else "still_failing"
+                    result["details"]  = f"Ready replicas: {ready}"
+                else:
+                    result["status"]   = "kubectl_unavailable"
+                    result["details"]  = "Cannot verify — kubectl not in container"
+                    result["resolved"] = None
+
+            elif issue_type == "disk_full":
+                out = subprocess.run(
+                    ["df", "-h", "/var/log"],
+                    capture_output=True, text=True, timeout=5, shell=False,
+                )
+                result["resolved"] = out.returncode == 0
+                result["status"]   = "cleaned" if out.returncode == 0 else "failed"
+                result["details"]  = out.stdout[:200] if out.stdout else ""
+
+            elif issue_type == "service_down":
+                out = subprocess.run(
+                    ["systemctl", "is-active", entities.get("service_name", "unknown")],
+                    capture_output=True, text=True, timeout=5, shell=False,
+                )
+                result["resolved"] = "active" in out.stdout
+                result["status"]   = out.stdout.strip()
+
+            else:
+                result["status"]   = "no_verifier"
+                result["details"]  = f"No verifier for {issue_type} yet"
+                result["resolved"] = None
+
+        except Exception as e:
+            result["status"]   = "verify_error"
+            result["details"]  = str(e)
+            result["resolved"] = None
+
+        return result
 
     # ── internal ──────────────────────────────────────────────────────────────
 
