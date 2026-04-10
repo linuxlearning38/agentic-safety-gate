@@ -980,6 +980,17 @@ def detect_query_intent(query):
         return "follow_up"
     if _is_healing_query(q):
         return "healing_incident"
+    # Metric-alert patterns not caught by _is_healing_query compound check
+    _alert_terms = [
+        "disk usage", "disk is", "disk at",
+        "cpu usage", "cpu is at", "memory usage",
+        "% full", "% usage", "% disk",
+        "worker-", "node-",
+    ]
+    if any(k in q for k in _alert_terms):
+        return "healing_incident"
+    if re.search(r'\d+\s*%', q) and any(k in q for k in ["disk", "cpu", "memory", "usage", "full"]):
+        return "healing_incident"
     if any(k in q for k in ["diagram", "architecture", "request flow", "data flow", "component", "sequence flow", "topology"]):
         return "architecture"
     # Diagram intent takes priority — even for "your" queries
@@ -1689,7 +1700,7 @@ def ask():
                 time_taken=f"{elapsed:.2f}s",
             ))
 
-        if _is_healing_query(query):
+        if _is_healing_query(query) or detect_query_intent(query) == "healing_incident":
             response, healing_meta = _build_healing_response(query)
             elapsed = time.time() - start_time
             _record_query(query, response, "healing_incident", elapsed, confidence="high")
@@ -1762,7 +1773,7 @@ def ask():
             "run kubectl", "execute", "apply the fix", "apply this", "run this",
             "run the", "kubectl apply", "kubectl exec", "diagnose now", "check now",
         ])
-        graph_name = match_graph(query) if _graph_explicit or detect_query_intent(query) not in ("troubleshooting", "definition", "ava_self") else None
+        graph_name = match_graph(query) if _graph_explicit or detect_query_intent(query) not in ("troubleshooting", "definition", "ava_self", "healing_incident") else None
         if graph_name:
             logger.info(f"[*] Command Graph matched: {graph_name}")
             _graph_t0    = time.time()
