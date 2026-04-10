@@ -608,6 +608,25 @@ def _diagram_entities_from_text(*texts):
     combined = "\n".join(_normalize_text(text) for text in texts if text)
     return _extract_query_entities(combined)
 
+_KNOWN_DIAGRAM_TECH = [
+    "zuul", "kafka", "cassandra", "evcache", "eureka", "ribbon",
+    "hystrix", "resilience4j", "samza", "mantis", "netty",
+    "elasticsearch", "spark", "s3", "dynamodb", "sqs", "sns",
+    "redis", "mysql", "postgres", "mongodb", "nginx", "consul",
+    "vault", "prometheus", "grafana", "jaeger", "istio", "envoy",
+    "docker", "kubernetes", "terraform", "jenkins", "argocd",
+    "api gateway", "load balancer", "cdn", "open connect",
+]
+
+def _extract_diagram_entities(llava_text: str) -> list:
+    """Extract technology names from llava analysis output."""
+    found = []
+    text_lower = llava_text.lower()
+    for tech in _KNOWN_DIAGRAM_TECH:
+        if tech in text_lower:
+            found.append(tech)
+    return found
+
 def _hallucination_terms(response_text, entities):
     text = _normalize_text(response_text).lower()
     entity_terms = {e.lower() for e in entities}
@@ -2217,16 +2236,35 @@ def upload_file():
                 messages=[{
                     "role": "user",
                     "content": (
-                        "Analyze this infrastructure or system diagram. "
-                        "List only the technologies, services, components, arrows, layers, and labels that are actually visible. "
-                        "Do not invent missing technologies. "
-                        "If unsure, say what is unclear."
+                        "Analyze this infrastructure/architecture diagram carefully.\n\n"
+                        "STEP 1 - List ALL visible text labels, component names, and technology names "
+                        "you can read in the image. Be exhaustive.\n\n"
+                        "STEP 2 - For each component you identified, explain:\n"
+                        "- What it does\n"
+                        "- Where it sits in the architecture\n"
+                        "- How it connects to other components\n\n"
+                        "STEP 3 - Explain the complete request flow from left to right (or top to bottom).\n\n"
+                        "STEP 4 - Explain the data flow if present.\n\n"
+                        "IMPORTANT RULES:\n"
+                        "- ONLY mention components you can actually see labeled in the image\n"
+                        "- Do NOT add AWS/Kubernetes/Lambda unless you can see those exact labels\n"
+                        "- If you see 'Zuul' label it as Zuul API Gateway\n"
+                        "- If you see 'Kafka' label it as Kafka Message Queue\n"
+                        "- Be specific, not generic"
                     ),
                     "images": [image_data]
                 }]
             )
             vision_analysis = vision_response['message']['content']
+            # Combine structural entities (from filename/text) with known-tech scan
             diagram_entities = _diagram_entities_from_text(filename, vision_analysis)
+            tech_entities    = _extract_diagram_entities(vision_analysis)
+            # Merge without duplicates, tech_entities first (higher signal)
+            combined_keys = {e.lower() for e in diagram_entities}
+            for te in tech_entities:
+                if te not in combined_keys:
+                    diagram_entities.append(te)
+                    combined_keys.add(te)
             diagram_query = (
                 f"Analyze this infrastructure diagram for {filename}. "
                 f"Focus on these detected components: {', '.join(diagram_entities) if diagram_entities else 'unknown components'}."
