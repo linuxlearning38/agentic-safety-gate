@@ -982,6 +982,16 @@ def detect_query_intent(query):
         return "healing_incident"
     if any(k in q for k in ["diagram", "architecture", "request flow", "data flow", "component", "sequence flow", "topology"]):
         return "architecture"
+    # Diagram intent takes priority — even for "your" queries
+    _diagram_triggers = [
+        "create a diagram", "draw a diagram", "mermaid diagram",
+        "draw a mermaid", "create mermaid", "show diagram",
+        "architecture diagram", "generate diagram", "make a diagram",
+        "docker diagram", "container diagram", "flow diagram",
+        "draw", "visualize", "create diagram",
+    ]
+    if any(k in q for k in _diagram_triggers):
+        return "architecture"
     # AVA self-knowledge guard — before all others
     _ava_patterns = [
         "your architecture", "your files", "your containers", "your models",
@@ -989,6 +999,8 @@ def detect_query_intent(query):
         "your stack", "your components", "your docker", "your database",
         "are you running", "do you run", "what containers", "what services",
         "what ports", "what models", "what are you running",
+        "what models", "which model", "your model",
+        "knowledge base size", "how many chunks", "your knowledge",
     ]
     if any(k in q for k in _ava_patterns) or re.search(r'\bava\b', q):
         return "ava_self"
