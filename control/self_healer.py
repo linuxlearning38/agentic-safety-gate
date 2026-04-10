@@ -73,6 +73,112 @@ HEALING_PLAYBOOK: dict[str, dict] = {
     },
 }
 
+# ─── Diagnostic playbook ─────────────────────────────────────────────────────
+
+DIAGNOSTIC_PLAYBOOK: dict[str, dict] = {
+    "pod_crash": {
+        "possible_causes": [
+            "Application error or exception",
+            "Missing ConfigMap or Secret",
+            "OOMKilled (memory limit too low)",
+            "Image pull error",
+            "Liveness probe failing",
+        ],
+        "diagnostic_commands": [
+            "kubectl describe pod {pod_name} -n {namespace}",
+            "kubectl logs {pod_name} -n {namespace} --previous",
+            "kubectl get events -n {namespace} --sort-by=.lastTimestamp",
+        ],
+        "needs_more_info": True,
+    },
+    "oom_killed": {
+        "possible_causes": [
+            "Memory limit set too low",
+            "Memory leak in application",
+            "Sudden traffic spike",
+        ],
+        "diagnostic_commands": [
+            "kubectl describe pod {pod_name} -n {namespace}",
+            "kubectl top pod {pod_name} -n {namespace}",
+        ],
+        "needs_more_info": False,
+    },
+    "disk_full": {
+        "possible_causes": [
+            "Log files accumulation",
+            "Container image layers",
+            "Application writing too much data",
+        ],
+        "diagnostic_commands": [
+            "df -h",
+            "du -sh /var/log/*",
+            "docker system df",
+        ],
+        "needs_more_info": False,
+    },
+    "high_cpu": {
+        "possible_causes": [
+            "Traffic spike",
+            "Infinite loop in application",
+            "Missing resource limits",
+        ],
+        "diagnostic_commands": [
+            "kubectl top pods -n {namespace}",
+            "kubectl describe node {node_name}",
+        ],
+        "needs_more_info": True,
+    },
+    "service_down": {
+        "possible_causes": [
+            "All pods crashed",
+            "Service selector mismatch",
+            "Network policy blocking traffic",
+        ],
+        "diagnostic_commands": [
+            "kubectl get pods -n {namespace}",
+            "kubectl describe service {service_name}",
+            "kubectl get endpoints {service_name}",
+        ],
+        "needs_more_info": True,
+    },
+    "node_not_ready": {
+        "possible_causes": [
+            "Kubelet not running",
+            "Node resource pressure",
+            "Network connectivity issue",
+        ],
+        "diagnostic_commands": [
+            "kubectl describe node {node_name}",
+            "kubectl get events --field-selector involvedObject.name={node_name}",
+        ],
+        "needs_more_info": True,
+    },
+    "image_pull_error": {
+        "possible_causes": [
+            "Wrong image name or tag",
+            "Registry authentication failed",
+            "Network issue reaching registry",
+        ],
+        "diagnostic_commands": [
+            "kubectl describe pod {pod_name} -n {namespace}",
+            "kubectl get events -n {namespace}",
+        ],
+        "needs_more_info": False,
+    },
+    "cert_expiry": {
+        "possible_causes": [
+            "Certificate not renewed",
+            "cert-manager not running",
+            "Manual cert not replaced",
+        ],
+        "diagnostic_commands": [
+            "openssl s_client -connect {host}:443 -servername {host} 2>/dev/null | openssl x509 -noout -dates",
+            "kubectl get certificate -A",
+        ],
+        "needs_more_info": False,
+    },
+}
+
 # ─── Keyword → issue_type classification ─────────────────────────────────────
 
 _CLASSIFIERS: list[tuple[list[str], str, str]] = [
@@ -82,9 +188,9 @@ _CLASSIFIERS: list[tuple[list[str], str, str]] = [
     (["imagepullbackoff", "image pull", "errimagepull"],             "image_pull_error", "MEDIUM"),
     (["notready", "not ready", "node not ready"],                    "node_not_ready",   "HIGH"),
     (["disk full", "no space left", "disk pressure", "diskpressure",
-      "filesystem full", "df -h"],                                   "disk_full",        "HIGH"),
+      "filesystem full", "disk usage", "% full", "% usage", "95%"],  "disk_full",        "HIGH"),
     (["high cpu", "cpu > ", "cpu usage", "cpu pressure"],            "high_cpu",         "MEDIUM"),
-    (["service down", "service failed", "inactive", "failed to start",
+    (["service down", "service failed", "service is down", "inactive", "failed to start",
       "systemctl"],                                                   "service_down",     "HIGH"),
     (["certificate", "cert expir", "tls expir", "ssl expir"],        "cert_expiry",      "MEDIUM"),
 ]
@@ -257,12 +363,16 @@ class SelfHealer:
         except Exception as _e:
             logger.warning(f"[SelfHealer] audit write failed: {_e}")
 
+        diag = DIAGNOSTIC_PLAYBOOK.get(issue_type, {})
         out = {
-            "action_taken": action_taken,
-            "command_used": cmd,
-            "result":       exec_result,
-            "risk_level":   risk_level,
-            "timestamp":    ts,
+            "action_taken":        action_taken,
+            "command_used":        cmd,
+            "result":              exec_result,
+            "risk_level":          risk_level,
+            "possible_causes":     diag.get("possible_causes", []),
+            "diagnostic_commands": diag.get("diagnostic_commands", []),
+            "needs_more_info":     diag.get("needs_more_info", False),
+            "timestamp":           ts,
         }
         logger.info(f"[SelfHealer] heal: {action_taken} | cmd={cmd[:80]}")
         return out
