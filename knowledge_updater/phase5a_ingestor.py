@@ -20,6 +20,11 @@ import chromadb
 import requests
 from chromadb.config import Settings
 
+try:
+    from knowledge_updater.architecture_reference_corpus import ARCHITECTURE_REFERENCE_DOCS
+except Exception:
+    from architecture_reference_corpus import ARCHITECTURE_REFERENCE_DOCS
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s"
@@ -1085,6 +1090,70 @@ COMMERCIAL TARGET:
 ]
 
 
+ARCHITECTURE_SEED_PATTERNS = [
+    {
+        "name": "API Gateway + Event Streaming Architecture",
+        "category": "architecture",
+        "description": "Use an API gateway as the synchronous entry point for client traffic, then publish domain events to a streaming backbone for asynchronous downstream processing. This separates request routing from event fan-out.",
+        "implementation": "Request Flow:\n1. Client request enters through an API gateway such as Zuul, Kong, or Envoy.\n2. Gateway applies auth, routing, and service discovery.\n3. Request reaches the owning microservice.\n4. Service writes primary state and emits a domain event to Kafka.\n\nData Flow:\n1. Kafka topics carry immutable events such as playback-started, payment-authorized, or order-created.\n2. Stream processors and downstream services subscribe independently.\n3. Stateful stores or caches are updated from the event stream.\n\nWhen explaining this architecture, describe the synchronous request path separately from the asynchronous event path.",
+        "benefits": "Clear separation of concerns. API path stays simple while downstream systems scale independently. Event fan-out avoids point-to-point integrations.",
+        "tradeoffs": "Requires strong schema/version discipline. Debugging becomes harder because user-facing actions span both sync and async paths.",
+        "example": "Netflix-style edge flow: Zuul routes playback/API requests, services publish events to Kafka, downstream consumers update stores, caches, and monitoring streams.",
+        "tags": "architecture, api-gateway, kafka, event-driven, microservices, request-flow, data-flow"
+    },
+    {
+        "name": "Cache-Aside Read Scaling Pattern",
+        "category": "architecture",
+        "description": "Serve hot reads from a cache while keeping the database as the source of truth. On cache miss, fetch from the database, populate the cache, and return the response.",
+        "implementation": "Read Flow:\n1. Service receives request for an object or aggregate.\n2. Service checks EVCache or Redis first.\n3. If cache hit, return immediately.\n4. If cache miss, read from Cassandra or the primary database.\n5. Populate cache with TTL and return data.\n\nWrite Flow:\n1. Service writes to the primary store first.\n2. Cache entry is invalidated or refreshed.\n\nWhen describing this architecture, call out that cache reduces latency and shields the database from repeated hot reads.",
+        "benefits": "Lower read latency. Reduced database load. Good fit for traffic hotspots and frequently reused aggregates.",
+        "tradeoffs": "Cache invalidation and TTL selection are hard. Stale reads are possible if invalidation is delayed.",
+        "example": "Netflix EVCache keeps hot catalog or playback metadata close to services while Cassandra remains the durable store.",
+        "tags": "architecture, cache-aside, evcache, redis, cassandra, low-latency, read-scaling"
+    },
+    {
+        "name": "Streaming Analytics Pipeline Pattern",
+        "category": "architecture",
+        "description": "Use a streaming log such as Kafka to collect events, then process them with a stream processor such as Samza or Flink to compute aggregates, enrich records, and feed downstream systems in near real time.",
+        "implementation": "Pipeline Flow:\n1. Producers emit ordered events into Kafka topics.\n2. Stream processors consume partitions in parallel.\n3. Processors enrich, aggregate, or join event streams.\n4. Results are written to serving databases, caches, alerting systems, or downstream topics.\n\nWhen answering architecture questions, explain that Kafka is the transport backbone while the stream processor performs stateful computation over the event stream.",
+        "benefits": "Near-real-time analytics. Decouples producers from consumers. Supports replay and reprocessing from the log.",
+        "tradeoffs": "Operational complexity rises with consumer lag, partitioning, and schema evolution. Stateful stream jobs need checkpointing and recovery strategy.",
+        "example": "Kafka carries playback or platform events, Samza computes aggregates, and downstream systems persist derived views for dashboards and APIs.",
+        "tags": "architecture, kafka, samza, streaming, analytics, event-processing, pipeline"
+    },
+    {
+        "name": "Operational Control Loop for Distributed Systems",
+        "category": "architecture",
+        "description": "Model large systems as a control loop: request path, state path, and observability path. The request path serves traffic, the state path stores or caches data, and the observability path monitors health and triggers action.",
+        "implementation": "Three Paths:\n1. Request Path: gateway -> service -> downstream API/store.\n2. State Path: primary database + cache + derived views.\n3. Observability Path: metrics/events -> monitoring/alerting -> operator action.\n\nFor architecture answers, explicitly separate user traffic from telemetry flow so monitoring components like Mantis or alerting tools are not mistaken for primary request-serving components.",
+        "benefits": "Makes architecture explanations clearer. Distinguishes business traffic from telemetry and control signals. Useful for troubleshooting and incident response.",
+        "tradeoffs": "Adds conceptual complexity. Teams may over-model simple systems if this framing is used everywhere.",
+        "example": "Netflix-style flow: Zuul and services handle requests, Cassandra/EVCache hold state, Kafka and monitoring tools feed control/observability loops such as Mantis.",
+        "tags": "architecture, observability, mantis, request-path, telemetry, control-loop, distributed-systems"
+    },
+    {
+        "name": "High-Scale Microservice Edge Pattern",
+        "category": "architecture",
+        "description": "At internet scale, edge routing, stateless services, event streaming, and distributed state stores work together. The edge gateway handles routing and protection, core services remain stateless, and state is externalized into databases, caches, and streams.",
+        "implementation": "Design Rules:\n1. Keep stateless request-serving services behind the gateway.\n2. Put shared state in systems designed for scale: Cassandra, Kafka, distributed caches.\n3. Use asynchronous events for cross-domain side effects.\n4. Put monitoring and alerting beside the traffic path, not inside it.\n5. Explain request flow and data flow separately in documentation and AI answers.\n\nThis pattern is useful when answering questions about systems like Netflix, Uber, or large platform architectures.",
+        "benefits": "Scales better than tightly coupled service meshes with embedded state. Makes independent scaling and failure isolation easier.",
+        "tradeoffs": "Requires clear service boundaries, robust observability, and mature operational practices.",
+        "example": "Gateway at the edge, stateless APIs in the middle tier, Cassandra + EVCache for state, Kafka + stream processing for asynchronous data movement.",
+        "tags": "architecture, microservices, edge, cassandra, kafka, cache, scale, distributed"
+    },
+    {
+        "name": "Architecture Explanation Pattern for AVA",
+        "category": "architecture",
+        "description": "When answering architecture questions, AVA should identify components first, then explain request flow, then data flow, then why each major technology exists. Avoid generic labels unless grounded by retrieved text.",
+        "implementation": "Answer Template:\n1. Components: list named technologies exactly as grounded.\n2. Request Flow: explain the synchronous traffic path.\n3. Data Flow: explain event, storage, and cache movement.\n4. Key Technologies: map each named component to its role.\n5. Why They Are Used: summarize the system-level purpose.\n\nGrounding Rules:\n- Prefer named entities from the user query and retrieved context.\n- Prefer relationship lines with verbs like routes, carries, stores, caches, processes, monitors.\n- Avoid mixing unrelated SRE snippets into architecture explanations.",
+        "benefits": "Makes architecture answers consistent, readable, and closer to expert system-design explanations.",
+        "tradeoffs": "Needs clean architecture context to work well. If the retrieved evidence is weak, AVA should stay narrow instead of hallucinating.",
+        "example": "For Zuul + Kafka + Cassandra + EVCache + Samza + Mantis: explain gateway routing, event streaming, durable state, cache reads, stream processing, and observability as separate roles.",
+        "tags": "architecture, answer-quality, grounding, request-flow, data-flow, ava"
+    },
+]
+
+
 def seed_ava_architecture():
     """Ingest AVA's own system architecture into devops_patterns_v1."""
     logger.info(f"Seeding {len(AVA_ARCHITECTURE)} AVA architecture entries into '{COLLECTION_PATTERNS}'...")
@@ -1145,6 +1214,67 @@ def seed_patterns_collection():
     return ok, fail
 
 
+def seed_architecture_patterns_collection():
+    """Ingest architecture-focused seed patterns into devops_patterns_v1."""
+    logger.info(f"Seeding {len(ARCHITECTURE_SEED_PATTERNS)} architecture patterns into '{COLLECTION_PATTERNS}'...")
+    ok = 0
+    fail = 0
+    for pattern in ARCHITECTURE_SEED_PATTERNS:
+        text = _pattern_to_text(pattern)
+        meta = {
+            "name":       pattern["name"][:200],
+            "category":   pattern["category"],
+            "tags":       pattern["tags"],
+            "source":     "ava_architecture_patterns_v1",
+            "collection": COLLECTION_PATTERNS,
+        }
+        if ingest_text_to_collection(COLLECTION_PATTERNS, text, meta):
+            ok += 1
+        else:
+            fail += 1
+        time.sleep(0.1)
+    logger.info(f"Architecture pattern seed complete: {ok} ingested, {fail} failed")
+    return ok, fail
+
+
+def _architecture_reference_to_text(doc: dict) -> str:
+    return (
+        f"ARCHITECTURE REFERENCE: {doc['title']}\n\n"
+        f"CATEGORY: {doc['category']}\n\n"
+        f"SOURCE: {doc['source']}\n"
+        f"SOURCE URL: {doc['source_url']}\n\n"
+        f"SUMMARY: {doc['summary']}\n\n"
+        f"ARCHITECTURE NOTES: {doc['architecture_notes']}\n\n"
+        f"REQUEST FLOW: {doc['request_flow']}\n\n"
+        f"DATA FLOW: {doc['data_flow']}\n\n"
+        f"TAGS: {doc['tags']}"
+    )
+
+
+def seed_architecture_reference_corpus():
+    """Ingest curated architecture reference material into devops_patterns_v1."""
+    logger.info(f"Seeding {len(ARCHITECTURE_REFERENCE_DOCS)} architecture references into '{COLLECTION_PATTERNS}'...")
+    ok = 0
+    fail = 0
+    for doc in ARCHITECTURE_REFERENCE_DOCS:
+        text = _architecture_reference_to_text(doc)
+        meta = {
+            "name":       doc["title"][:200],
+            "category":   doc["category"],
+            "tags":       doc["tags"],
+            "source":     doc["source"],
+            "source_url": doc["source_url"],
+            "collection": COLLECTION_PATTERNS,
+        }
+        if ingest_text_to_collection(COLLECTION_PATTERNS, text, meta):
+            ok += 1
+        else:
+            fail += 1
+        time.sleep(0.1)
+    logger.info(f"Architecture reference corpus seed complete: {ok} ingested, {fail} failed")
+    return ok, fail
+
+
 def seed_fixes_collection():
     """Ingest all 20 seed fixes into devops_fixes_v1."""
     logger.info(f"Seeding {len(SEED_FIXES)} fixes into '{COLLECTION_FIXES}'...")
@@ -1196,6 +1326,14 @@ if __name__ == "__main__":
     # Step 2c: seed AVA self-architecture
     print("\n--- Seeding AVA architecture into devops_patterns_v1 ---")
     ok_a, fail_a = seed_ava_architecture()
+
+    # Step 2d: seed architecture-focused expert patterns
+    print("\n--- Seeding architecture expert patterns into devops_patterns_v1 ---")
+    ok_arch, fail_arch = seed_architecture_patterns_collection()
+
+    # Step 2e: seed curated architecture reference corpus
+    print("\n--- Seeding architecture reference corpus into devops_patterns_v1 ---")
+    ok_ref, fail_ref = seed_architecture_reference_corpus()
 
     # Step 3: stats
     print("\n--- Collection Stats ---")

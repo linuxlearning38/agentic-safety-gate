@@ -431,6 +431,28 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
             blog_min_relevance=min_relevance,
             format_for_llm=False
         )
+        if query_intent == "architecture" and entities:
+            seeded_chunks = []
+            keyword_limit = 8
+            for collection in [
+                getattr(hybrid_retriever, "patterns_collection", None),
+                getattr(hybrid_retriever, "blogs_collection", None),
+                getattr(hybrid_retriever, "fixes_collection", None),
+                getattr(hybrid_retriever, "policies_collection", None),
+            ]:
+                seeded_chunks.extend(hybrid_retriever._keyword_fetch(collection, entities, limit=keyword_limit))
+            seeded_chunks = _filter_architecture_chunks(seeded_chunks, entities)
+            raw_chunks = _filter_architecture_chunks(raw_chunks, entities)
+            if seeded_chunks:
+                seen = set()
+                prioritized = []
+                for chunk in seeded_chunks + (raw_chunks or []):
+                    content = getattr(chunk, "content", None)
+                    if not content or content in seen:
+                        continue
+                    prioritized.append(chunk)
+                    seen.add(content)
+                raw_chunks = prioritized
         if entities:
             boosted_chunks = []
             keyword_limit = 6 if query_intent == "architecture" else 4
@@ -563,8 +585,20 @@ def _record_query(query, response, intent, elapsed, sources_used=0, confidence=N
 def _normalize_fact_key(label):
     return re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
 
+def _canonical_fact_label(label):
+    normalized = re.sub(r'\s+', ' ', _normalize_text(label).strip().lower())
+    aliases = {
+        "server": "server name",
+        "cluster": "cluster name",
+        "project": "project name",
+        "service": "service name",
+        "app": "application name",
+        "application": "application name",
+    }
+    return aliases.get(normalized, normalized)
+
 def _fact_aliases(label):
-    base = _normalize_fact_key(label)
+    base = _normalize_fact_key(_canonical_fact_label(label))
     aliases = {base}
     if not base:
         return aliases
@@ -685,6 +719,118 @@ def _repair_architecture_answer(response_text, entities):
             lines.insert(0, "Components: " + ", ".join(entities))
     return "\n".join(lines)
 
+
+def _build_grounded_architecture_answer(context_blocks, entities):
+    entities = [entity for entity in (entities or []) if entity][:6]
+    relevant_lines = []
+    for block in context_blocks or []:
+        for line in block.splitlines():
+            cleaned = _normalize_text(line).strip(" -\t")
+            if cleaned:
+                relevant_lines.append(cleaned)
+    noise_markers = (
+        "docker",
+    )
+    filtered_lines = []
+    for line in relevant_lines:
+        lower = line.lower().strip()
+        if not lower:
+            continue
+        if _is_noisy_architecture_line(line):
+            continue
+        if any(marker in lower for marker in noise_markers):
+            continue
+        if len(lower.split()) < 4:
+            continue
+        entity_hits = sum(1 for entity in entities if entity.lower() in lower)
+        relation_hits = sum(
+            1 for term in ("route", "request", "gateway", "stream", "event", "cache", "store", "read", "write", "monitor", "process", "carry", "ingest")
+            if term in lower
+        )
+        if entities and entity_hits == 0:
+            continue
+        if entity_hits == 0 and relation_hits == 0:
+            continue
+        filtered_lines.append(line)
+    relevant_lines = filtered_lines[:10]
+    if not relevant_lines and not entities:
+        return None
+
+    entity_facts = {}
+    for entity in entities:
+        lower_entity = entity.lower()
+        for line in relevant_lines:
+            if lower_entity in line.lower():
+                entity_facts[entity] = line.strip()
+                break
+
+    request_terms = ("request", "route", "gateway", "proxy", "client", "api", "entry")
+    data_terms = ("data", "event", "stream", "store", "cache", "read", "write", "persist", "kafka", "cassandra")
+    request_flow = []
+    data_flow = []
+    for line in relevant_lines:
+        lower = line.lower()
+        if any(term in lower for term in request_terms) and line not in request_flow:
+            request_flow.append(line)
+        if any(term in lower for term in data_terms) and line not in data_flow:
+            data_flow.append(line)
+
+    component_lines = []
+    for entity in entities:
+        if entity.lower() in {"netflix", "ava"} and len(entities) >= 4:
+            continue
+        fact = entity_facts.get(entity)
+        if fact:
+            component_lines.append(f"- {entity}: {fact}")
+        else:
+            component_lines.append(f"- {entity}")
+
+    tech_lines = []
+    for entity in entities:
+        if entity.lower() in {"netflix", "ava"} and len(entities) >= 4:
+            continue
+        fact = entity_facts.get(entity)
+        if fact:
+            tech_lines.append(f"- {entity}: grounded by '{fact}'")
+        else:
+            tech_lines.append(f"- {entity}")
+
+    why_used = []
+    if request_flow:
+        why_used.append("- They are used together to route incoming requests through the right entry and service paths.")
+    if data_flow:
+        why_used.append("- They are used together to move, store, and cache operational or event data with lower latency.")
+    if relevant_lines:
+        why_used.append("- Grounded context shows these components are connected by explicit request/data relationships, not just listed independently.")
+
+    sections = ["**Components:**"]
+    sections.extend(component_lines or ["- No grounded components found."])
+    if request_flow:
+        sections.append("\n**Request Flow:**")
+        sections.extend(f"- {line}" for line in request_flow[:4])
+    if data_flow:
+        sections.append("\n**Data Flow:**")
+        sections.extend(f"- {line}" for line in data_flow[:4])
+    sections.append("\n**Key Technologies:**")
+    sections.extend(tech_lines or ["- No grounded technologies found."])
+    if why_used:
+        sections.append("\n**Why They Are Used:**")
+        sections.extend(why_used[:3])
+    return "\n".join(sections)
+
+
+def _looks_generic_architecture_answer(response_text):
+    text = _normalize_text(response_text).lower()
+    generic_markers = [
+        "distributed streaming platform",
+        "in-memory cache",
+        "monitoring and alerting system",
+        "nosql database",
+        "requests enter through",
+        "routes requests to appropriate microservices",
+    ]
+    return sum(1 for marker in generic_markers if marker in text) >= 2
+
 def _build_diagram_grounding_block(question, context_blocks, extracted_entities):
     lines = [
         "Diagram grounding rules:",
@@ -727,6 +873,27 @@ def _build_grounded_mermaid_diagram(context_blocks, entities):
     for entity in unique_entities:
         safe_label = entity.replace('"', "'")
         lines.append(f'    {node_ids[entity.lower()]}["{safe_label}"]')
+
+    self_architecture_terms = {entity.lower() for entity in unique_entities}
+    if "ava-agent" in self_architecture_terms:
+        preferred_edges = [
+            ("ava-agent", "flask/gunicorn", "serves"),
+            ("ava-agent", "postgresql", "reads/writes"),
+            ("ava-agent", "redis", "caches"),
+            ("ava-agent", "open policy agent", "checks policy with"),
+            ("ava-agent", "hashicorp vault", "uses secrets from"),
+            ("ava-agent", "ollama host", "calls"),
+        ]
+        added_self_edges = False
+        for left, right, relation in preferred_edges:
+            if left in node_ids and right in node_ids:
+                added_self_edges = True
+                lines.append(
+                    f'    {node_ids[left]} -- "{relation}" --> {node_ids[right]}'
+                )
+        if added_self_edges:
+            lines.append("```")
+            return "\n".join(lines)
 
     relation_terms = [
         "handles", "routes", "calls", "uses", "writes", "stores",
@@ -777,6 +944,76 @@ def _repair_diagram_response(response_text, context_blocks, entities):
         return grounded + "\n\nGrounded from detected components only."
     return text
 
+
+def _is_ava_self_architecture_query(query, entities=None):
+    q = (query or "").lower()
+    markers = [
+        "your docker", "your architecture", "your containers", "your services",
+        "your ports", "your stack", "ava", "your runtime",
+    ]
+    if any(marker in q for marker in markers):
+        return True
+    for entity in entities or []:
+        if entity.lower() in {
+            "ava-agent", "flask/gunicorn", "postgresql", "redis",
+            "open policy agent", "hashicorp vault", "ollama host",
+        }:
+            return True
+    return False
+
+
+def _diagram_needs_grounded_override(response_text, entities):
+    text = _normalize_text(response_text).lower()
+    if not text:
+        return True
+    generic_markers = [
+        "docker host", "docker daemon", "containers:", "each container runs a specific service",
+    ]
+    if any(marker in text for marker in generic_markers):
+        return True
+    required_entities = [entity.lower() for entity in (entities or []) if entity]
+    if required_entities:
+        hits = sum(1 for entity in required_entities if entity in text)
+        if hits < min(3, len(required_entities)):
+            return True
+    return False
+
+
+def _ava_runtime_diagram_entities():
+    return [
+        "ava-agent",
+        "Flask/Gunicorn",
+        "PostgreSQL",
+        "Redis",
+        "Open Policy Agent",
+        "HashiCorp Vault",
+        "Ollama Host",
+    ]
+
+
+def _build_ava_runtime_diagram_response():
+    return (
+        "```mermaid\n"
+        "graph LR\n"
+        "    A[\"ava-agent:5443\"]\n"
+        "    B[\"Flask/Gunicorn\"]\n"
+        "    C[\"PostgreSQL:5432\"]\n"
+        "    D[\"Redis:6379\"]\n"
+        "    E[\"Open Policy Agent:8181\"]\n"
+        "    F[\"HashiCorp Vault:8200\"]\n"
+        "    G[\"Ollama Host:11434\"]\n"
+        "    A -- \"serves via\" --> B\n"
+        "    A -- \"reads/writes\" --> C\n"
+        "    A -- \"caches with\" --> D\n"
+        "    A -- \"checks policy with\" --> E\n"
+        "    A -- \"uses secrets from\" --> F\n"
+        "    A -- \"calls\" --> G\n"
+        "```\n\n"
+        "Explanation:\n"
+        "- AVA runs as `ava-agent` on port `5443` and uses Flask/Gunicorn to serve requests.\n"
+        "- It stores relational data in PostgreSQL, uses Redis for fast state/caching, checks policy with OPA, reads secrets from Vault, and calls the Ollama host for local model inference."
+    )
+
 def _needs_strict_grounding(query_intent, query):
     if query_intent in {"ava_self", "healing_incident", "follow_up", "memory_recall", "memory_store", "architecture"}:
         return True
@@ -810,6 +1047,8 @@ def _extract_relevant_context_lines(context_blocks, entities, limit=8):
             cleaned = line.strip(" -\t")
             if not cleaned:
                 continue
+            if _is_noisy_architecture_line(cleaned):
+                continue
             lower = cleaned.lower()
             match_count = sum(1 for entity in entities if entity.lower() in lower)
             if not match_count:
@@ -829,6 +1068,57 @@ def _extract_relevant_context_lines(context_blocks, entities, limit=8):
         if len(matches) >= limit:
             break
     return matches
+
+
+def _is_noisy_architecture_line(line):
+    lower = _normalize_text(line).strip().lower()
+    if not lower:
+        return True
+    noise_markers = (
+        "entities detected:",
+        "diagram grounding rules:",
+        "grounded diagram facts:",
+        "terraform init",
+        "architecture reference:",
+        "queue depth",
+        "consumer lag",
+        "redis_blocked_clients",
+        "kafka_consumer_lag",
+        "slo:",
+        "example:",
+        "alert:",
+        "alerting example",
+        "30-day rolling",
+    )
+    if lower.startswith("#"):
+        return True
+    if any(marker in lower for marker in noise_markers):
+        return True
+    if re.search(r"\b[a-z]+_[a-z0-9_]+\b", lower) and not any(term in lower for term in ("gateway", "stream", "cache", "store", "event", "request", "route", "process", "monitor")):
+        return True
+    return False
+
+
+def _filter_architecture_chunks(raw_chunks, entities):
+    if not raw_chunks or not entities:
+        return raw_chunks
+    relation_terms = {
+        "handles", "routes", "calls", "uses", "writes", "stores", "publishes",
+        "sends", "reads", "connects", "proxies", "feeds", "triggers",
+        "loads", "carries", "behind", "through", "via", "gateway",
+        "stream", "event", "cache", "monitor", "process",
+    }
+    filtered = []
+    for chunk in raw_chunks:
+        content = _normalize_text(getattr(chunk, "content", ""))
+        lower = content.lower()
+        if _is_noisy_architecture_line(content):
+            continue
+        entity_hits = sum(1 for entity in entities if entity.lower() in lower)
+        relation_hits = sum(1 for term in relation_terms if term in lower)
+        if entity_hits >= 2 or (entity_hits >= 1 and relation_hits >= 1):
+            filtered.append(chunk)
+    return filtered or raw_chunks
 
 def _build_grounding_block(query, context_blocks, query_intent):
     entities = _extract_query_entities(query)
@@ -850,7 +1140,15 @@ def _grounding_confident_enough(query, context_blocks, confidence):
     matched_lines = _extract_relevant_context_lines(context_blocks, entities)
     q = query.lower()
     if any(term in q for term in ["diagram", "architecture", "request flow", "data flow", "components"]):
-        return bool(matched_lines) and (bool(entities) or confidence in {"medium", "high"})
+        relation_terms = ("route", "request", "gateway", "stream", "event", "cache", "store", "read", "write", "monitor", "process", "carry")
+        relation_line_hits = 0
+        for block in context_blocks or []:
+            for line in block.splitlines():
+                lower = line.lower()
+                entity_hits = sum(1 for entity in entities if entity.lower() in lower)
+                if entity_hits >= 1 and any(term in lower for term in relation_terms):
+                    relation_line_hits += 1
+        return bool(matched_lines) or (confidence == "medium" and relation_line_hits >= 1 and len(entities) >= 3)
     if not entities:
         return confidence in {"medium", "high"} and bool(context_blocks)
     return len(matched_lines) >= 2 or (confidence == "medium" and len(matched_lines) >= 1 and len(entities) <= 3)
@@ -860,7 +1158,7 @@ def _load_chat_facts():
 
 def _save_chat_fact(label, value):
     facts = _load_chat_facts()
-    label = label.strip().lower()
+    label = _canonical_fact_label(label)
     key = _normalize_fact_key(label)
     facts[key] = {
         "label": label,
@@ -890,7 +1188,7 @@ def _parse_memory_statement(statement):
 
 def _extract_memory_request(query):
     m = re.match(
-        r"\s*remember this(?: exactly)?\s*:\s*(.+?)(?:[.?!]\s*(what.+))?\s*$",
+        r"\s*remember(?: this)?(?: exactly)?\s*:\s*(.+?)(?:[.?!]\s*(what.+))?\s*$",
         query,
         re.IGNORECASE,
     )
@@ -905,6 +1203,7 @@ def _extract_memory_request(query):
 def _extract_recall_label(query):
     patterns = [
         r"what is my (.+?)[\?]?$",
+        r"what's my (.+?)[\?]?$",
         r"what (.+?) did i just mention[\?]?$",
         r"what did i just mention about my (.+?)[\?]?$",
     ]
@@ -913,7 +1212,7 @@ def _extract_recall_label(query):
         m = re.match(pattern, q, re.IGNORECASE)
         if m:
             label = m.group(1).strip().replace("_", " ")
-            return label
+            return _canonical_fact_label(label)
     return None
 
 def _recall_chat_fact(label):
@@ -990,7 +1289,10 @@ def _topic_from_turn(turn):
     response = _normalize_text(turn.get("response"))
     intent = _normalize_text(turn.get("intent")).lower()
     if intent == "architecture" or "```mermaid" in response:
-        entities = _diagram_entities_from_text(response)
+        if _is_ava_self_architecture_query(query):
+            return "ava-agent, PostgreSQL, Redis"
+        cleaned_response = re.sub(r"```mermaid.*?```", "", response, flags=re.S).strip()
+        entities = _diagram_entities_from_text(query, cleaned_response)
         if entities:
             return ", ".join(entities[:3])
     return _summarize_topic(query)
@@ -999,11 +1301,44 @@ def _response_summary(response_text):
     response_text = _normalize_text(response_text).strip()
     if not response_text:
         return ""
+    low_signal_phrases = {
+        "the diagram shows the components of the docker architecture",
+        "this diagram represents the interconnections between the main components",
+    }
     if "```mermaid" in response_text:
         cleaned = re.sub(r"```mermaid.*?```", "", response_text, flags=re.S).strip()
         if cleaned:
-            return cleaned.split("\n", 1)[0].strip()
+            for line in cleaned.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("#"):
+                    continue
+                if re.fullmatch(r"\*\*[^*]+:\*\*", line):
+                    continue
+                if re.fullmatch(r"[A-Za-z][A-Za-z ]+:", line):
+                    continue
+                if line.startswith("- **") and ":**" in line:
+                    continue
+                if line.startswith("**") and line.endswith("**"):
+                    continue
+                normalized = re.sub(r"^[\-\*\s]+", "", line).strip().rstrip(".").lower()
+                if normalized in low_signal_phrases:
+                    continue
+                return line
         return "A grounded Mermaid diagram of the architecture."
+    for line in response_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"\*\*[^*]+:\*\*", line):
+            continue
+        if re.fullmatch(r"[A-Za-z][A-Za-z ]+:", line):
+            continue
+        normalized = re.sub(r"^[\-\*\s]+", "", line).strip().rstrip(".").lower()
+        if normalized in low_signal_phrases:
+            continue
+        return line
     return response_text.split("\n", 1)[0].strip()
 
 def _build_follow_up_response(query):
@@ -1158,6 +1493,12 @@ def detect_query_intent(query):
         return "memory_recall"
     if _is_follow_up_query(q):
         return "follow_up"
+    incident_terms = [
+        "oomkilled", "oom killed", "crashloopbackoff", "crashloop",
+        "imagepullbackoff", "image pull backoff", "pending", "containercreating",
+    ]
+    if any(term in q for term in incident_terms):
+        return "troubleshooting"
     if _is_healing_query(q):
         return "healing_incident"
     # Metric-alert patterns not caught by _is_healing_query compound check
@@ -1349,6 +1690,63 @@ _CONFIDENCE_PREFIXES = {
     'low': "I don't have a strong match for this, but based on general DevOps knowledge: ",
 }
 
+def _answer_known_incident_query(query):
+    q = query.lower()
+    if "oomkilled" in q or "oom killed" in q:
+        return (
+            "**Root Cause:** Kubernetes marks a container as `OOMKilled` when it exceeds its memory limit and the kernel terminates it to protect node stability.\n"
+            "**Fix:** Raise the pod memory limit if it is too low, reduce the application's memory use, and compare actual peak usage against the current request and limit.\n"
+            "**Why this works:** `OOMKilled` is specifically a memory-pressure termination, so the durable fix is aligning the workload's memory behavior with Kubernetes limits.\n"
+            "**Watch out for:** A restart can hide the symptom temporarily. Check for memory leaks, bursty traffic, large in-memory caches, or JVM heap settings before only increasing limits."
+        )
+    if "crashloopbackoff" in q:
+        return (
+            "**Root Cause:** `CrashLoopBackOff` means the container keeps starting, failing, and being restarted, so Kubernetes backs off between restart attempts.\n"
+            "**Fix:** Check the container logs, last termination reason, image entrypoint, env vars, config mounts, and readiness or liveness probe settings. Common causes are bad startup commands, missing config, and application crashes.\n"
+            "**Why this works:** `CrashLoopBackOff` is a restart pattern, not the root problem itself. The real fix comes from the failing process or probe.\n"
+            "**Watch out for:** If probes are too aggressive, Kubernetes can restart an otherwise healthy app before it finishes booting."
+        )
+    return None
+
+def _answer_ava_self_query(query, about=None):
+    q = query.lower()
+    about = about or _get_about_data()
+    containers = about.get("containers", {})
+    models = about.get("models", {})
+    kb = about.get("knowledge_base", {})
+    total_chunks = sum(int(count or 0) for count in kb.values())
+
+    if any(term in q for term in ["what containers", "your containers", "your docker", "your ports", "what ports", "services and ports"]):
+        lines = ["I run these Docker containers and ports:"]
+        for name, data in containers.items():
+            proto = f" ({data['proto']})" if data.get("proto") else ""
+            lines.append(f"- {name}: port {data['port']}{proto} - {data['stack']}")
+        return "\n".join(lines)
+
+    if any(term in q for term in ["what models", "which model", "your model", "are you running", "do you run"]):
+        return (
+            "I run these local models via Ollama:\n"
+            f"- LLM: {models.get('llm', 'unknown')}\n"
+            f"- Embedding: {models.get('embedding', 'unknown')}\n"
+            f"- Vision: {models.get('vision', 'unknown')}\n"
+            f"- Ollama host: {models.get('ollama_host', 'unknown')}"
+        )
+
+    if any(term in q for term in ["knowledge base size", "how many chunks", "your knowledge"]):
+        lines = [f"My knowledge base currently has {total_chunks:,} chunks across {len(kb)} collections:"]
+        for name, count in kb.items():
+            lines.append(f"- {name}: {int(count or 0):,} chunks")
+        return "\n".join(lines)
+
+    if "runtime" in q or "stack" in q or "overview" in q:
+        return (
+            f"I am AVA {about.get('version', '')}, built by {about.get('built_by', 'unknown')}.\n"
+            f"My runtime is {about.get('runtime', 'unknown')}.\n"
+            f"My main app container is ava-agent on port 5443, and I use {models.get('llm', 'unknown')} as my main LLM."
+        )
+
+    return None
+
 
 def generate_response(query, context, confidence=None, prior_messages=None):
     """Phase 3: Structured response with memory, CoT, Mermaid, fail-safe.
@@ -1363,6 +1761,26 @@ def generate_response(query, context, confidence=None, prior_messages=None):
         wants_diagram = any(k in query.lower() for k in [
             "draw", "visualize", "create a diagram", "show me a diagram", "render diagram", "mermaid"
         ])
+        if query_intent == "architecture" and not wants_diagram:
+            query_entities = _extract_query_entities(query)
+            if query_entities:
+                extracted_entities = query_entities
+        is_ava_self_diagram = wants_diagram and _is_ava_self_architecture_query(query, extracted_entities)
+        if is_ava_self_diagram:
+            extracted_entities = _ava_runtime_diagram_entities()
+            prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
+            answer = _build_ava_runtime_diagram_response()
+            return prefix + answer if prefix else answer
+        if query_intent == "ava_self":
+            prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
+            answer = _answer_ava_self_query(query)
+            if answer:
+                return prefix + answer if prefix else answer
+        if query_intent == "troubleshooting":
+            prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
+            answer = _answer_known_incident_query(query)
+            if answer:
+                return prefix + answer if prefix else answer
 
         system_parts = ["You are AVA, a senior DevOps AI assistant.\n\nRULES:\n1. Always respond in English only\n2. Use the provided context as your primary grounding source\n3. If the context is partial but clearly relevant, give the best direct answer you can and say what is inferred\n4. Do not lead with phrases like 'the context does not directly say' unless the context is genuinely irrelevant\n5. Prefer direct practical answers over meta commentary about the context\n6. Quote specific config values, commands, and fixes directly from context when available\n7. Be specific, practical, and concise"]
 
@@ -1423,10 +1841,18 @@ def generate_response(query, context, confidence=None, prior_messages=None):
         if query_intent == "architecture":
             if wants_diagram:
                 answer = _repair_diagram_response(answer, context or [], extracted_entities)
-            elif _hallucination_terms(answer, extracted_entities):
-                answer = _repair_architecture_answer(answer, extracted_entities)
-            elif extracted_entities and not any(entity.lower() in answer.lower() for entity in extracted_entities[:2]):
-                answer = _repair_architecture_answer(answer, extracted_entities)
+                if _is_ava_self_architecture_query(query, extracted_entities):
+                    grounded_diagram = _build_grounded_mermaid_diagram(context or [], extracted_entities)
+                    if grounded_diagram and _diagram_needs_grounded_override(answer, extracted_entities):
+                        answer = grounded_diagram + "\n\nGrounded from my current AVA runtime components."
+            else:
+                grounded_architecture = _build_grounded_architecture_answer(context or [], extracted_entities)
+                if _hallucination_terms(answer, extracted_entities):
+                    answer = grounded_architecture or _repair_architecture_answer(answer, extracted_entities)
+                elif extracted_entities and not any(entity.lower() in answer.lower() for entity in extracted_entities[:2]):
+                    answer = grounded_architecture or _repair_architecture_answer(answer, extracted_entities)
+                elif grounded_architecture and _looks_generic_architecture_answer(answer):
+                    answer = grounded_architecture
         prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
         return prefix + answer if prefix else answer
 
