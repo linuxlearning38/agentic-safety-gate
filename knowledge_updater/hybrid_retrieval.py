@@ -166,6 +166,8 @@ class HybridRetriever:
 
     def _detect_query_intent(self, query_text: str) -> str:
         q = query_text.lower().strip()
+        if any(k in q for k in ["architecture", "request flow", "data flow", "components", "topology", "diagram"]):
+            return "architecture"
         if any(q.startswith(prefix) for prefix in ["what is", "what are", "define", "explain "]):
             return "definition"
         if any(k in q for k in ["compare", "difference between", "vs ", "versus"]):
@@ -224,6 +226,67 @@ class HybridRetriever:
 
         return bonus
 
+    def _architecture_bonus(self, chunk: RetrievedChunk, core_terms: list) -> int:
+        if not core_terms:
+            return 0
+        text = chunk.content.lower()
+        title = (chunk.metadata.get("title", "") or "").lower()
+        source = (chunk.metadata.get("source", "") or "").lower()
+        relation_terms = {
+            "routes", "route", "gateway", "request", "data flow", "stream", "streams",
+            "event", "events", "cache", "caches", "store", "stores", "writes",
+            "reads", "process", "processes", "monitor", "monitors", "pipeline",
+        }
+        bonus = 0
+        matched_terms = sum(1 for term in core_terms if term in text)
+        bonus += matched_terms * 6
+        if any(term in title for term in core_terms):
+            bonus += 10
+        if any(term in source for term in core_terms):
+            bonus += 3
+        relation_hits = sum(1 for term in relation_terms if term in text)
+        bonus += min(relation_hits, 6) * 4
+        if chunk.source_collection == "patterns":
+            bonus += 18
+        elif chunk.source_collection == "blogs":
+            bonus += 6
+        if matched_terms >= 2 and relation_hits >= 1:
+            bonus += 20
+        return bonus
+
+    def _is_ava_scoped_query(self, query_text: str) -> bool:
+        q = query_text.lower()
+        ava_markers = (
+            "ava", "your architecture", "your docker", "your containers",
+            "your ports", "your stack", "your models", "ava-agent",
+        )
+        return any(marker in q for marker in ava_markers)
+
+    def _is_ava_internal_chunk(self, chunk: RetrievedChunk) -> bool:
+        text = chunk.content.lower()
+        title = (chunk.metadata.get("title", "") or "").lower()
+        source = (chunk.metadata.get("source", "") or "").lower()
+        internal_markers = (
+            "ava request pipeline",
+            "ava-agent",
+            "flask/gunicorn",
+            "ollama host",
+            "phase5a_ingestor.py",
+            "devops-agent",
+            "knowledge_updater",
+            "port 5443",
+            "postgresql 15",
+            "hashicorp vault",
+            "open policy agent",
+        )
+        return any(marker in text or marker in title or marker in source for marker in internal_markers)
+
+    def _filter_architecture_chunks_for_query(self, chunks: list, query_text: str) -> list:
+        if self._is_ava_scoped_query(query_text):
+            return chunks
+        filtered = [chunk for chunk in chunks if not self._is_ava_internal_chunk(chunk)]
+        return filtered or chunks
+
     def query(
         self,
         query_text: str,
@@ -246,6 +309,8 @@ class HybridRetriever:
         blog_fetch_count = max(n_blogs, 20)
         if query_intent == "definition":
             blog_fetch_count = max(n_blogs, 8)
+        elif query_intent == "architecture":
+            blog_fetch_count = max(n_blogs, 12)
         blog_chunks = self._query_collection(
             self.blogs_collection, embedding, blog_fetch_count, "blogs"
         )
@@ -286,6 +351,34 @@ class HybridRetriever:
             patterns_chunks = self._query_collection(
                 self.patterns_collection, embedding, 2, "patterns"
             )
+        elif query_intent == "architecture":
+            patterns_chunks = self._query_collection(
+                self.patterns_collection, embedding, 8, "patterns"
+            )
+            architecture_seed_terms = core_terms[:8]
+            if architecture_seed_terms:
+                pattern_seeded = self._keyword_fetch(self.patterns_collection, architecture_seed_terms, limit=8)
+                blog_seeded = self._keyword_fetch(self.blogs_collection, architecture_seed_terms, limit=8)
+                seen = set()
+                merged_patterns = []
+                for chunk in pattern_seeded + patterns_chunks:
+                    key = chunk.content
+                    if key in seen:
+                        continue
+                    merged_patterns.append(chunk)
+                    seen.add(key)
+                patterns_chunks = merged_patterns
+                seen = set()
+                merged_blogs = []
+                for chunk in blog_seeded + blog_chunks:
+                    key = chunk.content
+                    if key in seen:
+                        continue
+                    merged_blogs.append(chunk)
+                    seen.add(key)
+                blog_chunks = merged_blogs
+            patterns_chunks = self._filter_architecture_chunks_for_query(patterns_chunks, query_text)
+            blog_chunks = self._filter_architecture_chunks_for_query(blog_chunks, query_text)
         else:
             patterns_chunks = self._query_collection(
                 self.patterns_collection, embedding, 4, "patterns"
@@ -295,6 +388,11 @@ class HybridRetriever:
         if query_intent == "definition":
             for chunk in all_chunks:
                 bonus = self._definition_bonus(chunk, query_text, core_terms)
+                if bonus:
+                    chunk.distance = max(0, chunk.distance - bonus)
+        elif query_intent == "architecture":
+            for chunk in policy_chunks + blog_chunks + patterns_chunks:
+                bonus = self._architecture_bonus(chunk, core_terms)
                 if bonus:
                     chunk.distance = max(0, chunk.distance - bonus)
 
@@ -307,6 +405,10 @@ class HybridRetriever:
         if query_intent == "definition":
             policy_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
             blog_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
+        elif query_intent == "architecture":
+            patterns_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
+            blog_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
+            policy_chunks.sort(key=lambda x: x.relevance_score, reverse=True)
 
         blog_chunks_filtered = [
             c for c in blog_chunks if c.relevance_score >= blog_min_relevance
@@ -322,9 +424,17 @@ class HybridRetriever:
         )
 
         if not format_for_llm:
+            if query_intent == "architecture":
+                return patterns_chunks + blog_chunks_filtered + policy_chunks + fixes_chunks
             return policy_chunks + blog_chunks_filtered + fixes_chunks + patterns_chunks
 
-        return self._format_context(policy_chunks, blog_chunks_filtered, fixes_chunks, patterns_chunks)
+        return self._format_context(
+            policy_chunks,
+            blog_chunks_filtered,
+            fixes_chunks,
+            patterns_chunks,
+            query_intent=query_intent,
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Phase 3: Context Assembly
@@ -403,9 +513,16 @@ class HybridRetriever:
         policy_chunks: list,
         blog_chunks: list,
         fixes_chunks: list = None,
-        patterns_chunks: list = None
+        patterns_chunks: list = None,
+        query_intent: str = "general",
     ) -> str:
         sections = []
+
+        if query_intent == "architecture" and patterns_chunks:
+            sections.append("### Infrastructure Patterns")
+            for i, chunk in enumerate(patterns_chunks, 1):
+                sections.append(f"\n[PT{i}] Relevance: {chunk.relevance_score:.0%}")
+                sections.append(chunk.content)
 
         if policy_chunks:
             sections.append("### Trusted Knowledge Base")
@@ -430,7 +547,7 @@ class HybridRetriever:
                 sections.append(f"\n[F{i}] Relevance: {chunk.relevance_score:.0%}")
                 sections.append(chunk.content)
 
-        if patterns_chunks:
+        if patterns_chunks and query_intent != "architecture":
             sections.append("\n### Infrastructure Patterns")
             for i, chunk in enumerate(patterns_chunks, 1):
                 sections.append(f"\n[PT{i}] Relevance: {chunk.relevance_score:.0%}")
