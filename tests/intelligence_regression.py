@@ -18,6 +18,9 @@ FUNCTIONS = {
     "_recall_chat_fact",
     "_get_recent_distinct_turns",
     "_summarize_topic",
+    "_topic_from_turn",
+    "_topic_signature",
+    "_response_summary",
     "_build_follow_up_response",
     "_json_only_requested",
     "_predict_heal_action",
@@ -29,6 +32,9 @@ FUNCTIONS = {
     "_repair_architecture_answer",
     "_extract_relevant_context_lines",
     "_build_diagram_grounding_block",
+    "_looks_like_mermaid_response",
+    "_build_grounded_mermaid_diagram",
+    "_repair_diagram_response",
     "_looks_like_invalid_json_wrapper",
     "_repair_definition_wrapper",
 }
@@ -38,6 +44,7 @@ CONSTANTS = {
     "_ENTITY_STOP_WORDS",
     "_INFRA_COMPONENTS",
     "_GENERIC_HALLUCINATION_TERMS",
+    "_KNOWN_DIAGRAM_TECH",
 }
 
 
@@ -145,6 +152,17 @@ def main():
     follow_up = ns["_build_follow_up_response"]("How is it different from the previous thing I asked?")
     check("follow up references latest topic", "readiness probe" in follow_up.lower())
     check("follow up references prior topic", "cluster name" in follow_up.lower())
+    check("response summary strips mermaid fence", ns["_response_summary"]("```mermaid\ngraph TD\nA-->B\n```\n\nGrounded explanation.") == "Grounded explanation.")
+
+    fake_db.queries = [
+        {"query": "Create a mermaid diagram of your Docker architecture.", "response": "```mermaid\ngraph LR\nA[ava-agent]-->B[Redis]\n```\n\nAVA uses Redis and Vault.", "intent": "architecture"},
+        {"query": "How is it different from the previous thing I asked?", "response": "topic compare", "intent": "follow_up"},
+        {"query": "What is the difference between readiness probe and liveness probe?", "response": "Readiness probe checks if a container is ready. Liveness probe checks if it is healthy enough to keep running.", "intent": "definition"},
+    ]
+    distinct_turns = ns["_get_recent_distinct_turns"](limit=4)
+    check("distinct turns skip follow_up rows", len(distinct_turns) == 2)
+    architecture_signature = ns["_topic_signature"](distinct_turns[0])
+    check("topic signature prefers architecture entities", "redis" in architecture_signature and "vault" in architecture_signature)
 
     crash_response, crash_meta = ns["_build_healing_response"](
         "A pod nginx-deployment is in CrashLoopBackOff. Classify the issue type, confidence, command, risk level, rollback, and whether you would auto-execute or queue for approval."
@@ -173,6 +191,20 @@ def main():
     )
     check("diagram grounding mentions detected entities", "zuul" in grounding.lower())
     check("diagram grounding mentions kafka", "kafka" in grounding.lower())
+
+    mermaid = ns["_build_grounded_mermaid_diagram"](
+        ["Zuul handles API gateway traffic to Kafka", "Kafka carries events to Cassandra"],
+        ["Zuul", "Kafka", "Cassandra"],
+    )
+    check("grounded mermaid generated", mermaid.startswith("```mermaid"))
+    check("grounded mermaid keeps entities", "Zuul" in mermaid and "Kafka" in mermaid)
+
+    repaired_diagram = ns["_repair_diagram_response"](
+        "Zuul routes requests to Kafka.",
+        ["Zuul routes requests to Kafka", "Kafka stores events in Cassandra"],
+        ["Zuul", "Kafka", "Cassandra"],
+    )
+    check("diagram repair returns mermaid", ns["_looks_like_mermaid_response"](repaired_diagram) is True)
 
     hallucinations = ns["_hallucination_terms"](
         "This uses frontend, backend, and event sourcing heavily.",

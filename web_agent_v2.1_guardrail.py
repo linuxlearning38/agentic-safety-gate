@@ -377,7 +377,8 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
         entities = _extract_query_entities(query)
 
         # ava_self: exact system facts first, then patterns, minimal policy, no blogs
-        if query_intent == "ava_self":
+        _self_architecture = query_intent == "architecture" and any(term in query.lower() for term in ["your ", "you ", "ava", "yourself"])
+        if query_intent == "ava_self" or _self_architecture:
             about = _get_about_data()
             c = about["containers"]
             m = about["models"]
@@ -577,32 +578,62 @@ def _fact_aliases(label):
     return {alias.strip("_") for alias in aliases if alias.strip("_")}
 
 def _extract_query_entities(query):
-    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-:/+.]{2,}", query)
-    entities = []
+    query = _normalize_text(query)
     lower_query = query.lower()
-    for component in _INFRA_COMPONENTS:
-        if component in lower_query:
-            entities.append(component)
+    tech_terms = sorted({
+        *_INFRA_COMPONENTS,
+        *_KNOWN_DIAGRAM_TECH,
+        "crashloopbackoff", "oomkilled", "readiness probe", "liveness probe",
+        "api gateway", "load balancer",
+    }, key=len, reverse=True)
+
+    entities = []
+    seen = set()
+
+    def add_entity(value):
+        cleaned = _normalize_text(value).strip(' .,:;`"\'')
+        lower = cleaned.lower()
+        if not cleaned or lower in _ENTITY_STOP_WORDS or len(lower) < 2:
+            return
+        if lower not in seen:
+            seen.add(lower)
+            entities.append(cleaned)
+
+    for match in re.findall(r'[`"\']([^`"\']{2,60})[`"\']', query):
+        add_entity(match)
+
+    for term in tech_terms:
+        if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", lower_query):
+            add_entity(term)
+
+    tokens = re.findall(r"[A-Za-z][A-Za-z0-9_\-:/+.]{2,}", query)
+    important_tokens = {
+        "kafka", "zuul", "cassandra", "evcache", "nginx", "kubernetes",
+        "docker", "redis", "postgres", "vault", "opa", "oomkilled",
+        "crashloopbackoff", "readiness", "liveness", "probe", "samza",
+        "mantis", "netty", "eureka", "hystrix", "argocd", "grafana",
+        "prometheus", "terraform", "jenkins", "consul", "envoy", "istio",
+    }
+    noisy_terms = {
+        "diagram", "architecture", "request", "flow", "data", "component",
+        "components", "sequence", "topology", "question", "difference",
+        "previous", "thing", "asked", "latest", "recent", "compare",
+        "create", "draw", "make", "render", "explain",
+    }
     for token in tokens:
         lower = token.lower()
-        if lower in _ENTITY_STOP_WORDS:
+        if lower in _ENTITY_STOP_WORDS or lower in noisy_terms:
             continue
-        if any(ch.isupper() for ch in token) or "-" in token or lower in {
-            "kafka", "zuul", "cassandra", "evcache", "nginx", "kubernetes",
-            "docker", "redis", "postgres", "vault", "opa", "oomkilled",
-            "crashloopbackoff", "readiness", "liveness", "probe",
-        }:
-            entities.append(token)
-        elif len(token) >= 5:
-            entities.append(token)
-    deduped = []
-    seen = set()
-    for entity in entities:
-        key = entity.lower()
-        if key not in seen:
-            seen.add(key)
-            deduped.append(entity)
-    return deduped[:8]
+        if (
+            any(ch.isupper() for ch in token)
+            or "-" in token
+            or "/" in token
+            or any(ch.isdigit() for ch in token)
+            or lower in important_tokens
+        ):
+            add_entity(token)
+
+    return entities[:10]
 
 def _diagram_entities_from_text(*texts):
     combined = "\n".join(_normalize_text(text) for text in texts if text)
@@ -660,6 +691,7 @@ def _build_diagram_grounding_block(question, context_blocks, extracted_entities)
         "- Use only components visible in the diagram analysis or supported by retrieved context.",
         "- Do not introduce technologies that are not grounded.",
         "- Explain request flow and data flow only when grounded by the input/context.",
+        "- Preserve the exact grounded component names in the final answer.",
     ]
     if extracted_entities:
         lines.append("Diagram entities detected: " + ", ".join(extracted_entities))
@@ -668,6 +700,82 @@ def _build_diagram_grounding_block(question, context_blocks, extracted_entities)
         relevant = _extract_relevant_context_lines(context_blocks, extracted_entities, limit=10)
         lines.extend(f"- {line}" for line in relevant[:10])
     return "\n".join(lines)
+
+
+def _looks_like_mermaid_response(response_text):
+    text = _normalize_text(response_text).strip()
+    return text.startswith("```mermaid") or text.startswith("graph TD") or text.startswith("graph LR")
+
+
+def _build_grounded_mermaid_diagram(context_blocks, entities):
+    if not entities:
+        return None
+
+    unique_entities = []
+    seen = set()
+    for entity in entities:
+        lower = entity.lower()
+        if lower not in seen:
+            seen.add(lower)
+            unique_entities.append(entity)
+    unique_entities = unique_entities[:6]
+    if not unique_entities:
+        return None
+
+    node_ids = {entity.lower(): f"N{idx}" for idx, entity in enumerate(unique_entities, start=1)}
+    lines = ["```mermaid", "graph TD"]
+    for entity in unique_entities:
+        safe_label = entity.replace('"', "'")
+        lines.append(f'    {node_ids[entity.lower()]}["{safe_label}"]')
+
+    relation_terms = [
+        "handles", "routes", "calls", "uses", "writes", "stores",
+        "publishes", "sends", "reads", "connects", "proxies",
+        "feeds", "triggers", "loads", "carries",
+    ]
+    added_edges = set()
+    relevant_lines = _extract_relevant_context_lines(context_blocks, unique_entities, limit=12)
+    for line in relevant_lines:
+        lower = line.lower()
+        present = [entity for entity in unique_entities if entity.lower() in lower]
+        if len(present) < 2:
+            continue
+        left, right = present[0], present[1]
+        relation = "flows to"
+        for term in relation_terms:
+            if term in lower:
+                relation = term
+                break
+        edge_key = (left.lower(), right.lower(), relation)
+        if edge_key in added_edges:
+            continue
+        added_edges.add(edge_key)
+        lines.append(
+            f'    {node_ids[left.lower()]} -- "{relation}" --> {node_ids[right.lower()]}'
+        )
+
+    if not added_edges and len(unique_entities) >= 2:
+        for left, right in zip(unique_entities, unique_entities[1:]):
+            lines.append(
+                f'    {node_ids[left.lower()]} -- "flows to" --> {node_ids[right.lower()]}'
+            )
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def _repair_diagram_response(response_text, context_blocks, entities):
+    text = _normalize_text(response_text).strip()
+    if not text:
+        return _build_grounded_mermaid_diagram(context_blocks, entities) or text
+    if text.startswith("```mermaid"):
+        return text
+    if text.startswith("graph TD") or text.startswith("graph LR"):
+        return f"```mermaid\n{text}\n```"
+    grounded = _build_grounded_mermaid_diagram(context_blocks, entities)
+    if grounded:
+        return grounded + "\n\nGrounded from detected components only."
+    return text
 
 def _needs_strict_grounding(query_intent, query):
     if query_intent in {"ava_self", "healing_incident", "follow_up", "memory_recall", "memory_store", "architecture"}:
@@ -678,6 +786,13 @@ def _needs_strict_grounding(query_intent, query):
 def _extract_relevant_context_lines(context_blocks, entities, limit=8):
     if not context_blocks:
         return []
+
+    relation_terms = {
+        "handles", "routes", "calls", "uses", "writes", "stores", "publishes",
+        "sends", "reads", "connects", "proxies", "feeds", "triggers",
+        "loads", "carries", "behind", "through", "via",
+    }
+
     if not entities:
         lines = []
         for block in context_blocks[:3]:
@@ -689,17 +804,30 @@ def _extract_relevant_context_lines(context_blocks, entities, limit=8):
                     return lines
         return lines
 
-    matches = []
+    scored = []
     for block in context_blocks:
         for line in block.splitlines():
             cleaned = line.strip(" -\t")
             if not cleaned:
                 continue
             lower = cleaned.lower()
-            if any(entity.lower() in lower for entity in entities):
-                matches.append(cleaned)
-            if len(matches) >= limit:
-                return matches
+            match_count = sum(1 for entity in entities if entity.lower() in lower)
+            if not match_count:
+                continue
+            relation_score = sum(1 for term in relation_terms if term in lower)
+            scored.append((match_count, relation_score, len(cleaned), cleaned))
+
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    matches = []
+    seen = set()
+    for _, _, _, cleaned in scored:
+        lower = cleaned.lower()
+        if lower in seen:
+            continue
+        seen.add(lower)
+        matches.append(cleaned)
+        if len(matches) >= limit:
+            break
     return matches
 
 def _build_grounding_block(query, context_blocks, query_intent):
@@ -719,10 +847,13 @@ def _grounding_confident_enough(query, context_blocks, confidence):
     if confidence == "high":
         return True
     entities = _extract_query_entities(query)
+    matched_lines = _extract_relevant_context_lines(context_blocks, entities)
+    q = query.lower()
+    if any(term in q for term in ["diagram", "architecture", "request flow", "data flow", "components"]):
+        return bool(matched_lines) and (bool(entities) or confidence in {"medium", "high"})
     if not entities:
         return confidence in {"medium", "high"} and bool(context_blocks)
-    matched_lines = _extract_relevant_context_lines(context_blocks, entities)
-    return len(matched_lines) >= 2
+    return len(matched_lines) >= 2 or (confidence == "medium" and len(matched_lines) >= 1 and len(entities) <= 3)
 
 def _load_chat_facts():
     return db.get_memory(_MEMORY_FACT_KEY, {}) or {}
@@ -810,9 +941,14 @@ def _get_recent_prior_messages(n=4):
         prior_messages.append({"role": "assistant", "content": _normalize_text(row.get("response"))})
     return prior_messages
 
+def _topic_signature(turn):
+    topic = _normalize_text(_topic_from_turn(turn)).lower()
+    return re.sub(r'[^a-z0-9]+', ' ', topic).strip()
+
 def _get_recent_distinct_turns(limit=6):
-    rows = db.get_recent_queries(n=limit * 2)
+    rows = db.get_recent_queries(n=limit * 3)
     useful = []
+    seen_signatures = set()
     for row in reversed(rows):
         query = _normalize_text(row.get("query")).strip()
         if not query:
@@ -820,20 +956,55 @@ def _get_recent_distinct_turns(limit=6):
         intent = _normalize_text(row.get("intent")).strip().lower()
         if intent == "follow_up":
             continue
-        useful.append({
+        turn = {
             "query": query,
             "response": _normalize_text(row.get("response")).strip(),
             "intent": intent,
-        })
+        }
+        signature = _topic_signature(turn)
+        if signature and signature in seen_signatures:
+            continue
+        if signature:
+            seen_signatures.add(signature)
+        useful.append(turn)
         if len(useful) >= limit:
             break
     return list(reversed(useful))
 
 def _summarize_topic(query):
-    cleaned = _normalize_text(query).strip()
+    cleaned = _normalize_text(query).strip().rstrip("?.!")
     if not cleaned:
         return "an earlier topic"
+    entities = _extract_query_entities(cleaned)
+    if entities:
+        if len(entities) == 1:
+            return entities[0]
+        if len(entities) == 2:
+            return f"{entities[0]} and {entities[1]}"
+        return ", ".join(entities[:3])
+    cleaned = re.sub(r"^(what is|what are|how is|how does|how do|explain|describe|tell me about|show me)\s+", "", cleaned, flags=re.IGNORECASE)
     return cleaned[0].lower() + cleaned[1:] if len(cleaned) > 1 else cleaned.lower()
+
+def _topic_from_turn(turn):
+    query = _normalize_text(turn.get("query"))
+    response = _normalize_text(turn.get("response"))
+    intent = _normalize_text(turn.get("intent")).lower()
+    if intent == "architecture" or "```mermaid" in response:
+        entities = _diagram_entities_from_text(response)
+        if entities:
+            return ", ".join(entities[:3])
+    return _summarize_topic(query)
+
+def _response_summary(response_text):
+    response_text = _normalize_text(response_text).strip()
+    if not response_text:
+        return ""
+    if "```mermaid" in response_text:
+        cleaned = re.sub(r"```mermaid.*?```", "", response_text, flags=re.S).strip()
+        if cleaned:
+            return cleaned.split("\n", 1)[0].strip()
+        return "A grounded Mermaid diagram of the architecture."
+    return response_text.split("\n", 1)[0].strip()
 
 def _build_follow_up_response(query):
     recent = _get_recent_distinct_turns(limit=4)
@@ -844,24 +1015,33 @@ def _build_follow_up_response(query):
     previous_turn = recent[-2] if len(recent) >= 2 else None
     last_query = _normalize_text(last_turn.get("query"))
     last_response = _normalize_text(last_turn.get("response"))
+    last_topic = _topic_from_turn(last_turn)
+    last_answer_summary = _response_summary(last_response) or last_response
 
     q = query.lower().strip()
     if "previous thing" in q or "previous question" in q:
         if previous_turn:
             previous_query = _normalize_text(previous_turn.get("query"))
+            previous_topic = _topic_from_turn(previous_turn)
+            if previous_topic == last_topic:
+                return (
+                    f"Your recent questions stayed on the same topic: {last_topic}.\n\n"
+                    f"The latest answer summary was: {last_answer_summary}"
+                )
             return (
-                f"Your previous question was about {_summarize_topic(last_query)}.\n\n"
-                f"The question before that was about {_summarize_topic(previous_query)}.\n\n"
-                f"So this one is different because it focuses on {_summarize_topic(last_query)}, whereas the earlier one focused on {_summarize_topic(previous_query)}."
+                f"Your most recent topic was {last_topic}.\n\n"
+                f"The topic before that was {previous_topic}.\n\n"
+                f"They differ because the latest turn focused on {last_topic}, while the earlier turn focused on {previous_topic}.\n\n"
+                f"Latest answer summary: {last_answer_summary}"
             )
         return (
-            f"Your most recent previous question was about {_summarize_topic(last_query)}.\n\n"
-            f"The answer to that was:\n{last_response}"
+            f"Your most recent previous question was about {last_topic}.\n\n"
+            f"Latest answer summary: {last_answer_summary}"
         )
 
     return (
-        f"Your most recent previous question was: {last_query}\n\n"
-        f"The answer to that was:\n{last_response}"
+        f"Your most recent previous question was about {last_topic}.\n\n"
+        f"Latest answer summary: {last_answer_summary}"
     )
 
 def _looks_like_invalid_json_wrapper(response_text):
@@ -1241,7 +1421,11 @@ def generate_response(query, context, confidence=None, prior_messages=None):
         )
         answer = response["message"]["content"]
         if query_intent == "architecture":
-            if _hallucination_terms(answer, extracted_entities):
+            if wants_diagram:
+                answer = _repair_diagram_response(answer, context or [], extracted_entities)
+            elif _hallucination_terms(answer, extracted_entities):
+                answer = _repair_architecture_answer(answer, extracted_entities)
+            elif extracted_entities and not any(entity.lower() in answer.lower() for entity in extracted_entities[:2]):
                 answer = _repair_architecture_answer(answer, extracted_entities)
         prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
         return prefix + answer if prefix else answer
