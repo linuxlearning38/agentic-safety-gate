@@ -22,6 +22,7 @@ certs/
 query_history.json
 users.json
 financial_report.json
+quality_auditor_report.json
 
 # Logs
 *.log
@@ -36,6 +37,7 @@ archive/
 postgres_data/
 redis_data/
 *.sqlite3
+*.db
 chromadb/
 chroma_db/
 
