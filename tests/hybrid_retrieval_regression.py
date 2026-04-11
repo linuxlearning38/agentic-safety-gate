@@ -18,6 +18,7 @@ def load_retriever():
         "field": field,
         "Optional": Optional,
         "logging": logging,
+        "logger": logging.getLogger("hybrid_retrieval_test"),
         "re": re,
         "time": time,
         "RetrievedChunk": None,
@@ -40,6 +41,10 @@ class DummyChunk:
     @property
     def relevance_score(self):
         return round(1.0 / (1.0 + self.distance), 4)
+
+    @property
+    def source_label(self):
+        return self.metadata.get("source", self.source_collection)
 
 
 class RetrievedChunk(DummyChunk):
@@ -111,6 +116,25 @@ def main():
         query_intent="architecture",
     )
     check("architecture context starts with patterns section", formatted.startswith("### Infrastructure Patterns"))
+    assembled = retriever.assemble_context(
+        [
+            DummyChunk(
+                content="SUMMARY: Kafka is the event backbone.",
+                source_collection="blogs",
+                distance=1.0,
+                metadata={"url": "https://example.com/kafka", "source": "example", "title": "Kafka"},
+            ),
+            DummyChunk(
+                content="REQUEST FLOW: Zuul routes requests to services.",
+                source_collection="blogs",
+                distance=1.1,
+                metadata={"url": "https://example.com/kafka", "source": "example", "title": "Kafka"},
+            ),
+        ],
+        max_articles=1,
+        max_chunks_per_article=2,
+    )
+    check("assemble_context strips section labels", "SUMMARY:" not in assembled[0] and "REQUEST FLOW:" not in assembled[0])
 
     print("\nHybrid retrieval regression tests passed.")
 

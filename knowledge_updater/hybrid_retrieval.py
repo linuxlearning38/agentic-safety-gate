@@ -483,7 +483,7 @@ class HybridRetriever:
                     "label": chunk.source_label,
                     "score": chunk.relevance_score
                 }
-            grouped[url]["parts"].append(chunk.content)
+            grouped[url]["parts"].append(self._strip_section_labels(chunk.content))
 
         # Build merged blocks, best-scoring articles first
         sorted_groups = sorted(
