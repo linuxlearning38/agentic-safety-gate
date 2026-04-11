@@ -1112,8 +1112,6 @@ def _filter_architecture_chunks(raw_chunks, entities):
     for chunk in raw_chunks:
         content = _normalize_text(getattr(chunk, "content", ""))
         lower = content.lower()
-        if _is_noisy_architecture_line(content):
-            continue
         entity_hits = sum(1 for entity in entities if entity.lower() in lower)
         relation_hits = sum(1 for term in relation_terms if term in lower)
         if entity_hits >= 2 or (entity_hits >= 1 and relation_hits >= 1):
