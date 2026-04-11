@@ -476,7 +476,7 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
                     assembled = [_build_grounding_block(query, assembled, query_intent)] + assembled
                 logger.info(f"Context assembly: {len(raw_chunks)} chunks -> {len(assembled)} merged blocks")
                 return assembled
-            raw_docs = [chunk.content for chunk in raw_chunks]
+            raw_docs = [hybrid_retriever._strip_section_labels(chunk.content) for chunk in raw_chunks]
             if _needs_strict_grounding(query_intent, query):
                 raw_docs = [_build_grounding_block(query, raw_docs, query_intent)] + raw_docs
             return raw_docs
@@ -541,6 +541,38 @@ def _normalize_text(value):
         except Exception:
             return str(value)
     return str(value)
+
+def _normalize_user_query(query):
+    text = _normalize_text(query).strip()
+    if not text:
+        return ""
+    # Strip repeated list, outline, and punctuation-heavy prefixes such as:
+    # "1. ", "2) ", "2.1.2. ", "a.b.c. ", "--- ", or mixed copied numbering junk.
+    patterns = [
+        r'^(?:(?:\s*[\[\(]?\d+(?:\.\d+)*[\]\)]?[\.\):-]*\s*)+)',
+        r'^(?:(?:\s*[a-zA-Z](?:\.[a-zA-Z0-9]+)*[\.\):-]+\s*)+)',
+        r'^(?:\s*[-_=:#*~`|\\/]+\s*)+',
+        r'^(?:\s*(?:\d+[a-zA-Z]?|[a-zA-Z]{1,3})[-_=]+\s*)+',
+    ]
+    previous = None
+    while text and text != previous:
+        previous = text
+        for pattern in patterns:
+            text = re.sub(pattern, '', text).strip()
+    # If the query still contains a question trigger later in the string, trim to it.
+    question_markers = [
+        "what ", "which ", "how ", "why ", "when ", "where ",
+        "explain ", "compare ", "define ", "remember ", "draw ",
+        "create ", "show ", "tell ", "is ", "are ",
+    ]
+    lower = text.lower()
+    starts_with_marker = any(lower.startswith(marker) for marker in question_markers)
+    positions = [lower.find(marker) for marker in question_markers if lower.find(marker) > 0]
+    if positions and not starts_with_marker:
+        candidate = text[min(positions):].strip()
+        if len(candidate.split()) >= 2:
+            text = candidate
+    return text.strip()
 
 def _chat_payload(response_text="", response_type="knowledge", ok=True, confidence=None,
                   sources_used=0, time_taken="", **extra):
@@ -773,6 +805,30 @@ def _build_grounded_architecture_answer(context_blocks, entities):
         if any(term in lower for term in request_terms) and line not in request_flow:
             request_flow.append(line)
         if any(term in lower for term in data_terms) and line not in data_flow:
+            data_flow.append(line)
+
+    entity_fact_lower = {entity.lower(): fact for entity, fact in entity_facts.items()}
+    synthesized_request = []
+    synthesized_data = []
+    if "zuul" in entity_fact_lower:
+        synthesized_request.append("Zuul sits at the edge and routes incoming requests to backend services.")
+    if "kafka" in entity_fact_lower:
+        synthesized_request.append("After synchronous request handling, services publish domain events into Kafka for downstream asynchronous work.")
+        synthesized_data.append("Kafka acts as the durable event backbone between producers and downstream consumers.")
+    if "samza" in entity_fact_lower:
+        synthesized_data.append("Samza consumes stream data, processes it, and emits derived outputs or aggregates.")
+    if "cassandra" in entity_fact_lower:
+        synthesized_data.append("Cassandra stores durable distributed state for serving and downstream systems.")
+    if "evcache" in entity_fact_lower:
+        synthesized_data.append("EVCache serves hot reads to reduce latency in front of durable stores.")
+    if "mantis" in entity_fact_lower:
+        synthesized_data.append("Mantis processes or observes streaming data outside the direct end-user request path.")
+
+    for line in synthesized_request:
+        if line not in request_flow:
+            request_flow.append(line)
+    for line in synthesized_data:
+        if line not in data_flow:
             data_flow.append(line)
 
     component_lines = []
@@ -1185,6 +1241,7 @@ def _parse_memory_statement(statement):
     return None
 
 def _extract_memory_request(query):
+    query = _normalize_user_query(query)
     m = re.match(
         r"\s*remember(?: this)?(?: exactly)?\s*:\s*(.+?)(?:[.?!]\s*(what.+))?\s*$",
         query,
@@ -1199,6 +1256,7 @@ def _extract_memory_request(query):
     return {"fact": fact, "follow_up": follow_up}
 
 def _extract_recall_label(query):
+    query = _normalize_user_query(query)
     patterns = [
         r"what is my (.+?)[\?]?$",
         r"what's my (.+?)[\?]?$",
@@ -1484,8 +1542,10 @@ def _build_healing_response(query):
     return response_text, body
 
 def detect_query_intent(query):
-    q = query.lower().strip()
+    q = _normalize_user_query(query).lower().strip()
     if q.startswith("remember this"):
+        return "memory_store"
+    if q.startswith("remember:") or q.startswith("remember "):
         return "memory_store"
     if _extract_recall_label(q):
         return "memory_recall"
@@ -2242,8 +2302,7 @@ def ask():
     start_time = time.time()
     try:
         data = request.json
-        query = data.get('query', '').strip()
-        query = re.sub(r'^\s*\d+[\.\)]\s*', '', query).strip()
+        query = _normalize_user_query(data.get('query', ''))
 
         if not query:
             return jsonify({'error': 'No query provided'}), 400

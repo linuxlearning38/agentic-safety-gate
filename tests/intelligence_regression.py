@@ -9,6 +9,7 @@ SOURCE = Path(__file__).resolve().parents[1] / "web_agent_v2.1_guardrail.py"
 
 FUNCTIONS = {
     "_normalize_text",
+    "_normalize_user_query",
     "_normalize_fact_key",
     "_canonical_fact_label",
     "_fact_aliases",
@@ -160,6 +161,10 @@ def main():
         "memory request parse plain remember",
         ns["_extract_memory_request"]("Remember: server=prod-india-01")["fact"]["label"] == "server",
     )
+    cleaned_query = ns["_normalize_user_query"]("2. 1. what models are you running?")
+    check("numbered query prefixes strip repeatedly", cleaned_query == "what models are you running?")
+    noisy_query = ns["_normalize_user_query"]("1.2.4.a.b.c.d.e.---a-b-44-4-4-4-4-4-= what models are you running?")
+    check("noisy query prefixes strip aggressively", noisy_query == "what models are you running?")
     saved_server = ns["_save_chat_fact"]("server", "prod-india-01")
     check("memory label canonicalized", saved_server["label"] == "server name")
     check(
@@ -345,6 +350,17 @@ def main():
     check("grounded architecture answer has request flow", "**Request Flow:**" in grounded_arch and "Zuul routes API requests" in grounded_arch)
     check("grounded architecture answer has data flow", "**Data Flow:**" in grounded_arch and "Kafka carries playback events" in grounded_arch)
     check("grounded architecture answer filters noise", "terraform init" not in grounded_arch and "Entities detected" not in grounded_arch and "kafka_consumer_lag" not in grounded_arch and "feature flags" not in grounded_arch and "Kafka Design Overview" not in grounded_arch)
+    sparse_arch = ns["_build_grounded_architecture_answer"](
+        [
+            "Zuul is the front door for requests from devices and web sites to backend services.",
+            "Kafka is a distributed event streaming platform for producers and consumers.",
+            "Cassandra is a distributed NoSQL database for low-latency serving state.",
+            "EVCache is a replicated cache for hot reads.",
+        ],
+        ["Zuul", "Kafka", "Cassandra", "EVCache"],
+    )
+    check("sparse architecture answer synthesizes request flow", "Zuul sits at the edge" in sparse_arch and "publish domain events into Kafka" in sparse_arch)
+    check("sparse architecture answer synthesizes data flow", "durable event backbone" in sparse_arch and "hot reads" in sparse_arch)
     ava_self_models = ns["_answer_ava_self_query"](
         "What models are you running?",
         about={
