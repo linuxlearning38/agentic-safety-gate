@@ -2243,6 +2243,7 @@ def ask():
     try:
         data = request.json
         query = data.get('query', '').strip()
+        query = re.sub(r'^\s*\d+[\.\)]\s*', '', query).strip()
 
         if not query:
             return jsonify({'error': 'No query provided'}), 400

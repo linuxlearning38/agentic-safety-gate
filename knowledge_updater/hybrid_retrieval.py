@@ -508,6 +508,16 @@ class HybridRetriever:
         )
         return merged
 
+    _SECTION_LABEL_RE = re.compile(
+        r'^(SUMMARY|REQUEST FLOW|ARCHITECTURE NOTES):\s*',
+        re.MULTILINE | re.IGNORECASE,
+    )
+
+    def _strip_section_labels(self, text: str) -> str:
+        """Remove structural doc labels (SUMMARY:, REQUEST FLOW:, ARCHITECTURE NOTES:)
+        from chunk content so they don't bleed into LLM answers."""
+        return self._SECTION_LABEL_RE.sub('', text)
+
     def _format_context(
         self,
         policy_chunks: list,
@@ -522,13 +532,13 @@ class HybridRetriever:
             sections.append("### Infrastructure Patterns")
             for i, chunk in enumerate(patterns_chunks, 1):
                 sections.append(f"\n[PT{i}] Relevance: {chunk.relevance_score:.0%}")
-                sections.append(chunk.content)
+                sections.append(self._strip_section_labels(chunk.content))
 
         if policy_chunks:
             sections.append("### Trusted Knowledge Base")
             for i, chunk in enumerate(policy_chunks, 1):
                 sections.append(f"\n[P{i}] Relevance: {chunk.relevance_score:.0%}")
-                sections.append(chunk.content)
+                sections.append(self._strip_section_labels(chunk.content))
 
         if blog_chunks:
             sections.append("\n### Engineering Blog Context")
@@ -539,19 +549,19 @@ class HybridRetriever:
                 sections.append(
                     f"\n[B{i}] {source} — '{title}' | {pub} | Relevance: {chunk.relevance_score:.0%}"
                 )
-                sections.append(chunk.content)
+                sections.append(self._strip_section_labels(chunk.content))
 
         if fixes_chunks:
             sections.append("\n### Known Fixes & Solutions")
             for i, chunk in enumerate(fixes_chunks, 1):
                 sections.append(f"\n[F{i}] Relevance: {chunk.relevance_score:.0%}")
-                sections.append(chunk.content)
+                sections.append(self._strip_section_labels(chunk.content))
 
         if patterns_chunks and query_intent != "architecture":
             sections.append("\n### Infrastructure Patterns")
             for i, chunk in enumerate(patterns_chunks, 1):
                 sections.append(f"\n[PT{i}] Relevance: {chunk.relevance_score:.0%}")
-                sections.append(chunk.content)
+                sections.append(self._strip_section_labels(chunk.content))
 
         return "\n".join(sections)
 
