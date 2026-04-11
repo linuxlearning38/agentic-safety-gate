@@ -50,3 +50,4 @@ Thumbs.db
 scan_output.txt
 security_audit.json
 docs/
+.env
