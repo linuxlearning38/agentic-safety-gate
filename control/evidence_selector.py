@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import re
 
 
 @dataclass
@@ -9,6 +10,81 @@ class EvidencePacket:
     facts: dict
     entities: list[str] = field(default_factory=list)
     evidence_blocks: list[str] = field(default_factory=list)
+
+
+ARCHITECTURE_RELATION_TERMS = {
+    "route", "routes", "routing", "gateway", "front door", "edge",
+    "request", "requests", "service", "services", "publish", "publishes",
+    "consume", "consumes", "stream", "streams", "event", "events",
+    "cache", "caches", "store", "stores", "read", "reads", "write", "writes",
+    "process", "processes", "serve", "serves", "backend", "flow", "fan-out",
+    "transport", "serving", "pipeline",
+}
+
+ARCHITECTURE_NOISE_MARKERS = (
+    "queue depth", "consumer lag", "redis_blocked_clients", "kafka_consumer_lag",
+    "slo:", "example:", "alert:", "checklist", "terraform init", "curl ",
+    "kubectl ", "helm ", "latency:", "error rate", "30-day rolling",
+)
+
+
+def _strip_architecture_labels(text: str) -> str:
+    return re.sub(
+        r"(?im)^\s*(SUMMARY|REQUEST FLOW|ARCHITECTURE NOTES|ARCHITECTURE REFERENCE):\s*",
+        "",
+        text or "",
+    )
+
+
+def _is_noisy_architecture_line(line: str) -> bool:
+    lower = (line or "").strip().lower()
+    if not lower:
+        return True
+    if lower.startswith("#"):
+        return True
+    if any(marker in lower for marker in ARCHITECTURE_NOISE_MARKERS):
+        return True
+    if re.search(r"\b[a-z]+_[a-z0-9_]+\b", lower) and not any(
+        term in lower for term in ("gateway", "stream", "cache", "store", "event", "request", "route", "process")
+    ):
+        return True
+    return False
+
+
+def _extract_architecture_lines(text: str) -> list[str]:
+    lines = []
+    for raw_line in _strip_architecture_labels(text).splitlines():
+        line = raw_line.strip(" -*\t")
+        if _is_noisy_architecture_line(line):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _architecture_line_score(line: str, entities: list[str], self_runtime: bool = False) -> int:
+    lower = line.lower()
+    entity_hits = sum(1 for entity in entities if entity.lower() in lower)
+    relation_hits = sum(1 for term in ARCHITECTURE_RELATION_TERMS if term in lower)
+    if self_runtime and "ava-agent" in lower:
+        entity_hits += 1
+    return entity_hits * 4 + relation_hits * 2 + min(len(line) // 80, 2)
+
+
+def _runtime_architecture_blocks(about: dict) -> tuple[list[str], list[str]]:
+    containers = about.get("containers", {})
+    models = about.get("models", {})
+    blocks = [
+        "ava-agent serves requests through Flask/Gunicorn on port 5443.",
+        "ava-agent reads and writes relational data in PostgreSQL on port 5432.",
+        "ava-agent uses Redis on port 6379 for fast state and caching.",
+        "ava-agent checks policy decisions with Open Policy Agent on port 8181.",
+        "ava-agent reads secrets from HashiCorp Vault on port 8200.",
+        f"ava-agent calls the Ollama host at {models.get('ollama_host', 'unknown')} for local model inference.",
+    ]
+    entities = list(containers.keys())
+    if models.get("ollama_host"):
+        entities.append("Ollama")
+    return blocks, entities
 
 
 def format_ava_self_facts_block(about: dict) -> str:
@@ -104,5 +180,67 @@ def select_troubleshooting_evidence(route, retrieved_chunks: list) -> EvidencePa
         normalized_query=route.normalized_query,
         facts=facts,
         entities=list(route.entities or []),
+        evidence_blocks=evidence_blocks,
+    )
+
+
+def select_architecture_evidence(route, retrieved_chunks: list, about: dict | None = None) -> EvidencePacket:
+    route_entities = list(route.entities or [])
+    if route.topic == "self_runtime" and about:
+        evidence_blocks, runtime_entities = _runtime_architecture_blocks(about)
+        facts = {
+            "topic": route.topic,
+            "response_mode": route.response_mode,
+            "sources": ["runtime_about"],
+        }
+        return EvidencePacket(
+            intent="architecture",
+            topic=route.topic or "external",
+            normalized_query=route.normalized_query,
+            facts=facts,
+            entities=route_entities or runtime_entities,
+            evidence_blocks=evidence_blocks,
+        )
+
+    scored_lines = []
+    for chunk in retrieved_chunks or []:
+        source_collection = getattr(chunk, "source_collection", "")
+        if source_collection not in {"patterns", "blogs", "policies", "fixes"}:
+            continue
+        text = getattr(chunk, "content", "") or ""
+        lines = _extract_architecture_lines(text)
+        for line in lines:
+            score = _architecture_line_score(line, route_entities)
+            lower = line.lower()
+            entity_hits = sum(1 for entity in route_entities if entity.lower() in lower)
+            relation_hits = sum(1 for term in ARCHITECTURE_RELATION_TERMS if term in lower)
+            if entity_hits >= 2 or (entity_hits >= 1 and relation_hits >= 1) or (not route_entities and relation_hits >= 2) or (len(route_entities) <= 1 and relation_hits >= 3):
+                scored_lines.append((score, line, source_collection))
+
+    scored_lines.sort(key=lambda item: (-item[0], len(item[1])))
+    evidence_blocks = []
+    evidence_sources = []
+    seen = set()
+    for _, line, source_collection in scored_lines:
+        lowered = line.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        evidence_blocks.append(line)
+        evidence_sources.append(source_collection)
+        if len(evidence_blocks) >= 8:
+            break
+
+    facts = {
+        "topic": route.topic or "external",
+        "response_mode": route.response_mode,
+        "sources": evidence_sources,
+    }
+    return EvidencePacket(
+        intent="architecture",
+        topic=route.topic or "external",
+        normalized_query=route.normalized_query,
+        facts=facts,
+        entities=route_entities,
         evidence_blocks=evidence_blocks,
     )
