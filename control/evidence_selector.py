@@ -25,6 +25,8 @@ ARCHITECTURE_NOISE_MARKERS = (
     "queue depth", "consumer lag", "redis_blocked_clients", "kafka_consumer_lag",
     "slo:", "example:", "alert:", "checklist", "terraform init", "curl ",
     "kubectl ", "helm ", "latency:", "error rate", "30-day rolling",
+    "when answering architecture questions", "answer template", "grounding rules",
+    "ava should", "stay narrow instead of", "instead of hallucinating",
 )
 
 
@@ -34,6 +36,15 @@ def _strip_architecture_labels(text: str) -> str:
         "",
         text or "",
     )
+
+
+def _strip_definition_markup(text: str) -> str:
+    cleaned = text or ""
+    cleaned = re.sub(r"(?is)<details>.*?</summary>", " ", cleaned)
+    cleaned = re.sub(r"(?is)</?[^>]+>", " ", cleaned)
+    cleaned = cleaned.replace("```", " ")
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    return cleaned.strip()
 
 
 def _is_noisy_architecture_line(line: str) -> bool:
@@ -51,10 +62,48 @@ def _is_noisy_architecture_line(line: str) -> bool:
     return False
 
 
+def _definition_line_score(line: str, target_entities: list[str], source_collection: str) -> int:
+    lower = line.lower()
+    score = 0
+    if source_collection == "patterns":
+        score += 8
+    if any(lower.startswith(prefix) for prefix in ("description:", "a ", "an ", "the ")):
+        score += 4
+    if " is a " in lower or " is an " in lower or " are " in lower:
+        score += 5
+    if "kubernetes" in lower:
+        score += 2
+    if any(entity.lower() in lower for entity in target_entities):
+        score += 6
+    if "<" in line or "details>" in lower or "summary>" in lower:
+        score -= 10
+    if "you can read more" in lower or "copy | explain" in lower:
+        score -= 8
+    return score
+
+
+def _pattern_definition_lines(text: str) -> list[str]:
+    candidates = []
+    for label in ("DESCRIPTION", "BENEFITS", "TRADEOFFS", "EXAMPLE"):
+        match = re.search(rf"(?im)^\s*{label}:\s*(.+)$", text or "")
+        if match:
+            candidates.append(match.group(1).strip())
+    return candidates
+
+
 def _extract_architecture_lines(text: str) -> list[str]:
     lines = []
     for raw_line in _strip_architecture_labels(text).splitlines():
         line = raw_line.strip(" -*\t")
+        line = re.sub(r"^\d+\.\s*", "", line)
+        line = re.sub(
+            r"^(PATTERN|CATEGORY|DESCRIPTION|BENEFITS|TRADEOFFS|EXAMPLE|IMPLEMENTATION|REFERENCE|SOURCE|SOURCE URL|Architecture role|Request flow|Data flow):\s*",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        ).strip()
+        if re.fullmatch(r"\d+\.", line):
+            continue
         if _is_noisy_architecture_line(line):
             continue
         lines.append(line)
@@ -314,13 +363,24 @@ def select_comparison_evidence(route, retrieved_chunks: list) -> EvidencePacket:
 
 def select_definition_evidence(route, retrieved_chunks: list) -> EvidencePacket:
     target_entities = [entity for entity in (route.entities or []) if entity]
-    evidence_blocks = []
+    pattern_lines = []
+    fallback_lines = []
     seen = set()
 
     for chunk in retrieved_chunks or []:
-        text = _strip_architecture_labels(getattr(chunk, "content", "") or "")
-        for raw_line in text.splitlines():
+        source_collection = getattr(chunk, "source_collection", "") or ""
+        raw_text = getattr(chunk, "content", "") or ""
+        if source_collection == "patterns":
+            chunk_lines = _pattern_definition_lines(raw_text)
+        else:
+            text = _strip_definition_markup(_strip_architecture_labels(raw_text))
+            chunk_lines = text.splitlines()
+        for raw_line in chunk_lines:
             line = raw_line.strip(" -*\t")
+            if not line:
+                continue
+            line = re.sub(r"^(PATTERN|CATEGORY|DESCRIPTION|BENEFITS|TRADEOFFS|EXAMPLE|IMPLEMENTATION|REFERENCE|SOURCE|SOURCE URL|Architecture role|Request flow|Data flow):\s*", "", line, flags=re.IGNORECASE)
+            line = line.strip()
             if not line:
                 continue
             lowered = line.lower()
@@ -331,9 +391,19 @@ def select_definition_evidence(route, retrieved_chunks: list) -> EvidencePacket:
             if target_entities and not any(entity.lower() in lowered for entity in target_entities):
                 continue
             seen.add(lowered)
-            evidence_blocks.append(line)
-            if len(evidence_blocks) >= 4:
-                break
+            score = _definition_line_score(line, target_entities, source_collection)
+            if score <= 0:
+                continue
+            if source_collection == "patterns":
+                pattern_lines.append((score, line))
+            else:
+                fallback_lines.append((score, line))
+
+    scored_lines = pattern_lines or fallback_lines
+    scored_lines.sort(key=lambda item: (-item[0], len(item[1])))
+    evidence_blocks = []
+    for _, line in scored_lines:
+        evidence_blocks.append(line)
         if len(evidence_blocks) >= 4:
             break
 
