@@ -334,3 +334,92 @@ def build_architecture_plan(route, evidence) -> AnswerPlan:
         entities=entities,
         confidence=confidence,
     )
+
+
+def build_follow_up_plan(route, evidence) -> AnswerPlan:
+    last_topic = evidence.facts.get("last_topic", "")
+    previous_topic = evidence.facts.get("previous_topic", "")
+    last_summary = evidence.facts.get("last_summary", "") or "I don't have a strong summary for the latest answer yet."
+    if not last_topic:
+        answer = "I don't have enough recent conversation context to answer that follow-up reliably."
+        confidence = "low"
+    elif previous_topic:
+        if previous_topic == last_topic:
+            answer = (
+                f"Your recent questions stayed on the same topic: {last_topic}.\n\n"
+                f"The latest answer summary was: {last_summary}"
+            )
+        else:
+            answer = (
+                f"Your most recent topic was {last_topic}.\n\n"
+                f"The topic before that was {previous_topic}.\n\n"
+                f"They differ because the latest turn focused on {last_topic}, while the earlier turn focused on {previous_topic}.\n\n"
+                f"Latest answer summary: {last_summary}"
+            )
+        confidence = "high"
+    else:
+        answer = (
+            f"Your most recent previous question was about {last_topic}.\n\n"
+            f"Latest answer summary: {last_summary}"
+        )
+        confidence = "medium"
+    return AnswerPlan(
+        intent="follow_up",
+        mode="deterministic",
+        topic="follow_up",
+        answer=answer,
+        evidence=evidence.facts,
+        entities=list(evidence.entities or []),
+        confidence=confidence,
+    )
+
+
+def build_comparison_plan(route, evidence) -> AnswerPlan:
+    targets = list(evidence.facts.get("targets") or route.comparison_targets or [])
+    collected = evidence.facts.get("collected") or {}
+    if len(targets) < 2:
+        answer = "I need two clear options to compare."
+        return AnswerPlan(
+            intent="comparison",
+            mode="deterministic",
+            topic="comparison",
+            answer=answer,
+            evidence=evidence.facts,
+            confidence="low",
+        )
+
+    left, right = targets[0], targets[1]
+    left_lines = collected.get(left.lower(), [])
+    right_lines = collected.get(right.lower(), [])
+
+    left_summary = left_lines[0] if left_lines else f"{left} is one of the options you asked to compare."
+    right_summary = right_lines[0] if right_lines else f"{right} is the other option you asked to compare."
+
+    choose_lines = []
+    if left_lines:
+        choose_lines.append(f"- Choose **{left}** when you want {left_lines[0].rstrip('.')}.")
+    if right_lines:
+        choose_lines.append(f"- Choose **{right}** when you want {right_lines[0].rstrip('.')}.")
+    if not choose_lines:
+        choose_lines = [
+            f"- Choose **{left}** when its operational trade-offs fit your rollout or reliability needs better.",
+            f"- Choose **{right}** when you want the other deployment or infrastructure trade-off.",
+        ]
+
+    answer = "\n".join([
+        f"**{left}:** {left_summary}",
+        f"**{right}:** {right_summary}",
+        "",
+        "**When to choose each:**",
+        *choose_lines,
+    ])
+    confidence = "high" if left_lines or right_lines else "medium"
+    return AnswerPlan(
+        intent="comparison",
+        mode="deterministic",
+        topic="comparison",
+        answer=answer,
+        evidence=evidence.facts,
+        entities=list(evidence.entities or []),
+        confidence=confidence,
+    )

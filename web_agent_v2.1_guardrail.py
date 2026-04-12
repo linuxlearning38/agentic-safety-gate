@@ -25,6 +25,8 @@ from control.input_router import route_query
 from control.evidence_selector import (
     select_ava_self_evidence,
     select_architecture_evidence,
+    select_comparison_evidence,
+    select_follow_up_evidence,
     select_memory_store_evidence,
     select_memory_recall_evidence,
     select_troubleshooting_evidence,
@@ -33,6 +35,8 @@ from control.evidence_selector import (
 from control.answer_planner import (
     build_ava_self_plan,
     build_architecture_plan,
+    build_comparison_plan,
+    build_follow_up_plan,
     build_memory_store_plan,
     build_memory_recall_plan,
     build_troubleshooting_plan,
@@ -639,6 +643,51 @@ def _resolve_architecture_response(query):
         "sources_used": len(evidence.evidence_blocks),
         "topic": plan.topic,
         "response_mode": route.response_mode,
+    }
+
+
+def _retrieve_comparison_chunks(query):
+    raw_chunks = hybrid_retriever.query(
+        query_text=query,
+        n_policies=4,
+        n_blogs=2,
+        blog_min_relevance=0.01,
+        format_for_llm=False,
+    )
+    cleaned = []
+    for chunk in raw_chunks or []:
+        if hasattr(chunk, "content"):
+            chunk.content = hybrid_retriever._strip_section_labels(getattr(chunk, "content", ""))
+        cleaned.append(chunk)
+    return cleaned
+
+
+def _resolve_follow_up_response(query):
+    route = _route_query(query)
+    if route.intent != "follow_up":
+        return None
+    recent_turns = _get_recent_distinct_turns(limit=4)
+    evidence = select_follow_up_evidence(route, recent_turns, _topic_from_turn, _response_summary)
+    plan = build_follow_up_plan(route, evidence)
+    return {
+        "response": compose_controlled_response(plan),
+        "confidence": plan.confidence,
+        "sources_used": len(recent_turns[:2]),
+        "topic": plan.topic,
+    }
+
+
+def _resolve_comparison_response(query):
+    route = _route_query(query)
+    if route.intent != "comparison":
+        return None
+    evidence = select_comparison_evidence(route, _retrieve_comparison_chunks(query))
+    plan = build_comparison_plan(route, evidence)
+    return {
+        "response": compose_controlled_response(plan),
+        "confidence": plan.confidence,
+        "sources_used": len(evidence.evidence_blocks),
+        "topic": plan.topic,
     }
 
 def _chat_payload(response_text="", response_type="knowledge", ok=True, confidence=None,
@@ -1611,10 +1660,8 @@ def _build_healing_response(query):
 def detect_query_intent(query):
     q = _normalize_user_query(query).lower().strip()
     controlled_route = _route_query(query)
-    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting", "architecture"):
+    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting", "architecture", "follow_up", "comparison"):
         return controlled_route.intent
-    if _is_follow_up_query(q):
-        return "follow_up"
     if _is_healing_query(q):
         return "healing_incident"
     # Metric-alert patterns not caught by _is_healing_query compound check
@@ -1632,8 +1679,6 @@ def detect_query_intent(query):
     # other keywords present in the query (e.g. "what is the fix for...")
     if q.startswith("what is") or q.startswith("what are"):
         return "definition"
-    if any(k in q for k in ["compare", "difference between", "vs ", "versus"]):
-        return "comparison"
     if any(q.startswith(prefix) for prefix in ["define", "explain "]):
         return "definition"
     return "general"
@@ -1819,9 +1864,6 @@ def generate_response(query, context, confidence=None, prior_messages=None):
 
         if query_intent == "definition":
             system_parts.append("\nFor definition questions: start with a plain-English definition in the first sentence. Then give 2-4 practical details. If the retrieved context is related but incomplete, combine it with standard DevOps knowledge instead of refusing to answer.")
-
-        if query_intent == "comparison":
-            system_parts.append("\nFor comparison questions: answer with short sections for each option, then end with when to choose each one.")
 
         if use_structured:
             system_parts.append("\nFor technical problems, always structure your answer as:\n\n**Root Cause:** [1-2 sentences]\n**Fix:** [exact commands or config]\n**Why this works:** [1-2 sentences]\n**Watch out for:** [edge cases or caveats]")
@@ -2319,15 +2361,29 @@ def ask():
                 time_taken=f"{elapsed:.2f}s",
             ))
 
-        if _is_follow_up_query(query):
-            response = _build_follow_up_response(query)
+        if controlled_route.intent == "follow_up":
+            resolved = _resolve_follow_up_response(query)
+            response = resolved["response"]
             elapsed = time.time() - start_time
-            _record_query(query, response, "follow_up", elapsed, sources_used=1, confidence="high")
+            _record_query(query, response, "follow_up", elapsed, sources_used=resolved["sources_used"], confidence=resolved["confidence"])
             return jsonify(_chat_payload(
                 response,
                 response_type="knowledge",
-                confidence="high",
-                sources_used=1,
+                confidence=resolved["confidence"],
+                sources_used=resolved["sources_used"],
+                time_taken=f"{elapsed:.2f}s",
+            ))
+
+        if controlled_route.intent == "comparison":
+            resolved = _resolve_comparison_response(query)
+            response = resolved["response"]
+            elapsed = time.time() - start_time
+            _record_query(query, response, "comparison", elapsed, sources_used=resolved["sources_used"], confidence=resolved["confidence"])
+            return jsonify(_chat_payload(
+                response,
+                response_type="knowledge",
+                confidence=resolved["confidence"],
+                sources_used=resolved["sources_used"],
                 time_taken=f"{elapsed:.2f}s",
             ))
 
@@ -2395,6 +2451,16 @@ def ask():
                 elif q_route.intent == "architecture":
                     q_context = []
                     q_resolved = _resolve_architecture_response(q)
+                    q_confidence = q_resolved["confidence"]
+                    q_response = q_resolved["response"]
+                elif q_route.intent == "follow_up":
+                    q_context = []
+                    q_resolved = _resolve_follow_up_response(q)
+                    q_confidence = q_resolved["confidence"]
+                    q_response = q_resolved["response"]
+                elif q_route.intent == "comparison":
+                    q_context = []
+                    q_resolved = _resolve_comparison_response(q)
                     q_confidence = q_resolved["confidence"]
                     q_response = q_resolved["response"]
                 else:

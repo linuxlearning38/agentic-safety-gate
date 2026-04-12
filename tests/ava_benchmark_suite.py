@@ -19,8 +19,16 @@ FUNCTIONS = {
     "_resolve_memory_recall_response",
     "_retrieve_architecture_chunks",
     "_resolve_architecture_response",
+    "_retrieve_comparison_chunks",
+    "_resolve_follow_up_response",
+    "_resolve_comparison_response",
     "_retrieve_troubleshooting_chunks",
     "_resolve_troubleshooting_response",
+    "_get_recent_distinct_turns",
+    "_summarize_topic",
+    "_topic_from_turn",
+    "_topic_signature",
+    "_response_summary",
     "_extract_query_entities",
     "_normalize_fact_key",
     "_canonical_fact_label",
@@ -66,12 +74,16 @@ def load_helpers():
         "route_query": input_router.route_query,
         "select_ava_self_evidence": evidence_selector.select_ava_self_evidence,
         "select_architecture_evidence": evidence_selector.select_architecture_evidence,
+        "select_comparison_evidence": evidence_selector.select_comparison_evidence,
+        "select_follow_up_evidence": evidence_selector.select_follow_up_evidence,
         "select_memory_store_evidence": evidence_selector.select_memory_store_evidence,
         "select_memory_recall_evidence": evidence_selector.select_memory_recall_evidence,
         "select_troubleshooting_evidence": evidence_selector.select_troubleshooting_evidence,
         "format_ava_self_facts_block": evidence_selector.format_ava_self_facts_block,
         "build_ava_self_plan": answer_planner.build_ava_self_plan,
         "build_architecture_plan": answer_planner.build_architecture_plan,
+        "build_comparison_plan": answer_planner.build_comparison_plan,
+        "build_follow_up_plan": answer_planner.build_follow_up_plan,
         "build_memory_store_plan": answer_planner.build_memory_store_plan,
         "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
         "build_troubleshooting_plan": answer_planner.build_troubleshooting_plan,
@@ -80,6 +92,7 @@ def load_helpers():
             "__init__": lambda self: setattr(self, "memory", {}),
             "get_memory": lambda self, key, default=None: self.memory.get(key, default),
             "save_memory": lambda self, key, value: self.memory.__setitem__(key, value),
+            "get_recent_queries": lambda self, n=5: getattr(self, "queries", [])[-n:],
         })(),
         "_get_about_data": lambda: {
             "version": "2.1.2",
@@ -127,6 +140,16 @@ def load_helpers():
                 chunks.extend([
                     FakeChunk("Requests enter through an ingress or load balancer and are routed to a Kubernetes Service.", "patterns"),
                     FakeChunk("The Service sends traffic to healthy Pods, and Pods persist data through their configured backing stores.", "patterns"),
+                ])
+            if "blue-green" in q or "canary" in q:
+                chunks.extend([
+                    FakeChunk("Blue-green deployment keeps two production environments so traffic can switch all at once after validation.", "policies"),
+                    FakeChunk("Canary deployment gradually shifts a small percentage of traffic to the new version before a full rollout.", "policies"),
+                ])
+            if "readiness probe" in q or "liveness probe" in q:
+                chunks.extend([
+                    FakeChunk("A readiness probe decides whether a container should receive traffic.", "policies"),
+                    FakeChunk("A liveness probe decides whether Kubernetes should restart an unhealthy container.", "policies"),
                 ])
             if "oomkilled" in q or "oom killed" in q:
                 chunks.append(FakeChunk("OOMKilled happens when the container exceeds its memory limit.", "policies"))
@@ -256,6 +279,33 @@ def main():
         resolved = ns["_resolve_architecture_response"](query)
         check(f"architecture response {query!r}", expected.lower() in resolved["response"].lower())
         check(f"architecture detail {query!r}", extra.lower() in resolved["response"].lower())
+
+    ns["db"].queries = [
+        {"query": "Explain blue-green vs canary deployment", "response": "**blue-green:** switch traffic all at once.\n**canary:** shift traffic gradually.", "intent": "comparison"},
+        {"query": "What is a Kubernetes readiness probe?", "response": "A readiness probe decides whether a container should receive traffic.", "intent": "definition"},
+    ]
+    follow_up_queries = [
+        "How is it different from the previous thing I asked?",
+        "What did I just ask?",
+        "Can you compare that with what we discussed?",
+    ]
+    for query in follow_up_queries:
+        route = ns["_route_query"](query)
+        check(f"follow_up route {query!r}", route.intent == "follow_up")
+        check(f"detect_query_intent {query!r}", ns["detect_query_intent"](query) == "follow_up")
+        resolved = ns["_resolve_follow_up_response"](query)
+        check(f"follow_up response {query!r}", "readiness probe" in resolved["response"].lower() or "blue green" in resolved["response"].lower())
+
+    comparison_queries = [
+        ("Explain blue-green vs canary deployment", "blue-green", "canary"),
+        ("What is the difference between readiness probe and liveness probe?", "readiness probe", "liveness probe"),
+    ]
+    for query, left, right in comparison_queries:
+        route = ns["_route_query"](query)
+        check(f"comparison route {query!r}", route.intent == "comparison")
+        check(f"detect_query_intent {query!r}", ns["detect_query_intent"](query) == "comparison")
+        resolved = ns["_resolve_comparison_response"](query)
+        check(f"comparison response {query!r}", left.lower() in resolved["response"].lower() and right.lower() in resolved["response"].lower())
 
     print("\nAVA controlled benchmark passed.")
 

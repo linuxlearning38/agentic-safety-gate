@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import re
 from typing import Callable
 
 
@@ -52,6 +53,17 @@ EXPLICIT_EXECUTION_MARKERS = (
     "run the", "kubectl apply", "kubectl exec", "diagnose now", "check now",
 )
 
+FOLLOW_UP_MARKERS = (
+    "previous thing", "previous question", "previous thing i asked",
+    "previous thing i said", "what did i just say", "what did i just ask",
+    "different from the previous", "different from what i asked",
+    "what we discussed", "compare that with",
+)
+
+COMPARISON_MARKERS = (
+    "difference between", "compare", " versus ", " vs ", "compare ",
+)
+
 
 @dataclass
 class IntentRoute:
@@ -64,6 +76,7 @@ class IntentRoute:
     memory_fact: dict | None = None
     memory_follow_up: str = ""
     recall_label: str | None = None
+    comparison_targets: list[str] = field(default_factory=list)
     response_mode: str = "text"
     reason: str = ""
 
@@ -108,6 +121,44 @@ def classify_architecture_topic(normalized_query: str, entities: list[str] | Non
         return None
     response_mode = "diagram" if wants_diagram else "text"
     return topic, response_mode
+
+
+def is_follow_up_query(normalized_query: str) -> bool:
+    q = (normalized_query or "").lower().strip()
+    return any(marker in q for marker in FOLLOW_UP_MARKERS)
+
+
+def _clean_comparison_target(text: str) -> str:
+    cleaned = (text or "").strip().strip("?.!, ")
+    cleaned = re.sub(
+        r"^(what is the difference between|difference between|compare|explain|describe|tell me about)\s+",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip()
+
+
+def extract_comparison_targets(normalized_query: str) -> list[str]:
+    q = (normalized_query or "").strip().rstrip("?.!")
+    q_lower = q.lower()
+    match = re.search(r"difference between\s+(.+?)\s+and\s+(.+)$", q_lower, re.IGNORECASE)
+    if match:
+        left = match.group(1).strip()
+        right = match.group(2).strip()
+        return [_clean_comparison_target(left), _clean_comparison_target(right)]
+    if " vs " in q_lower:
+        parts = re.split(r"\s+vs\s+", q, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            return [_clean_comparison_target(parts[0]), _clean_comparison_target(parts[1])]
+    if " versus " in q_lower:
+        parts = re.split(r"\s+versus\s+", q, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            return [_clean_comparison_target(parts[0]), _clean_comparison_target(parts[1])]
+    match = re.search(r"compare\s+(.+?)\s+and\s+(.+)$", q, re.IGNORECASE)
+    if match:
+        return [_clean_comparison_target(match.group(1)), _clean_comparison_target(match.group(2))]
+    return []
 
 
 def route_query(
@@ -167,6 +218,17 @@ def route_query(
             reason=f"matched architecture topic '{architecture_topic}' in {response_mode} mode",
         )
 
+    if is_follow_up_query(normalized_query):
+        return IntentRoute(
+            raw_query=raw_query,
+            normalized_query=normalized_query,
+            intent="follow_up",
+            confidence="high",
+            entities=entities,
+            topic="follow_up",
+            reason="matched controlled follow-up request",
+        )
+
     ava_self_topic = classify_ava_self_topic(normalized_query)
     if ava_self_topic:
         return IntentRoute(
@@ -189,6 +251,19 @@ def route_query(
             entities=entities,
             topic=troubleshooting_topic,
             reason=f"matched troubleshooting topic '{troubleshooting_topic}'",
+        )
+
+    comparison_targets = extract_comparison_targets(normalized_query)
+    if comparison_targets:
+        return IntentRoute(
+            raw_query=raw_query,
+            normalized_query=normalized_query,
+            intent="comparison",
+            confidence="medium",
+            entities=entities,
+            topic="comparison",
+            comparison_targets=comparison_targets,
+            reason="matched controlled comparison request",
         )
 
     return IntentRoute(

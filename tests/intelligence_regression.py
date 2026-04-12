@@ -17,6 +17,9 @@ FUNCTIONS = {
     "_resolve_memory_recall_response",
     "_retrieve_architecture_chunks",
     "_resolve_architecture_response",
+    "_retrieve_comparison_chunks",
+    "_resolve_follow_up_response",
+    "_resolve_comparison_response",
     "_retrieve_troubleshooting_chunks",
     "_resolve_troubleshooting_response",
     "_normalize_fact_key",
@@ -144,6 +147,16 @@ class FakeHybridRetriever:
                 FakeChunk("Requests enter through an ingress or load balancer and are routed to a Kubernetes Service.", "patterns"),
                 FakeChunk("The Service sends traffic to healthy Pods, and Pods persist data through their configured backing stores.", "patterns"),
             ])
+        if "blue-green" in q or "canary" in q:
+            chunks.extend([
+                FakeChunk("Blue-green deployment keeps two production environments so traffic can switch all at once after validation.", "policies"),
+                FakeChunk("Canary deployment gradually shifts a small percentage of traffic to the new version before a full rollout.", "policies"),
+            ])
+        if "readiness probe" in q or "liveness probe" in q:
+            chunks.extend([
+                FakeChunk("A readiness probe decides whether a container should receive traffic.", "policies"),
+                FakeChunk("A liveness probe decides whether Kubernetes should restart an unhealthy container.", "policies"),
+            ])
         if "oomkilled" in q or "oom killed" in q:
             chunks.append(FakeChunk("OOMKilled happens when the container exceeds its memory limit.", "policies"))
             chunks.append(FakeChunk("Increase memory limits only after checking peak usage and leaks.", "fixes"))
@@ -180,12 +193,16 @@ def load_helpers():
         "route_query": input_router.route_query,
         "select_ava_self_evidence": evidence_selector.select_ava_self_evidence,
         "select_architecture_evidence": evidence_selector.select_architecture_evidence,
+        "select_comparison_evidence": evidence_selector.select_comparison_evidence,
+        "select_follow_up_evidence": evidence_selector.select_follow_up_evidence,
         "select_memory_store_evidence": evidence_selector.select_memory_store_evidence,
         "select_memory_recall_evidence": evidence_selector.select_memory_recall_evidence,
         "select_troubleshooting_evidence": evidence_selector.select_troubleshooting_evidence,
         "format_ava_self_facts_block": evidence_selector.format_ava_self_facts_block,
         "build_ava_self_plan": answer_planner.build_ava_self_plan,
         "build_architecture_plan": answer_planner.build_architecture_plan,
+        "build_comparison_plan": answer_planner.build_comparison_plan,
+        "build_follow_up_plan": answer_planner.build_follow_up_plan,
         "build_memory_store_plan": answer_planner.build_memory_store_plan,
         "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
         "build_troubleshooting_plan": answer_planner.build_troubleshooting_plan,
@@ -299,6 +316,13 @@ def main():
     check("architecture diagram route is controlled", architecture_diagram_route.intent == "architecture")
     check("architecture diagram topic", architecture_diagram_route.topic == "self_runtime")
     check("architecture diagram mode", architecture_diagram_route.response_mode == "diagram")
+    check(
+        "follow_up route is controlled",
+        ns["_route_query"]("How is it different from the previous thing I asked?").intent == "follow_up",
+    )
+    comparison_route = ns["_route_query"]("What is the difference between readiness probe and liveness probe?")
+    check("comparison route is controlled", comparison_route.intent == "comparison")
+    check("comparison route extracts targets", len(comparison_route.comparison_targets) == 2)
 
     fake_db.queries = [
         {"query": "Remember this exactly: cluster=prod-west-2", "response": "Okay", "intent": "memory"},
@@ -515,6 +539,10 @@ def main():
     architecture_diagram_resolved = ns["_resolve_architecture_response"]("Create a mermaid diagram of your Docker architecture")
     check("controlled architecture diagram is deterministic", architecture_diagram_resolved["response"].startswith("```mermaid"))
     check("controlled architecture diagram includes ava runtime", "ava-agent:5443" in architecture_diagram_resolved["response"])
+    follow_up_resolved = ns["_resolve_follow_up_response"]("How is it different from the previous thing I asked?")
+    check("controlled follow_up response is deterministic", "latest answer summary" in follow_up_resolved["response"].lower())
+    comparison_resolved = ns["_resolve_comparison_response"]("What is the difference between readiness probe and liveness probe?")
+    check("controlled comparison response includes both targets", "readiness probe" in comparison_resolved["response"].lower() and "liveness probe" in comparison_resolved["response"].lower())
     oom_answer = ns["_answer_known_incident_query"]("What causes OOMKilled in Kubernetes?")
     check("oomkilled answer is deterministic", oom_answer.startswith("**Root Cause:**") and "memory limit" in oom_answer)
     check(

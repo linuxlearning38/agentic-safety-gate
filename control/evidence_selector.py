@@ -244,3 +244,69 @@ def select_architecture_evidence(route, retrieved_chunks: list, about: dict | No
         entities=route_entities,
         evidence_blocks=evidence_blocks,
     )
+
+
+def select_follow_up_evidence(route, recent_turns: list, topic_fn, summary_fn) -> EvidencePacket:
+    recent_turns = list(recent_turns or [])
+    last_turn = recent_turns[-1] if recent_turns else None
+    previous_turn = recent_turns[-2] if len(recent_turns) >= 2 else None
+    facts = {
+        "last_turn": last_turn,
+        "previous_turn": previous_turn,
+        "last_topic": topic_fn(last_turn) if last_turn else "",
+        "previous_topic": topic_fn(previous_turn) if previous_turn else "",
+        "last_summary": summary_fn((last_turn or {}).get("response", "")) if last_turn else "",
+    }
+    evidence_blocks = []
+    if last_turn:
+        evidence_blocks.append((last_turn.get("response") or "").strip())
+    if previous_turn:
+        evidence_blocks.append((previous_turn.get("response") or "").strip())
+    return EvidencePacket(
+        intent="follow_up",
+        topic="follow_up",
+        normalized_query=route.normalized_query,
+        facts=facts,
+        entities=list(route.entities or []),
+        evidence_blocks=evidence_blocks,
+    )
+
+
+def select_comparison_evidence(route, retrieved_chunks: list) -> EvidencePacket:
+    targets = list(route.comparison_targets or [])
+    target_lowers = [target.lower() for target in targets]
+    collected = {target.lower(): [] for target in targets}
+    evidence_blocks = []
+    seen = set()
+
+    for chunk in retrieved_chunks or []:
+        text = _strip_architecture_labels(getattr(chunk, "content", "") or "")
+        for raw_line in text.splitlines():
+            line = raw_line.strip(" -*\t")
+            if not line:
+                continue
+            lowered = line.lower()
+            if lowered in seen:
+                continue
+            if any(marker in lowered for marker in ARCHITECTURE_NOISE_MARKERS):
+                continue
+            for target in target_lowers:
+                if target in lowered and len(collected[target]) < 3:
+                    collected[target].append(line)
+                    seen.add(lowered)
+                    evidence_blocks.append(line)
+                    break
+
+    facts = {
+        "targets": targets,
+        "collected": collected,
+        "sources": [getattr(chunk, "source_collection", "") for chunk in (retrieved_chunks or [])],
+    }
+    return EvidencePacket(
+        intent="comparison",
+        topic="comparison",
+        normalized_query=route.normalized_query,
+        facts=facts,
+        entities=list(route.entities or []),
+        evidence_blocks=evidence_blocks,
+    )
