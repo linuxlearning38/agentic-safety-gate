@@ -64,6 +64,10 @@ COMPARISON_MARKERS = (
     "difference between", "compare", " versus ", " vs ", "compare ",
 )
 
+DEFINITION_MARKERS = (
+    "what is ", "what are ", "define ", "explain ",
+)
+
 
 @dataclass
 class IntentRoute:
@@ -93,6 +97,8 @@ def classify_ava_self_topic(normalized_query: str) -> str | None:
 
 def classify_troubleshooting_topic(normalized_query: str) -> str | None:
     q = f" {(normalized_query or '').lower().strip()} "
+    if any(q.strip().startswith(marker.strip()) for marker in DEFINITION_MARKERS):
+        return None
     if any(marker in q for marker in EXPLICIT_EXECUTION_MARKERS):
         return None
     for topic, patterns in TROUBLESHOOTING_TOPIC_PATTERNS.items():
@@ -159,6 +165,15 @@ def extract_comparison_targets(normalized_query: str) -> list[str]:
     if match:
         return [_clean_comparison_target(match.group(1)), _clean_comparison_target(match.group(2))]
     return []
+
+
+def classify_definition_topic(normalized_query: str) -> str | None:
+    q = (normalized_query or "").strip().lower()
+    if any(marker in q for marker in COMPARISON_MARKERS):
+        return None
+    if any(q.startswith(marker) for marker in DEFINITION_MARKERS):
+        return "definition"
+    return None
 
 
 def route_query(
@@ -264,6 +279,18 @@ def route_query(
             topic="comparison",
             comparison_targets=comparison_targets,
             reason="matched controlled comparison request",
+        )
+
+    definition_topic = classify_definition_topic(normalized_query)
+    if definition_topic:
+        return IntentRoute(
+            raw_query=raw_query,
+            normalized_query=normalized_query,
+            intent="definition",
+            confidence="medium",
+            entities=entities,
+            topic=definition_topic,
+            reason="matched controlled definition request",
         )
 
     return IntentRoute(

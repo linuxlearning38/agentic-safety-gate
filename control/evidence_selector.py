@@ -30,7 +30,7 @@ ARCHITECTURE_NOISE_MARKERS = (
 
 def _strip_architecture_labels(text: str) -> str:
     return re.sub(
-        r"(?im)^\s*(SUMMARY|REQUEST FLOW|ARCHITECTURE NOTES|ARCHITECTURE REFERENCE):\s*",
+        r"(?im)^\s*(SUMMARY|REQUEST FLOW|DATA FLOW|ARCHITECTURE NOTES|ARCHITECTURE REFERENCE|TAGS):\s*",
         "",
         text or "",
     )
@@ -308,5 +308,44 @@ def select_comparison_evidence(route, retrieved_chunks: list) -> EvidencePacket:
         normalized_query=route.normalized_query,
         facts=facts,
         entities=list(route.entities or []),
+        evidence_blocks=evidence_blocks,
+    )
+
+
+def select_definition_evidence(route, retrieved_chunks: list) -> EvidencePacket:
+    target_entities = [entity for entity in (route.entities or []) if entity]
+    evidence_blocks = []
+    seen = set()
+
+    for chunk in retrieved_chunks or []:
+        text = _strip_architecture_labels(getattr(chunk, "content", "") or "")
+        for raw_line in text.splitlines():
+            line = raw_line.strip(" -*\t")
+            if not line:
+                continue
+            lowered = line.lower()
+            if lowered in seen:
+                continue
+            if any(marker in lowered for marker in ARCHITECTURE_NOISE_MARKERS):
+                continue
+            if target_entities and not any(entity.lower() in lowered for entity in target_entities):
+                continue
+            seen.add(lowered)
+            evidence_blocks.append(line)
+            if len(evidence_blocks) >= 4:
+                break
+        if len(evidence_blocks) >= 4:
+            break
+
+    facts = {
+        "query": route.normalized_query,
+        "sources": [getattr(chunk, "source_collection", "") for chunk in (retrieved_chunks or [])],
+    }
+    return EvidencePacket(
+        intent="definition",
+        topic="definition",
+        normalized_query=route.normalized_query,
+        facts=facts,
+        entities=target_entities,
         evidence_blocks=evidence_blocks,
     )

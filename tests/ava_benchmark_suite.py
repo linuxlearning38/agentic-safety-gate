@@ -20,8 +20,10 @@ FUNCTIONS = {
     "_retrieve_architecture_chunks",
     "_resolve_architecture_response",
     "_retrieve_comparison_chunks",
+    "_retrieve_definition_chunks",
     "_resolve_follow_up_response",
     "_resolve_comparison_response",
+    "_resolve_definition_response",
     "_retrieve_troubleshooting_chunks",
     "_resolve_troubleshooting_response",
     "_get_recent_distinct_turns",
@@ -74,6 +76,7 @@ def load_helpers():
         "select_ava_self_evidence": evidence_selector.select_ava_self_evidence,
         "select_architecture_evidence": evidence_selector.select_architecture_evidence,
         "select_comparison_evidence": evidence_selector.select_comparison_evidence,
+        "select_definition_evidence": evidence_selector.select_definition_evidence,
         "select_follow_up_evidence": evidence_selector.select_follow_up_evidence,
         "select_memory_store_evidence": evidence_selector.select_memory_store_evidence,
         "select_memory_recall_evidence": evidence_selector.select_memory_recall_evidence,
@@ -82,6 +85,7 @@ def load_helpers():
         "build_ava_self_plan": answer_planner.build_ava_self_plan,
         "build_architecture_plan": answer_planner.build_architecture_plan,
         "build_comparison_plan": answer_planner.build_comparison_plan,
+        "build_definition_plan": answer_planner.build_definition_plan,
         "build_follow_up_plan": answer_planner.build_follow_up_plan,
         "build_memory_store_plan": answer_planner.build_memory_store_plan,
         "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
@@ -150,6 +154,10 @@ def load_helpers():
                     FakeChunk("A readiness probe decides whether a container should receive traffic.", "policies"),
                     FakeChunk("A liveness probe decides whether Kubernetes should restart an unhealthy container.", "policies"),
                 ])
+            if "oomkilled" in q and "what is" in q:
+                chunks.append(FakeChunk("OOMKilled is a Kubernetes termination reason that means the container exceeded its memory limit and the kernel killed it.", "policies"))
+            if "configmap" in q:
+                chunks.append(FakeChunk("A ConfigMap stores non-secret configuration data so Pods can consume settings without baking them into images.", "policies"))
             if "oomkilled" in q or "oom killed" in q:
                 chunks.append(FakeChunk("OOMKilled happens when the container exceeds its memory limit.", "policies"))
                 chunks.append(FakeChunk("Reduce memory usage or raise limits after checking actual peaks.", "fixes"))
@@ -305,6 +313,18 @@ def main():
         check(f"detect_query_intent {query!r}", ns["detect_query_intent"](query) == "comparison")
         resolved = ns["_resolve_comparison_response"](query)
         check(f"comparison response {query!r}", left.lower() in resolved["response"].lower() and right.lower() in resolved["response"].lower())
+
+    definition_queries = [
+        ("What is readiness probe?", "readiness probe", "receive traffic"),
+        ("What is OOMKilled?", "oomkilled", "memory limit"),
+        ("What is a ConfigMap?", "configmap", "configuration data"),
+    ]
+    for query, subject, expected in definition_queries:
+        route = ns["_route_query"](query)
+        check(f"definition route {query!r}", route.intent == "definition")
+        check(f"detect_query_intent {query!r}", ns["detect_query_intent"](query) == "definition")
+        resolved = ns["_resolve_definition_response"](query)
+        check(f"definition response {query!r}", subject.lower() in resolved["response"].lower() and expected.lower() in resolved["response"].lower())
 
     print("\nAVA controlled benchmark passed.")
 
