@@ -22,6 +22,20 @@ AVA_SELF_TOPIC_PATTERNS = {
     ],
 }
 
+TROUBLESHOOTING_TOPIC_PATTERNS = {
+    "oomkilled": ["oomkilled", "oom killed"],
+    "crashloopbackoff": ["crashloopbackoff", "crashloop"],
+    "imagepullbackoff": ["imagepullbackoff", "image pull backoff", "image pull error"],
+    "pending": [" pending", "containercreating", "container creating"],
+    "service_down": ["service is down", "service down", "unreachable", "can't connect", "cannot connect", "timeout"],
+    "generic": ["error", "failed", "not working", "broken", "troubleshoot", "debug", "fix", "issue", "problem"],
+}
+
+EXPLICIT_EXECUTION_MARKERS = (
+    "run kubectl", "execute", "apply the fix", "apply this", "run this",
+    "run the", "kubectl apply", "kubectl exec", "diagnose now", "check now",
+)
+
 
 @dataclass
 class IntentRoute:
@@ -44,6 +58,16 @@ def classify_ava_self_topic(normalized_query: str) -> str | None:
             return topic
     if "ava" in q:
         return "runtime"
+    return None
+
+
+def classify_troubleshooting_topic(normalized_query: str) -> str | None:
+    q = f" {(normalized_query or '').lower().strip()} "
+    if any(marker in q for marker in EXPLICIT_EXECUTION_MARKERS):
+        return None
+    for topic, patterns in TROUBLESHOOTING_TOPIC_PATTERNS.items():
+        if any(pattern in q for pattern in patterns):
+            return topic
     return None
 
 
@@ -100,6 +124,18 @@ def route_query(
             entities=entities,
             topic=ava_self_topic,
             reason=f"matched ava_self topic '{ava_self_topic}'",
+        )
+
+    troubleshooting_topic = classify_troubleshooting_topic(normalized_query)
+    if troubleshooting_topic:
+        return IntentRoute(
+            raw_query=raw_query,
+            normalized_query=normalized_query,
+            intent="troubleshooting",
+            confidence="high" if troubleshooting_topic != "generic" else "medium",
+            entities=entities,
+            topic=troubleshooting_topic,
+            reason=f"matched troubleshooting topic '{troubleshooting_topic}'",
         )
 
     return IntentRoute(

@@ -17,6 +17,8 @@ FUNCTIONS = {
     "_resolve_ava_self_response",
     "_resolve_memory_store_response",
     "_resolve_memory_recall_response",
+    "_retrieve_troubleshooting_chunks",
+    "_resolve_troubleshooting_response",
     "_extract_query_entities",
     "_normalize_fact_key",
     "_canonical_fact_label",
@@ -63,10 +65,12 @@ def load_helpers():
         "select_ava_self_evidence": evidence_selector.select_ava_self_evidence,
         "select_memory_store_evidence": evidence_selector.select_memory_store_evidence,
         "select_memory_recall_evidence": evidence_selector.select_memory_recall_evidence,
+        "select_troubleshooting_evidence": evidence_selector.select_troubleshooting_evidence,
         "format_ava_self_facts_block": evidence_selector.format_ava_self_facts_block,
         "build_ava_self_plan": answer_planner.build_ava_self_plan,
         "build_memory_store_plan": answer_planner.build_memory_store_plan,
         "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
+        "build_troubleshooting_plan": answer_planner.build_troubleshooting_plan,
         "compose_controlled_response": response_composer.compose_response,
         "db": type("FakeDB", (), {
             "__init__": lambda self: setattr(self, "memory", {}),
@@ -74,6 +78,27 @@ def load_helpers():
             "save_memory": lambda self, key, value: self.memory.__setitem__(key, value),
         })(),
     }
+    class FakeChunk:
+        def __init__(self, content, source_collection):
+            self.content = content
+            self.source_collection = source_collection
+    class FakeHybridRetriever:
+        def query(self, query_text, n_policies=4, n_blogs=3, blog_min_relevance=0.45, format_for_llm=True):
+            q = query_text.lower()
+            chunks = []
+            if "oomkilled" in q or "oom killed" in q:
+                chunks.append(FakeChunk("OOMKilled happens when the container exceeds its memory limit.", "policies"))
+                chunks.append(FakeChunk("Reduce memory usage or raise limits after checking actual peaks.", "fixes"))
+            if "crashloopbackoff" in q or "crashloop" in q:
+                chunks.append(FakeChunk("CrashLoopBackOff means repeated start-fail-restart cycles.", "policies"))
+                chunks.append(FakeChunk("Check logs, env vars, entrypoint, and probe settings.", "fixes"))
+            if "service is down" in q or "service down" in q:
+                chunks.append(FakeChunk("Check endpoints, readiness, ingress, and DNS when a service is down.", "fixes"))
+            chunks.append(FakeChunk("blog noise", "blogs"))
+            return chunks
+        def _strip_section_labels(self, text):
+            return text
+    namespace["hybrid_retriever"] = FakeHybridRetriever()
     segments = []
     for node in tree.body:
         if isinstance(node, ast.Assign):
@@ -160,6 +185,20 @@ def main():
         check(f"memory recall route {query!r}", route.intent == "memory_recall")
         recalled = ns["_resolve_memory_recall_response"](query)
         check(f"memory recall response {query!r}", expected.lower() in recalled["response"].lower())
+
+    troubleshooting_queries = [
+        ("What causes OOMKilled in Kubernetes?", "oomkilled", "memory limit"),
+        ("My nginx pod is CrashLoopBackOff", "crashloopbackoff", "CrashLoopBackOff"),
+        ("My service is down", "service_down", "service being down usually means"),
+    ]
+    for query, topic, expected in troubleshooting_queries:
+        route = ns["_route_query"](query)
+        check(f"troubleshooting route {query!r}", route.intent == "troubleshooting")
+        check(f"troubleshooting topic {query!r}", route.topic == topic)
+        check(f"detect_query_intent {query!r}", ns["detect_query_intent"](query) == "troubleshooting")
+        resolved = ns["_resolve_troubleshooting_response"](query)
+        check(f"troubleshooting response {query!r}", expected.lower() in resolved["response"].lower())
+        check(f"troubleshooting sources filtered {query!r}", resolved["sources_used"] >= 1)
 
     print("\nAVA controlled benchmark passed.")
 

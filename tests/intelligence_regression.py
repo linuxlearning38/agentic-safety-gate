@@ -15,6 +15,8 @@ FUNCTIONS = {
     "_resolve_ava_self_response",
     "_resolve_memory_store_response",
     "_resolve_memory_recall_response",
+    "_retrieve_troubleshooting_chunks",
+    "_resolve_troubleshooting_response",
     "_normalize_fact_key",
     "_canonical_fact_label",
     "_fact_aliases",
@@ -117,8 +119,28 @@ class FakeHealer:
 
 
 class FakeChunk:
-    def __init__(self, content):
+    def __init__(self, content, source_collection="policies"):
         self.content = content
+        self.source_collection = source_collection
+
+
+class FakeHybridRetriever:
+    def query(self, query_text, n_policies=4, n_blogs=3, blog_min_relevance=0.45, format_for_llm=True):
+        q = query_text.lower()
+        chunks = []
+        if "oomkilled" in q or "oom killed" in q:
+            chunks.append(FakeChunk("OOMKilled happens when the container exceeds its memory limit.", "policies"))
+            chunks.append(FakeChunk("Increase memory limits only after checking peak usage and leaks.", "fixes"))
+        if "crashloopbackoff" in q or "crashloop" in q:
+            chunks.append(FakeChunk("CrashLoopBackOff indicates repeated start-fail-restart cycles.", "policies"))
+            chunks.append(FakeChunk("Check logs, probe settings, config mounts, and entrypoint failures.", "fixes"))
+        if "service is down" in q or "service down" in q:
+            chunks.append(FakeChunk("Check endpoints, readiness, ingress, and DNS for service-down incidents.", "fixes"))
+        chunks.append(FakeChunk("blog noise that should be filtered", "blogs"))
+        return chunks
+
+    def _strip_section_labels(self, text):
+        return text
 
 
 def load_helpers():
@@ -143,13 +165,16 @@ def load_helpers():
         "select_ava_self_evidence": evidence_selector.select_ava_self_evidence,
         "select_memory_store_evidence": evidence_selector.select_memory_store_evidence,
         "select_memory_recall_evidence": evidence_selector.select_memory_recall_evidence,
+        "select_troubleshooting_evidence": evidence_selector.select_troubleshooting_evidence,
         "format_ava_self_facts_block": evidence_selector.format_ava_self_facts_block,
         "build_ava_self_plan": answer_planner.build_ava_self_plan,
         "build_memory_store_plan": answer_planner.build_memory_store_plan,
         "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
+        "build_troubleshooting_plan": answer_planner.build_troubleshooting_plan,
         "compose_controlled_response": response_composer.compose_response,
         "db": FakeDB(),
         "healer": FakeHealer(),
+        "hybrid_retriever": FakeHybridRetriever(),
     }
     segments = []
     for node in tree.body:
@@ -194,6 +219,10 @@ def main():
     check("numbered query prefixes strip repeatedly", cleaned_query == "what models are you running?")
     noisy_query = ns["_normalize_user_query"]("1.2.4.a.b.c.d.e.---a-b-44-4-4-4-4-4-= what models are you running?")
     check("noisy query prefixes strip aggressively", noisy_query == "what models are you running?")
+    check(
+        "declarative troubleshooting query preserved during normalization",
+        ns["_normalize_user_query"]("My service is down") == "My service is down",
+    )
     saved_server = ns["_save_chat_fact"]("server", "prod-india-01")
     check("memory label canonicalized", saved_server["label"] == "server name")
     check(
@@ -215,6 +244,10 @@ def main():
     check(
         "memory recall route is controlled",
         ns["_route_query"]("What is my server name?").intent == "memory_recall",
+    )
+    check(
+        "troubleshooting route is controlled",
+        ns["_route_query"]("What causes OOMKilled in Kubernetes?").intent == "troubleshooting",
     )
 
     fake_db.queries = [
@@ -423,6 +456,9 @@ def main():
     )
     check("ava self kb total is computed", "6,482" in ava_self_kb and "devops_patterns_v1: 64" in ava_self_kb)
     check("oomkilled intent routes to troubleshooting", ns["detect_query_intent"]("What causes OOMKilled in Kubernetes?") == "troubleshooting")
+    troubleshooting_resolved = ns["_resolve_troubleshooting_response"]("What causes OOMKilled in Kubernetes?")
+    check("controlled troubleshooting response is deterministic", troubleshooting_resolved["response"].startswith("**Root Cause:**"))
+    check("controlled troubleshooting strips blog noise", troubleshooting_resolved["sources_used"] == 2)
     oom_answer = ns["_answer_known_incident_query"]("What causes OOMKilled in Kubernetes?")
     check("oomkilled answer is deterministic", oom_answer.startswith("**Root Cause:**") and "memory limit" in oom_answer)
     check(

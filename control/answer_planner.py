@@ -88,3 +88,62 @@ def build_memory_recall_plan(route, evidence) -> AnswerPlan:
         evidence={"stored_fact": fact},
         confidence=confidence,
     )
+
+
+def build_troubleshooting_plan(route, evidence) -> AnswerPlan:
+    topic = evidence.topic or route.topic or "generic"
+    canned_answers = {
+        "oomkilled": (
+            "**Root Cause:** Kubernetes marks a container as `OOMKilled` when it exceeds its memory limit and the kernel terminates it to protect node stability.\n"
+            "**Fix:** Raise the pod memory limit if it is too low, reduce the application's memory use, and compare actual peak usage against the current request and limit.\n"
+            "**Why this works:** `OOMKilled` is a memory-pressure termination, so the durable fix is aligning the workload's memory behavior with Kubernetes limits.\n"
+            "**Watch out for:** Restarts can hide the symptom temporarily. Check for memory leaks, bursty traffic, large in-memory caches, or JVM heap settings before only increasing limits."
+        ),
+        "crashloopbackoff": (
+            "**Root Cause:** `CrashLoopBackOff` means the container keeps starting, failing, and being restarted, so Kubernetes backs off between restart attempts.\n"
+            "**Fix:** Check the container logs, last termination reason, image entrypoint, env vars, config mounts, and readiness or liveness probe settings. Common causes are bad startup commands, missing config, and application crashes.\n"
+            "**Why this works:** `CrashLoopBackOff` is a restart pattern, not the root problem itself. The real fix comes from the failing process or probe.\n"
+            "**Watch out for:** If probes are too aggressive, Kubernetes can restart an otherwise healthy app before it finishes booting."
+        ),
+        "imagepullbackoff": (
+            "**Root Cause:** `ImagePullBackOff` means Kubernetes could not pull the container image and is backing off before retrying.\n"
+            "**Fix:** Verify the image name and tag, confirm the registry is reachable, and ensure the pod has valid image pull credentials if the registry is private.\n"
+            "**Why this works:** The pod cannot start until the image is fetched successfully, so fixing the image reference or authentication removes the startup blocker.\n"
+            "**Watch out for:** A mutable tag can hide the real issue. Confirm the exact image digest or expected tag during rollback and redeploy."
+        ),
+        "pending": (
+            "**Root Cause:** A pod in `Pending` has not been scheduled or cannot start because the cluster is still missing resources, volumes, or other required dependencies.\n"
+            "**Fix:** Check scheduler events, resource requests, node availability, PVC binding, taints, tolerations, and admission policy failures.\n"
+            "**Why this works:** `Pending` is usually a placement or dependency problem, so the durable fix comes from the scheduler events and missing prerequisite.\n"
+            "**Watch out for:** Low cluster capacity can make `Pending` look intermittent. Check quotas and autoscaler behavior before changing only the pod spec."
+        ),
+        "service_down": (
+            "**Root Cause:** A service being down usually means traffic is not reaching a healthy backend because the pods, endpoints, ingress, load balancer, or network path are unhealthy or misconfigured.\n"
+            "**Fix:** Check service endpoints, pod readiness, ingress or load balancer health, DNS resolution, recent deploy changes, and network policies.\n"
+            "**Why this works:** A service is only available when the traffic path and the backing workloads are both healthy, so verifying that chain isolates the actual failure point.\n"
+            "**Watch out for:** A quick pod restart can mask the issue. Also check rollout history and dependency failures before declaring the service recovered."
+        ),
+        "generic": (
+            "**Root Cause:** This looks like an infrastructure or application failure that needs the failing component, error signal, and recent change context identified before choosing a durable fix.\n"
+            "**Fix:** Start with the exact error, workload status, recent deployment changes, logs, events, and dependency health so the failing layer can be isolated quickly.\n"
+            "**Why this works:** Troubleshooting becomes reliable when you narrow the fault domain first instead of changing multiple things at once.\n"
+            "**Watch out for:** Avoid treating the first symptom as the root cause. Check whether the issue is coming from config, dependencies, capacity, or rollout changes."
+        ),
+    }
+
+    answer = canned_answers.get(topic, canned_answers["generic"])
+    confidence = "high" if topic != "generic" else "medium"
+
+    return AnswerPlan(
+        intent="troubleshooting",
+        mode="deterministic",
+        topic=topic,
+        answer=answer,
+        evidence={
+            "topic": topic,
+            "evidence_blocks": list(evidence.evidence_blocks or []),
+            "sources": evidence.facts.get("sources", []),
+        },
+        entities=list(evidence.entities or []),
+        confidence=confidence,
+    )
