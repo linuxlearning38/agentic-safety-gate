@@ -82,3 +82,27 @@ def select_memory_recall_evidence(route, recalled_fact) -> EvidencePacket:
         entities=list(route.entities or []),
         evidence_blocks=[],
     )
+
+
+def select_troubleshooting_evidence(route, retrieved_chunks: list) -> EvidencePacket:
+    filtered_chunks = []
+    evidence_blocks = []
+    for chunk in retrieved_chunks or []:
+        source_collection = getattr(chunk, "source_collection", "")
+        if source_collection not in {"policies", "fixes"}:
+            continue
+        filtered_chunks.append(chunk)
+        evidence_blocks.append(getattr(chunk, "content", ""))
+
+    facts = {
+        "topic": route.topic or "generic",
+        "sources": [getattr(chunk, "source_collection", "") for chunk in filtered_chunks],
+    }
+    return EvidencePacket(
+        intent="troubleshooting",
+        topic=route.topic or "generic",
+        normalized_query=route.normalized_query,
+        facts=facts,
+        entities=list(route.entities or []),
+        evidence_blocks=evidence_blocks,
+    )

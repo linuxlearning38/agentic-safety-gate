@@ -26,12 +26,14 @@ from control.evidence_selector import (
     select_ava_self_evidence,
     select_memory_store_evidence,
     select_memory_recall_evidence,
+    select_troubleshooting_evidence,
     format_ava_self_facts_block,
 )
 from control.answer_planner import (
     build_ava_self_plan,
     build_memory_store_plan,
     build_memory_recall_plan,
+    build_troubleshooting_plan,
 )
 from control.response_composer import compose_response as compose_controlled_response
 from control import vuln_scanner          # Day 8 — Trivy + Lynis
@@ -579,7 +581,7 @@ def _normalize_user_query(query):
     question_markers = [
         "what ", "which ", "how ", "why ", "when ", "where ",
         "explain ", "compare ", "define ", "remember ", "draw ",
-        "create ", "show ", "tell ", "is ", "are ",
+        "create ", "show ", "tell ",
     ]
     lower = text.lower()
     starts_with_marker = any(lower.startswith(marker) for marker in question_markers)
@@ -636,6 +638,41 @@ def _resolve_memory_recall_response(query):
         "fact": fact,
         "confidence": plan.confidence,
         "label": route.recall_label,
+    }
+
+
+def _retrieve_troubleshooting_chunks(query):
+    raw_chunks = hybrid_retriever.query(
+        query_text=query,
+        n_policies=6,
+        n_blogs=0,
+        blog_min_relevance=1.0,
+        format_for_llm=False,
+    )
+    cleaned = []
+    for chunk in raw_chunks or []:
+        source_collection = getattr(chunk, "source_collection", "")
+        if source_collection not in {"policies", "fixes"}:
+            continue
+        content = hybrid_retriever._strip_section_labels(getattr(chunk, "content", ""))
+        if not content:
+            continue
+        chunk.content = content
+        cleaned.append(chunk)
+    return cleaned
+
+
+def _resolve_troubleshooting_response(query):
+    route = _route_query(query)
+    if route.intent != "troubleshooting":
+        return None
+    evidence = select_troubleshooting_evidence(route, _retrieve_troubleshooting_chunks(query))
+    plan = build_troubleshooting_plan(route, evidence)
+    return {
+        "response": compose_controlled_response(plan),
+        "confidence": plan.confidence,
+        "sources_used": len(evidence.evidence_blocks),
+        "topic": plan.topic,
     }
 
 def _chat_payload(response_text="", response_type="knowledge", ok=True, confidence=None,
@@ -1608,16 +1645,10 @@ def _build_healing_response(query):
 def detect_query_intent(query):
     q = _normalize_user_query(query).lower().strip()
     controlled_route = _route_query(query)
-    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall"):
+    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting"):
         return controlled_route.intent
     if _is_follow_up_query(q):
         return "follow_up"
-    incident_terms = [
-        "oomkilled", "oom killed", "crashloopbackoff", "crashloop",
-        "imagepullbackoff", "image pull backoff", "pending", "containercreating",
-    ]
-    if any(term in q for term in incident_terms):
-        return "troubleshooting"
     if _is_healing_query(q):
         return "healing_incident"
     # Metric-alert patterns not caught by _is_healing_query compound check
@@ -1651,8 +1682,6 @@ def detect_query_intent(query):
         return "comparison"
     if any(q.startswith(prefix) for prefix in ["define", "explain "]):
         return "definition"
-    if any(k in q for k in ["error", "failed", "not working", "broken", "troubleshoot", "debug", "fix"]):
-        return "troubleshooting"
     return "general"
 
 def build_memory_context(query=None):
@@ -1842,11 +1871,6 @@ def generate_response(query, context, confidence=None, prior_messages=None):
             prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
             answer = _build_ava_runtime_diagram_response()
             return prefix + answer if prefix else answer
-        if query_intent == "troubleshooting":
-            prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
-            answer = _answer_known_incident_query(query)
-            if answer:
-                return prefix + answer if prefix else answer
 
         system_parts = ["You are AVA, a senior DevOps AI assistant.\n\nRULES:\n1. Always respond in English only\n2. Use the provided context as your primary grounding source\n3. If the context is partial but clearly relevant, give the best direct answer you can and say what is inferred\n4. Do not lead with phrases like 'the context does not directly say' unless the context is genuinely irrelevant\n5. Prefer direct practical answers over meta commentary about the context\n6. Quote specific config values, commands, and fixes directly from context when available\n7. Be specific, practical, and concise"]
 
@@ -2351,6 +2375,19 @@ def ask():
                 time_taken=f"{elapsed:.2f}s",
             ))
 
+        if controlled_route.intent == "troubleshooting":
+            resolved = _resolve_troubleshooting_response(query)
+            response = resolved["response"]
+            elapsed = time.time() - start_time
+            _record_query(query, response, "troubleshooting", elapsed, sources_used=resolved["sources_used"], confidence=resolved["confidence"])
+            return jsonify(_chat_payload(
+                response,
+                response_type="knowledge",
+                confidence=resolved["confidence"],
+                sources_used=resolved["sources_used"],
+                time_taken=f"{elapsed:.2f}s",
+            ))
+
         if _is_follow_up_query(query):
             response = _build_follow_up_response(query)
             elapsed = time.time() - start_time
@@ -2419,6 +2456,11 @@ def ask():
                     q_context = []
                     q_confidence = "high"
                     q_response = _resolve_ava_self_response(q)
+                elif q_route.intent == "troubleshooting":
+                    q_context = []
+                    q_resolved = _resolve_troubleshooting_response(q)
+                    q_confidence = q_resolved["confidence"]
+                    q_response = q_resolved["response"]
                 else:
                     q_context = query_knowledge_base(q, query_intent=detect_query_intent(q))
                     q_confidence = score_context_confidence(q_context, q)
