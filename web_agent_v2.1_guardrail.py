@@ -21,6 +21,19 @@ from control.secure_executor import execute_command_secure, execute_approved_com
 from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
+from control.input_router import route_query
+from control.evidence_selector import (
+    select_ava_self_evidence,
+    select_memory_store_evidence,
+    select_memory_recall_evidence,
+    format_ava_self_facts_block,
+)
+from control.answer_planner import (
+    build_ava_self_plan,
+    build_memory_store_plan,
+    build_memory_recall_plan,
+)
+from control.response_composer import compose_response as compose_controlled_response
 from control import vuln_scanner          # Day 8 — Trivy + Lynis
 from control import database as db        # Phase 5B — SQLite layer
 from control.self_healer import healer    # Phase 5C — self-healing engine
@@ -376,9 +389,12 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
             query_intent = detect_query_intent(query)
         entities = _extract_query_entities(query)
 
-        # ava_self: exact system facts first, then patterns, minimal policy, no blogs
+        # ava_self: controlled migration path — authoritative runtime facts only
         _self_architecture = query_intent == "architecture" and any(term in query.lower() for term in ["your ", "you ", "ava", "yourself"])
-        if query_intent == "ava_self" or _self_architecture:
+        if query_intent == "ava_self":
+            about = _get_about_data()
+            return [format_ava_self_facts_block(about)]
+        if _self_architecture:
             about = _get_about_data()
             c = about["containers"]
             m = about["models"]
@@ -573,6 +589,54 @@ def _normalize_user_query(query):
         if len(candidate.split()) >= 2:
             text = candidate
     return text.strip()
+
+
+def _route_query(query):
+    return route_query(
+        query,
+        normalizer=_normalize_user_query,
+        entity_extractor=_extract_query_entities,
+        memory_request_extractor=_extract_memory_request,
+        recall_label_extractor=_extract_recall_label,
+    )
+
+
+def _resolve_ava_self_response(query, about=None):
+    route = _route_query(query)
+    if route.intent != "ava_self":
+        return None
+    evidence = select_ava_self_evidence(route, about or _get_about_data())
+    plan = build_ava_self_plan(route, evidence)
+    return compose_controlled_response(plan)
+
+
+def _resolve_memory_store_response(query):
+    route = _route_query(query)
+    if route.intent != "memory_store" or not route.memory_fact:
+        return None
+    saved_fact = _save_chat_fact(route.memory_fact["label"], route.memory_fact["value"])
+    evidence = select_memory_store_evidence(route)
+    plan = build_memory_store_plan(route, evidence, saved_fact)
+    return {
+        "response": compose_controlled_response(plan),
+        "saved_fact": saved_fact,
+        "confidence": plan.confidence,
+    }
+
+
+def _resolve_memory_recall_response(query):
+    route = _route_query(query)
+    if route.intent != "memory_recall" or not route.recall_label:
+        return None
+    fact = _recall_chat_fact(route.recall_label)
+    evidence = select_memory_recall_evidence(route, fact)
+    plan = build_memory_recall_plan(route, evidence)
+    return {
+        "response": compose_controlled_response(plan),
+        "fact": fact,
+        "confidence": plan.confidence,
+        "label": route.recall_label,
+    }
 
 def _chat_payload(response_text="", response_type="knowledge", ok=True, confidence=None,
                   sources_used=0, time_taken="", **extra):
@@ -1543,12 +1607,9 @@ def _build_healing_response(query):
 
 def detect_query_intent(query):
     q = _normalize_user_query(query).lower().strip()
-    if q.startswith("remember this"):
-        return "memory_store"
-    if q.startswith("remember:") or q.startswith("remember "):
-        return "memory_store"
-    if _extract_recall_label(q):
-        return "memory_recall"
+    controlled_route = _route_query(query)
+    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall"):
+        return controlled_route.intent
     if _is_follow_up_query(q):
         return "follow_up"
     incident_terms = [
@@ -1582,18 +1643,6 @@ def detect_query_intent(query):
     ]
     if any(k in q for k in _diagram_triggers):
         return "architecture"
-    # AVA self-knowledge guard — before all others
-    _ava_patterns = [
-        "your architecture", "your files", "your containers", "your models",
-        "your pipeline", "how do you work", "your ports", "your services",
-        "your stack", "your components", "your docker", "your database",
-        "are you running", "do you run", "what containers", "what services",
-        "what ports", "what models", "what are you running",
-        "what models", "which model", "your model",
-        "knowledge base size", "how many chunks", "your knowledge",
-    ]
-    if any(k in q for k in _ava_patterns) or re.search(r'\bava\b', q):
-        return "ava_self"
     # Definition guard runs first — "what is/are" always wins regardless of
     # other keywords present in the query (e.g. "what is the fix for...")
     if q.startswith("what is") or q.startswith("what are"):
@@ -1767,43 +1816,7 @@ def _answer_known_incident_query(query):
     return None
 
 def _answer_ava_self_query(query, about=None):
-    q = query.lower()
-    about = about or _get_about_data()
-    containers = about.get("containers", {})
-    models = about.get("models", {})
-    kb = about.get("knowledge_base", {})
-    total_chunks = sum(int(count or 0) for count in kb.values())
-
-    if any(term in q for term in ["what containers", "your containers", "your docker", "your ports", "what ports", "services and ports"]):
-        lines = ["I run these Docker containers and ports:"]
-        for name, data in containers.items():
-            proto = f" ({data['proto']})" if data.get("proto") else ""
-            lines.append(f"- {name}: port {data['port']}{proto} - {data['stack']}")
-        return "\n".join(lines)
-
-    if any(term in q for term in ["what models", "which model", "your model", "are you running", "do you run"]):
-        return (
-            "I run these local models via Ollama:\n"
-            f"- LLM: {models.get('llm', 'unknown')}\n"
-            f"- Embedding: {models.get('embedding', 'unknown')}\n"
-            f"- Vision: {models.get('vision', 'unknown')}\n"
-            f"- Ollama host: {models.get('ollama_host', 'unknown')}"
-        )
-
-    if any(term in q for term in ["knowledge base size", "how many chunks", "your knowledge"]):
-        lines = [f"My knowledge base currently has {total_chunks:,} chunks across {len(kb)} collections:"]
-        for name, count in kb.items():
-            lines.append(f"- {name}: {int(count or 0):,} chunks")
-        return "\n".join(lines)
-
-    if "runtime" in q or "stack" in q or "overview" in q:
-        return (
-            f"I am AVA {about.get('version', '')}, built by {about.get('built_by', 'unknown')}.\n"
-            f"My runtime is {about.get('runtime', 'unknown')}.\n"
-            f"My main app container is ava-agent on port 5443, and I use {models.get('llm', 'unknown')} as my main LLM."
-        )
-
-    return None
+    return _resolve_ava_self_response(query, about=about)
 
 
 def generate_response(query, context, confidence=None, prior_messages=None):
@@ -1829,11 +1842,6 @@ def generate_response(query, context, confidence=None, prior_messages=None):
             prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
             answer = _build_ava_runtime_diagram_response()
             return prefix + answer if prefix else answer
-        if query_intent == "ava_self":
-            prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
-            answer = _answer_ava_self_query(query)
-            if answer:
-                return prefix + answer if prefix else answer
         if query_intent == "troubleshooting":
             prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
             answer = _answer_known_incident_query(query)
@@ -1844,9 +1852,6 @@ def generate_response(query, context, confidence=None, prior_messages=None):
 
         if memory_ctx:
             system_parts.append(f"\nUSER CONTEXT (use this to tailor your answers):\n{memory_ctx}")
-
-        if query_intent == "ava_self":
-            system_parts.append("\nYou are AVA. The context below describes YOUR OWN architecture, containers, files, and runtime stack. Answer in first person using this context — do not say 'the system' or 'the assistant', say 'I' or 'my'. Be specific about ports, services, and components you see in the context.")
 
         if query_intent == "definition":
             system_parts.append("\nFor definition questions: start with a plain-English definition in the first sentence. Then give 2-4 practical details. If the retrieved context is related but incomplete, combine it with standard DevOps knowledge instead of refusing to answer.")
@@ -2319,36 +2324,26 @@ def ask():
             }), 503
 
         logger.info(f"Query: {query}")
+        controlled_route = _route_query(query)
 
-        memory_request = _extract_memory_request(query)
-        if memory_request:
-            fact = memory_request["fact"]
-            saved = _save_chat_fact(fact["label"], fact["value"])
-            follow_up = memory_request["follow_up"]
-            if follow_up:
-                response = f"Your {saved['label']} is {saved['value']}."
-            else:
-                response = f"Okay — I'll remember that your {saved['label']} is {saved['value']}."
+        if controlled_route.intent == "memory_store":
+            resolved = _resolve_memory_store_response(query)
+            response = resolved["response"]
             elapsed = time.time() - start_time
-            _record_query(query, response, "memory", elapsed, confidence="high")
+            _record_query(query, response, "memory_store", elapsed, confidence=resolved["confidence"])
             return jsonify(_chat_payload(
                 response,
                 response_type="memory",
-                confidence="high",
+                confidence=resolved["confidence"],
                 time_taken=f"{elapsed:.2f}s",
             ))
 
-        recall_label = _extract_recall_label(query)
-        if recall_label:
-            fact = _recall_chat_fact(recall_label)
-            response = (
-                f"Your {fact['label']} is {fact['value']}."
-                if fact else
-                f"I don't have a stored value for your {recall_label} yet."
-            )
-            confidence = "high" if fact else "low"
+        if controlled_route.intent == "memory_recall":
+            resolved = _resolve_memory_recall_response(query)
+            response = resolved["response"]
+            confidence = resolved["confidence"]
             elapsed = time.time() - start_time
-            _record_query(query, response, "memory", elapsed, confidence=confidence)
+            _record_query(query, response, "memory_recall", elapsed, confidence=confidence)
             return jsonify(_chat_payload(
                 response,
                 response_type="memory",
@@ -2398,6 +2393,17 @@ def ask():
                 response_type='knowledge',
                 time_taken=f"{elapsed:.2f}s"
             ))
+
+        if controlled_route.intent == "ava_self":
+            response = _resolve_ava_self_response(query)
+            elapsed = time.time() - start_time
+            _record_query(query, response, "ava_self", elapsed, confidence="high")
+            return jsonify(_chat_payload(
+                response,
+                response_type="knowledge",
+                confidence="high",
+                time_taken=f"{elapsed:.2f}s",
+            ))
         
         # Multi-question detection — split and answer each separately
         questions = detect_multiple_questions(query)
@@ -2408,9 +2414,15 @@ def ask():
 
             for idx, q in enumerate(questions, 1):
                 logger.info(f"[{idx}/{len(questions)}] Processing: {q}")
-                q_context = query_knowledge_base(q, query_intent=detect_query_intent(q))
-                q_confidence = score_context_confidence(q_context, q)
-                q_response = generate_response(q, q_context, confidence=q_confidence)
+                q_route = _route_query(q)
+                if q_route.intent == "ava_self":
+                    q_context = []
+                    q_confidence = "high"
+                    q_response = _resolve_ava_self_response(q)
+                else:
+                    q_context = query_knowledge_base(q, query_intent=detect_query_intent(q))
+                    q_confidence = score_context_confidence(q_context, q)
+                    q_response = generate_response(q, q_context, confidence=q_confidence)
                 combined_parts.append(
                     f"---\n\n**Question {idx}:** {q}\n\n{q_response}"
                 )
