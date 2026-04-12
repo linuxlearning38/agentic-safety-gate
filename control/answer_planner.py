@@ -28,6 +28,9 @@ ARCHITECTURE_ROLE_HINTS = {
     "ollama": "local model host used for inference",
 }
 
+PLAIN_COMPANY_NAMES = {"netflix", "uber", "twitter", "x", "meta", "amazon", "google"}
+ROLE_HINT_TERMS = {"gateway", "edge", "cache", "store", "stream", "processor", "service", "database", "front door", "transport"}
+
 
 def _first_sentence(text: str) -> str:
     match = re.split(r"(?<=[.!?])\s+", (text or "").strip(), maxsplit=1)
@@ -60,6 +63,17 @@ def _component_role(entity: str, evidence_blocks: list[str]) -> str:
             if len(sentence) >= 20:
                 return sentence
     return ARCHITECTURE_ROLE_HINTS.get(entity_lower, f"{entity} participates in the architecture flow shown by the retrieved evidence.")
+
+
+def _should_keep_architecture_entity(entity: str, evidence_blocks: list[str]) -> bool:
+    entity_lower = entity.lower()
+    if entity_lower not in PLAIN_COMPANY_NAMES:
+        return True
+    for line in evidence_blocks or []:
+        lower = line.lower()
+        if entity_lower in lower and any(term in lower for term in ROLE_HINT_TERMS):
+            return True
+    return False
 
 
 def _build_architecture_mermaid(entities: list[str], evidence_blocks: list[str], topic: str) -> str:
@@ -248,7 +262,7 @@ def build_troubleshooting_plan(route, evidence) -> AnswerPlan:
 
 
 def build_architecture_plan(route, evidence) -> AnswerPlan:
-    entities = list(evidence.entities or [])
+    entities = [entity for entity in (evidence.entities or []) if _should_keep_architecture_entity(entity, evidence.evidence_blocks)]
     evidence_blocks = list(evidence.evidence_blocks or [])
     topic = evidence.topic or route.topic or "external"
     response_mode = evidence.facts.get("response_mode", route.response_mode or "text")
@@ -420,6 +434,46 @@ def build_comparison_plan(route, evidence) -> AnswerPlan:
         topic="comparison",
         answer=answer,
         evidence=evidence.facts,
+        entities=list(evidence.entities or []),
+        confidence=confidence,
+    )
+
+
+def _definition_subject(query: str) -> str:
+    cleaned = (query or "").strip().rstrip("?.! ")
+    cleaned = re.sub(r"^(what is|what are|define|explain)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(a|an|the)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def build_definition_plan(route, evidence) -> AnswerPlan:
+    subject = _definition_subject(route.normalized_query)
+    lines = list(evidence.evidence_blocks or [])
+    if lines:
+        opening = _first_sentence(lines[0])
+        details = []
+        for line in lines[1:4]:
+            sentence = _first_sentence(line)
+            if sentence and sentence.lower() != opening.lower():
+                details.append(f"- {sentence}")
+        answer_lines = [opening]
+        if details:
+            answer_lines.extend(["", "Practical Details:", *details])
+        answer = "\n".join(answer_lines)
+        confidence = "high"
+    else:
+        answer = f"{subject or 'This concept'} is an infrastructure concept, but I don't have enough grounded detail yet to define it confidently."
+        confidence = "low"
+    return AnswerPlan(
+        intent="definition",
+        mode="deterministic",
+        topic="definition",
+        answer=answer,
+        evidence={
+            "subject": subject,
+            "evidence_blocks": lines,
+            "sources": evidence.facts.get("sources", []),
+        },
         entities=list(evidence.entities or []),
         confidence=confidence,
     )

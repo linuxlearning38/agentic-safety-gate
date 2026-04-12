@@ -26,6 +26,7 @@ from control.evidence_selector import (
     select_ava_self_evidence,
     select_architecture_evidence,
     select_comparison_evidence,
+    select_definition_evidence,
     select_follow_up_evidence,
     select_memory_store_evidence,
     select_memory_recall_evidence,
@@ -36,6 +37,7 @@ from control.answer_planner import (
     build_ava_self_plan,
     build_architecture_plan,
     build_comparison_plan,
+    build_definition_plan,
     build_follow_up_plan,
     build_memory_store_plan,
     build_memory_recall_plan,
@@ -686,6 +688,36 @@ def _resolve_comparison_response(query):
         "topic": plan.topic,
     }
 
+
+def _retrieve_definition_chunks(query):
+    raw_chunks = hybrid_retriever.query(
+        query_text=query,
+        n_policies=6,
+        n_blogs=2,
+        blog_min_relevance=0.01,
+        format_for_llm=False,
+    )
+    cleaned = []
+    for chunk in raw_chunks or []:
+        if hasattr(chunk, "content"):
+            chunk.content = hybrid_retriever._strip_section_labels(getattr(chunk, "content", ""))
+        cleaned.append(chunk)
+    return cleaned
+
+
+def _resolve_definition_response(query):
+    route = _route_query(query)
+    if route.intent != "definition":
+        return None
+    evidence = select_definition_evidence(route, _retrieve_definition_chunks(query))
+    plan = build_definition_plan(route, evidence)
+    return {
+        "response": compose_controlled_response(plan),
+        "confidence": plan.confidence,
+        "sources_used": len(evidence.evidence_blocks),
+        "topic": plan.topic,
+    }
+
 def _chat_payload(response_text="", response_type="knowledge", ok=True, confidence=None,
                   sources_used=0, time_taken="", **extra):
     payload = {
@@ -1280,7 +1312,7 @@ def _build_healing_response(query):
 def detect_query_intent(query):
     q = _normalize_user_query(query).lower().strip()
     controlled_route = _route_query(query)
-    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting", "architecture", "follow_up", "comparison"):
+    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting", "architecture", "follow_up", "comparison", "definition"):
         return controlled_route.intent
     if _is_healing_query(q):
         return "healing_incident"
@@ -1295,12 +1327,6 @@ def detect_query_intent(query):
         return "healing_incident"
     if re.search(r'\d+\s*%', q) and any(k in q for k in ["disk", "cpu", "memory", "usage", "full"]):
         return "healing_incident"
-    # Definition guard runs first — "what is/are" always wins regardless of
-    # other keywords present in the query (e.g. "what is the fix for...")
-    if q.startswith("what is") or q.startswith("what are"):
-        return "definition"
-    if any(q.startswith(prefix) for prefix in ["define", "explain "]):
-        return "definition"
     return "general"
 
 def build_memory_context(query=None):
@@ -1463,9 +1489,6 @@ def generate_response(query, context, confidence=None, prior_messages=None):
 
         if memory_ctx:
             system_parts.append(f"\nUSER CONTEXT (use this to tailor your answers):\n{memory_ctx}")
-
-        if query_intent == "definition":
-            system_parts.append("\nFor definition questions: start with a plain-English definition in the first sentence. Then give 2-4 practical details. If the retrieved context is related but incomplete, combine it with standard DevOps knowledge instead of refusing to answer.")
 
         if use_structured:
             system_parts.append("\nFor technical problems, always structure your answer as:\n\n**Root Cause:** [1-2 sentences]\n**Fix:** [exact commands or config]\n**Why this works:** [1-2 sentences]\n**Watch out for:** [edge cases or caveats]")
@@ -1989,6 +2012,19 @@ def ask():
                 time_taken=f"{elapsed:.2f}s",
             ))
 
+        if controlled_route.intent == "definition":
+            resolved = _resolve_definition_response(query)
+            response = resolved["response"]
+            elapsed = time.time() - start_time
+            _record_query(query, response, "definition", elapsed, sources_used=resolved["sources_used"], confidence=resolved["confidence"])
+            return jsonify(_chat_payload(
+                response,
+                response_type="knowledge",
+                confidence=resolved["confidence"],
+                sources_used=resolved["sources_used"],
+                time_taken=f"{elapsed:.2f}s",
+            ))
+
         if _is_healing_query(query) or detect_query_intent(query) == "healing_incident":
             response, healing_meta = _build_healing_response(query)
             elapsed = time.time() - start_time
@@ -2063,6 +2099,11 @@ def ask():
                 elif q_route.intent == "comparison":
                     q_context = []
                     q_resolved = _resolve_comparison_response(q)
+                    q_confidence = q_resolved["confidence"]
+                    q_response = q_resolved["response"]
+                elif q_route.intent == "definition":
+                    q_context = []
+                    q_resolved = _resolve_definition_response(q)
                     q_confidence = q_resolved["confidence"]
                     q_response = q_resolved["response"]
                 else:

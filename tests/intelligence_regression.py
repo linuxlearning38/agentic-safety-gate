@@ -18,8 +18,10 @@ FUNCTIONS = {
     "_retrieve_architecture_chunks",
     "_resolve_architecture_response",
     "_retrieve_comparison_chunks",
+    "_retrieve_definition_chunks",
     "_resolve_follow_up_response",
     "_resolve_comparison_response",
+    "_resolve_definition_response",
     "_retrieve_troubleshooting_chunks",
     "_resolve_troubleshooting_response",
     "_normalize_fact_key",
@@ -142,6 +144,10 @@ class FakeHybridRetriever:
                 FakeChunk("A readiness probe decides whether a container should receive traffic.", "policies"),
                 FakeChunk("A liveness probe decides whether Kubernetes should restart an unhealthy container.", "policies"),
             ])
+        if "oomkilled" in q and "what is" in q:
+            chunks.append(FakeChunk("OOMKilled is a Kubernetes termination reason that means the container exceeded its memory limit and the kernel killed it.", "policies"))
+        if "configmap" in q:
+            chunks.append(FakeChunk("A ConfigMap stores non-secret configuration data so Pods can consume settings without baking them into images.", "policies"))
         if "oomkilled" in q or "oom killed" in q:
             chunks.append(FakeChunk("OOMKilled happens when the container exceeds its memory limit.", "policies"))
             chunks.append(FakeChunk("Increase memory limits only after checking peak usage and leaks.", "fixes"))
@@ -179,6 +185,7 @@ def load_helpers():
         "select_ava_self_evidence": evidence_selector.select_ava_self_evidence,
         "select_architecture_evidence": evidence_selector.select_architecture_evidence,
         "select_comparison_evidence": evidence_selector.select_comparison_evidence,
+        "select_definition_evidence": evidence_selector.select_definition_evidence,
         "select_follow_up_evidence": evidence_selector.select_follow_up_evidence,
         "select_memory_store_evidence": evidence_selector.select_memory_store_evidence,
         "select_memory_recall_evidence": evidence_selector.select_memory_recall_evidence,
@@ -187,6 +194,7 @@ def load_helpers():
         "build_ava_self_plan": answer_planner.build_ava_self_plan,
         "build_architecture_plan": answer_planner.build_architecture_plan,
         "build_comparison_plan": answer_planner.build_comparison_plan,
+        "build_definition_plan": answer_planner.build_definition_plan,
         "build_follow_up_plan": answer_planner.build_follow_up_plan,
         "build_memory_store_plan": answer_planner.build_memory_store_plan,
         "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
@@ -308,6 +316,7 @@ def main():
     comparison_route = ns["_route_query"]("What is the difference between readiness probe and liveness probe?")
     check("comparison route is controlled", comparison_route.intent == "comparison")
     check("comparison route extracts targets", len(comparison_route.comparison_targets) == 2)
+    check("definition route is controlled", ns["_route_query"]("What is readiness probe?").intent == "definition")
 
     fake_db.queries = [
         {"query": "Remember this exactly: cluster=prod-west-2", "response": "Okay", "intent": "memory"},
@@ -437,6 +446,10 @@ def main():
     check("controlled follow_up response is deterministic", "latest answer summary" in follow_up_resolved["response"].lower())
     comparison_resolved = ns["_resolve_comparison_response"]("What is the difference between readiness probe and liveness probe?")
     check("controlled comparison response includes both targets", "readiness probe" in comparison_resolved["response"].lower() and "liveness probe" in comparison_resolved["response"].lower())
+    definition_resolved = ns["_resolve_definition_response"]("What is readiness probe?")
+    check("controlled definition response is deterministic", "readiness probe" in definition_resolved["response"].lower() and "receive traffic" in definition_resolved["response"].lower())
+    configmap_resolved = ns["_resolve_definition_response"]("What is a ConfigMap?")
+    check("controlled configmap definition response is grounded", "configmap" in configmap_resolved["response"].lower() and "configuration data" in configmap_resolved["response"].lower())
 
     wrapped = '{"issue_type":"definition","command":"","risk_level":"","rollback":"","action_taken":"Readiness probe checks readiness. Liveness probe checks health."}'
     check("wrapper detected", ns["_looks_like_invalid_json_wrapper"](wrapped) is True)
