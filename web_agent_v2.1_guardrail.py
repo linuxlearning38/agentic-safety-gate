@@ -697,6 +697,25 @@ def _retrieve_definition_chunks(query):
         blog_min_relevance=0.01,
         format_for_llm=False,
     )
+    entities = _extract_query_entities(query)
+    boosted_chunks = []
+    if entities and hasattr(hybrid_retriever, "_keyword_fetch"):
+        keyword_limit = 4
+        for collection in [
+            getattr(hybrid_retriever, "patterns_collection", None),
+            getattr(hybrid_retriever, "policies_collection", None),
+        ]:
+            boosted_chunks.extend(hybrid_retriever._keyword_fetch(collection, entities, limit=keyword_limit))
+    if boosted_chunks:
+        seen = {getattr(chunk, "content", None) for chunk in (raw_chunks or [])}
+        prepended = []
+        for chunk in boosted_chunks:
+            content = getattr(chunk, "content", None)
+            if content not in seen:
+                prepended.append(chunk)
+                seen.add(content)
+        if prepended:
+            raw_chunks = prepended + list(raw_chunks or [])
     cleaned = []
     for chunk in raw_chunks or []:
         if hasattr(chunk, "content"):

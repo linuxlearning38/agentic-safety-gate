@@ -69,6 +69,34 @@ def _get_client() -> chromadb.PersistentClient:
     )
 
 
+def _delete_collection_ids(collection, ids: list[str]) -> int:
+    if not ids:
+        return 0
+
+    deleted = 0
+    for start in range(0, len(ids), 200):
+        batch = ids[start:start + 200]
+        collection.delete(ids=batch)
+        deleted += len(batch)
+    return deleted
+
+
+def _refresh_collection_by_metadata(collection_name: str, where: dict, label: str) -> int:
+    client = _get_client()
+    collection = client.get_or_create_collection(name=collection_name)
+    try:
+        result = collection.get(where=where)
+    except Exception as exc:
+        logger.warning(f"Refresh skipped for {label} in '{collection_name}': {exc}")
+        return 0
+
+    ids = result.get("ids", []) if result else []
+    deleted = _delete_collection_ids(collection, ids)
+    if deleted:
+        logger.info(f"Removed {deleted} stale chunks from '{collection_name}' for {label}")
+    return deleted
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 def ingest_text_to_collection(collection_name: str, text: str, metadata: dict) -> bool:
     """
@@ -357,6 +385,16 @@ SEED_PATTERNS = [
         "tags": "kubernetes, hpa, autoscaling, scaling, cpu, metrics"
     },
     {
+        "name": "ConfigMap Definition",
+        "category": "kubernetes",
+        "description": "A ConfigMap is a Kubernetes object that stores non-sensitive configuration data such as URLs, feature flags, port numbers, or log levels. Pods can consume a ConfigMap as environment variables, command arguments, or mounted files.",
+        "implementation": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app-config\ndata:\n  LOG_LEVEL: info\n  API_BASE_URL: https://api.internal\n\n# Pod usage examples:\nenvFrom:\n- configMapRef:\n    name: app-config\n\nvolumeMounts:\n- name: app-config\n  mountPath: /etc/app-config\n  readOnly: true",
+        "benefits": "Separates configuration from container images. Lets teams update non-sensitive settings without rebuilding the image.",
+        "tradeoffs": "ConfigMaps are not for secrets. Sensitive values belong in Secrets or an external secret manager.",
+        "example": "Use a ConfigMap for APP_MODE=production or LOG_LEVEL=debug, but store database passwords in a Secret.",
+        "tags": "kubernetes, configmap, configuration, pod-config, non-sensitive"
+    },
+    {
         "name": "ConfigMap vs Secret Decision Pattern",
         "category": "kubernetes",
         "description": "Use ConfigMap for non-sensitive configuration (feature flags, URLs, log levels). Use Secret for credentials, tokens, keys. Never store secrets in ConfigMaps or environment variables in plain-text Dockerfiles.",
@@ -365,6 +403,16 @@ SEED_PATTERNS = [
         "tradeoffs": "Kubernetes Secrets are only base64-encoded by default — not encrypted at rest unless etcd encryption is enabled or you use ESO.",
         "example": "Use External Secrets Operator to sync AWS Secrets Manager secrets into Kubernetes Secrets automatically.",
         "tags": "kubernetes, configmap, secret, configuration, security, eso"
+    },
+    {
+        "name": "Readiness Probe Definition",
+        "category": "kubernetes",
+        "description": "A readiness probe is a Kubernetes health check that decides whether a running container is ready to receive traffic. If the readiness probe fails, Kubernetes keeps the Pod running but removes it from Service endpoints until it becomes ready again.",
+        "implementation": "readinessProbe:\n  httpGet:\n    path: /ready\n    port: 8080\n  initialDelaySeconds: 5\n  periodSeconds: 5\n  failureThreshold: 2\n\n# Effect:\n# probe passes -> Pod can receive Service traffic\n# probe fails  -> Pod stays running but is removed from ready endpoints",
+        "benefits": "Prevents traffic from reaching a container before it is ready. Helps with safer rollouts and dependency-aware startup.",
+        "tradeoffs": "A bad readiness probe can keep healthy Pods out of rotation or flap endpoints during transient dependency issues.",
+        "example": "Use readiness probes for apps that need warm-up time, migrations, or downstream dependencies before serving requests.",
+        "tags": "kubernetes, readiness, readiness-probe, health-check, service-endpoints"
     },
     {
         "name": "Probe Design: Liveness vs Readiness vs Startup",
@@ -1115,7 +1163,7 @@ ARCHITECTURE_SEED_PATTERNS = [
         "name": "Streaming Analytics Pipeline Pattern",
         "category": "architecture",
         "description": "Use a streaming log such as Kafka to collect events, then process them with a stream processor such as Samza or Flink to compute aggregates, enrich records, and feed downstream systems in near real time.",
-        "implementation": "Pipeline Flow:\n1. Producers emit ordered events into Kafka topics.\n2. Stream processors consume partitions in parallel.\n3. Processors enrich, aggregate, or join event streams.\n4. Results are written to serving databases, caches, alerting systems, or downstream topics.\n\nWhen answering architecture questions, explain that Kafka is the transport backbone while the stream processor performs stateful computation over the event stream.",
+        "implementation": "Pipeline Flow:\n1. Producers emit ordered events into Kafka topics.\n2. Stream processors consume partitions in parallel.\n3. Processors enrich, aggregate, or join event streams.\n4. Results are written to serving databases, caches, alerting systems, or downstream topics.\n\nIn this pattern, Kafka is the transport backbone while the stream processor performs stateful computation over the event stream.",
         "benefits": "Near-real-time analytics. Decouples producers from consumers. Supports replay and reprocessing from the log.",
         "tradeoffs": "Operational complexity rises with consumer lag, partitioning, and schema evolution. Stateful stream jobs need checkpointing and recovery strategy.",
         "example": "Kafka carries playback or platform events, Samza computes aggregates, and downstream systems persist derived views for dashboards and APIs.",
@@ -1144,10 +1192,10 @@ ARCHITECTURE_SEED_PATTERNS = [
     {
         "name": "Architecture Explanation Pattern for AVA",
         "category": "architecture",
-        "description": "When answering architecture questions, AVA should identify components first, then explain request flow, then data flow, then why each major technology exists. Avoid generic labels unless grounded by retrieved text.",
+        "description": "A strong architecture explanation identifies components first, then explains request flow, then data flow, then why each major technology exists. Generic labels should be avoided unless they are grounded by retrieved text.",
         "implementation": "Answer Template:\n1. Components: list named technologies exactly as grounded.\n2. Request Flow: explain the synchronous traffic path.\n3. Data Flow: explain event, storage, and cache movement.\n4. Key Technologies: map each named component to its role.\n5. Why They Are Used: summarize the system-level purpose.\n\nGrounding Rules:\n- Prefer named entities from the user query and retrieved context.\n- Prefer relationship lines with verbs like routes, carries, stores, caches, processes, monitors.\n- Avoid mixing unrelated SRE snippets into architecture explanations.",
         "benefits": "Makes architecture answers consistent, readable, and closer to expert system-design explanations.",
-        "tradeoffs": "Needs clean architecture context to work well. If the retrieved evidence is weak, AVA should stay narrow instead of hallucinating.",
+        "tradeoffs": "Needs clean architecture context to work well. Weak or missing evidence reduces answer quality; prefer fewer grounded statements over fabricated component roles.",
         "example": "For Zuul + Kafka + Cassandra + EVCache + Samza + Mantis: explain gateway routing, event streaming, durable state, cache reads, stream processing, and observability as separate roles.",
         "tags": "architecture, answer-quality, grounding, request-flow, data-flow, ava"
     },
@@ -1186,13 +1234,17 @@ def _pattern_to_text(p: dict) -> str:
         f"IMPLEMENTATION:\n{p['implementation']}\n\n"
         f"BENEFITS: {p['benefits']}\n\n"
         f"TRADEOFFS: {p['tradeoffs']}\n\n"
-        f"EXAMPLE: {p['example']}\n\n"
-        f"TAGS: {p['tags']}"
+        f"EXAMPLE: {p['example']}"
     )
 
 
 def seed_patterns_collection():
     """Ingest all 50 seed patterns into devops_patterns_v1."""
+    _refresh_collection_by_metadata(
+        COLLECTION_PATTERNS,
+        {"source": "ava_seed_patterns_v1"},
+        "seed patterns"
+    )
     logger.info(f"Seeding {len(SEED_PATTERNS)} patterns into '{COLLECTION_PATTERNS}'...")
     ok = 0
     fail = 0
@@ -1216,6 +1268,11 @@ def seed_patterns_collection():
 
 def seed_architecture_patterns_collection():
     """Ingest architecture-focused seed patterns into devops_patterns_v1."""
+    _refresh_collection_by_metadata(
+        COLLECTION_PATTERNS,
+        {"source": "ava_architecture_patterns_v1"},
+        "architecture seed patterns"
+    )
     logger.info(f"Seeding {len(ARCHITECTURE_SEED_PATTERNS)} architecture patterns into '{COLLECTION_PATTERNS}'...")
     ok = 0
     fail = 0
@@ -1239,20 +1296,23 @@ def seed_architecture_patterns_collection():
 
 def _architecture_reference_to_text(doc: dict) -> str:
     return (
-        f"ARCHITECTURE REFERENCE: {doc['title']}\n\n"
-        f"CATEGORY: {doc['category']}\n\n"
+        f"REFERENCE: {doc['title']}\n\n"
         f"SOURCE: {doc['source']}\n"
         f"SOURCE URL: {doc['source_url']}\n\n"
-        f"SUMMARY: {doc['summary']}\n\n"
-        f"ARCHITECTURE NOTES: {doc['architecture_notes']}\n\n"
-        f"REQUEST FLOW: {doc['request_flow']}\n\n"
-        f"DATA FLOW: {doc['data_flow']}\n\n"
-        f"TAGS: {doc['tags']}"
+        f"{doc['summary']}\n\n"
+        f"Architecture role: {doc['architecture_notes']}\n\n"
+        f"Request flow: {doc['request_flow']}\n\n"
+        f"Data flow: {doc['data_flow']}"
     )
 
 
 def seed_architecture_reference_corpus():
     """Ingest curated architecture reference material into devops_patterns_v1."""
+    _refresh_collection_by_metadata(
+        COLLECTION_PATTERNS,
+        {"category": "architecture_reference"},
+        "architecture reference corpus"
+    )
     logger.info(f"Seeding {len(ARCHITECTURE_REFERENCE_DOCS)} architecture references into '{COLLECTION_PATTERNS}'...")
     ok = 0
     fail = 0
