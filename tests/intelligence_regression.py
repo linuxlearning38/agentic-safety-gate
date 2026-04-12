@@ -37,8 +37,6 @@ FUNCTIONS = {
     "_topic_signature",
     "_response_summary",
     "_grounding_confident_enough",
-    "_build_follow_up_response",
-    "_is_follow_up_query",
     "_is_healing_query",
     "_json_only_requested",
     "_predict_heal_action",
@@ -46,24 +44,12 @@ FUNCTIONS = {
     "_build_healing_response",
     "_extract_query_entities",
     "_diagram_entities_from_text",
-    "_hallucination_terms",
-    "_repair_architecture_answer",
-    "_build_grounded_architecture_answer",
-    "_looks_generic_architecture_answer",
     "_extract_relevant_context_lines",
     "_is_noisy_architecture_line",
-    "_filter_architecture_chunks",
     "_build_diagram_grounding_block",
-    "_looks_like_mermaid_response",
-    "_build_grounded_mermaid_diagram",
-    "_repair_diagram_response",
     "_is_ava_self_architecture_query",
-    "_diagram_needs_grounded_override",
-    "_ava_runtime_diagram_entities",
-    "_build_ava_runtime_diagram_response",
     "_looks_like_invalid_json_wrapper",
     "_repair_definition_wrapper",
-    "_answer_known_incident_query",
     "_answer_ava_self_query",
     "detect_query_intent",
 }
@@ -72,7 +58,6 @@ CONSTANTS = {
     "_MEMORY_FACT_KEY",
     "_ENTITY_STOP_WORDS",
     "_INFRA_COMPONENTS",
-    "_GENERIC_HALLUCINATION_TERMS",
     "_KNOWN_DIAGRAM_TECH",
 }
 
@@ -329,9 +314,6 @@ def main():
         {"query": "What is my cluster name?", "response": "Your cluster is prod-west-2.", "intent": "memory"},
         {"query": "What is the difference between readiness probe and liveness probe?", "response": "Readiness probe checks if a container is ready. Liveness probe checks if it is healthy enough to keep running.", "intent": "definition"},
     ]
-    follow_up = ns["_build_follow_up_response"]("How is it different from the previous thing I asked?")
-    check("follow up references latest topic", "readiness probe" in follow_up.lower())
-    check("follow up references prior topic", "cluster name" in follow_up.lower())
     check("response summary strips mermaid fence", ns["_response_summary"]("```mermaid\ngraph TD\nA-->B\n```\n\nGrounded explanation.") == "Grounded explanation.")
     check("response summary skips headings", ns["_response_summary"]("**Explanation:**\n- ava-agent uses Redis.") == "- ava-agent uses Redis.")
     check("response summary skips plain section label", ns["_response_summary"]("Explanation:\n- ava-agent uses Redis.") == "- ava-agent uses Redis.")
@@ -387,15 +369,6 @@ def main():
     )
     check("diagram grounding mentions detected entities", "zuul" in grounding.lower())
     check("diagram grounding mentions kafka", "kafka" in grounding.lower())
-    filtered_chunks = ns["_filter_architecture_chunks"](
-        [
-            FakeChunk("Zuul routes API requests to downstream services and Kafka carries events to Cassandra."),
-            FakeChunk("terraform init"),
-            FakeChunk("Kubernetes investigations and Kafka lag experiments"),
-        ],
-        ["Zuul", "Kafka", "Cassandra"],
-    )
-    check("architecture chunk filter keeps relationship-rich chunks", len(filtered_chunks) == 1 and "Zuul routes API requests" in filtered_chunks[0].content)
     relevant_lines = ns["_extract_relevant_context_lines"](
         ["Zuul routes API requests to Kafka.\nKafka writes events to Cassandra.\nKafka writes events to Cassandra."],
         ["Zuul", "Kafka", "Cassandra"],
@@ -404,17 +377,6 @@ def main():
     check("relevant context lines dedupe duplicates", relevant_lines[0] != "" and len(set(relevant_lines)) == len(relevant_lines))
     check("architecture noise line detected", ns["_is_noisy_architecture_line"]("# Queue depth: kafka_consumer_lag, redis_blocked_clients") is True)
 
-    mermaid = ns["_build_grounded_mermaid_diagram"](
-        ["Zuul handles API gateway traffic to Kafka", "Kafka carries events to Cassandra"],
-        ["Zuul", "Kafka", "Cassandra"],
-    )
-    check("grounded mermaid generated", mermaid.startswith("```mermaid"))
-    check("grounded mermaid keeps entities", "Zuul" in mermaid and "Kafka" in mermaid)
-    ava_mermaid = ns["_build_grounded_mermaid_diagram"](
-        ["ava-agent calls Ollama Host and uses Redis and PostgreSQL"],
-        ["ava-agent", "Flask/Gunicorn", "PostgreSQL", "Redis", "Open Policy Agent", "HashiCorp Vault", "Ollama Host"],
-    )
-    check("ava mermaid uses preferred edges", "checks policy with" in ava_mermaid and "uses secrets from" in ava_mermaid)
     check(
         "ava self architecture query detected",
         ns["_is_ava_self_architecture_query"](
@@ -422,29 +384,6 @@ def main():
             ["ava-agent", "Redis"],
         ) is True,
     )
-    check(
-        "generic docker diagram needs override",
-        ns["_diagram_needs_grounded_override"](
-            "```mermaid\ngraph LR\nA[Docker Host] --> B(Docker Daemon)\n```",
-            ["ava-agent", "Redis", "PostgreSQL"],
-        ) is True,
-    )
-    check(
-        "ava runtime diagram entities are canonical",
-        ns["_ava_runtime_diagram_entities"]() == [
-            "ava-agent",
-            "Flask/Gunicorn",
-            "PostgreSQL",
-            "Redis",
-            "Open Policy Agent",
-            "HashiCorp Vault",
-            "Ollama Host",
-        ],
-    )
-    ava_runtime_diagram = ns["_build_ava_runtime_diagram_response"]()
-    check("ava runtime diagram is mermaid", ava_runtime_diagram.startswith("```mermaid"))
-    check("ava runtime diagram includes policy edge", "checks policy with" in ava_runtime_diagram)
-    check("ava runtime diagram includes ollama port", "11434" in ava_runtime_diagram)
     check(
         "topic from ava mermaid turn stays readable",
         ns["_topic_from_turn"]({
@@ -454,53 +393,8 @@ def main():
         }) == "ava-agent, PostgreSQL, Redis",
     )
 
-    repaired_diagram = ns["_repair_diagram_response"](
-        "Zuul routes requests to Kafka.",
-        ["Zuul routes requests to Kafka", "Kafka stores events in Cassandra"],
-        ["Zuul", "Kafka", "Cassandra"],
-    )
-    check("diagram repair returns mermaid", ns["_looks_like_mermaid_response"](repaired_diagram) is True)
 
-    hallucinations = ns["_hallucination_terms"](
-        "This uses frontend, backend, and event sourcing heavily.",
-        ["kafka", "zuul"],
-    )
-    check("hallucination terms detected", "frontend" in hallucinations and "backend" in hallucinations)
 
-    repaired_arch = ns["_repair_architecture_answer"](
-        "Microservices architecture\nFrontend handles users\nZuul is the gateway\nKafka handles events",
-        ["Zuul", "Kafka"],
-    )
-    check("architecture repair keeps grounded entities", "Zuul" in repaired_arch and "Kafka" in repaired_arch)
-    grounded_arch = ns["_build_grounded_architecture_answer"](
-        [
-            "Zuul routes API requests to backend services.",
-            "# Queue depth: kafka_consumer_lag, redis_blocked_clients",
-            "ARCHITECTURE REFERENCE: Kafka Design Overview",
-            "Kafka carries playback events to Samza.",
-            "Samza writes processed aggregates to Cassandra.",
-            "EVCache caches hot reads for low latency.",
-            "Mantis monitors streaming jobs and health.",
-            "EXAMPLE: Netflix uses feature flags to enable new algorithms for 1% of users.",
-            "Entities detected: cassandra, evcache, mantis, kafka, samza, zuul",
-            "terraform init",
-        ],
-        ["Zuul", "Kafka", "Cassandra", "EVCache", "Samza", "Mantis"],
-    )
-    check("grounded architecture answer has request flow", "**Request Flow:**" in grounded_arch and "Zuul routes API requests" in grounded_arch)
-    check("grounded architecture answer has data flow", "**Data Flow:**" in grounded_arch and "Kafka carries playback events" in grounded_arch)
-    check("grounded architecture answer filters noise", "terraform init" not in grounded_arch and "Entities detected" not in grounded_arch and "kafka_consumer_lag" not in grounded_arch and "feature flags" not in grounded_arch and "Kafka Design Overview" not in grounded_arch)
-    sparse_arch = ns["_build_grounded_architecture_answer"](
-        [
-            "Zuul is the front door for requests from devices and web sites to backend services.",
-            "Kafka is a distributed event streaming platform for producers and consumers.",
-            "Cassandra is a distributed NoSQL database for low-latency serving state.",
-            "EVCache is a replicated cache for hot reads.",
-        ],
-        ["Zuul", "Kafka", "Cassandra", "EVCache"],
-    )
-    check("sparse architecture answer synthesizes request flow", "Zuul sits at the edge" in sparse_arch and "publish domain events into Kafka" in sparse_arch)
-    check("sparse architecture answer synthesizes data flow", "durable event backbone" in sparse_arch and "hot reads" in sparse_arch)
     ava_self_models = ns["_answer_ava_self_query"](
         "What models are you running?",
         about={
@@ -543,14 +437,6 @@ def main():
     check("controlled follow_up response is deterministic", "latest answer summary" in follow_up_resolved["response"].lower())
     comparison_resolved = ns["_resolve_comparison_response"]("What is the difference between readiness probe and liveness probe?")
     check("controlled comparison response includes both targets", "readiness probe" in comparison_resolved["response"].lower() and "liveness probe" in comparison_resolved["response"].lower())
-    oom_answer = ns["_answer_known_incident_query"]("What causes OOMKilled in Kubernetes?")
-    check("oomkilled answer is deterministic", oom_answer.startswith("**Root Cause:**") and "memory limit" in oom_answer)
-    check(
-        "generic architecture answer detected",
-        ns["_looks_generic_architecture_answer"](
-            "**Components:**\n- Kafka: Distributed Streaming Platform\n- EVCache: In-Memory Cache\n- Mantis: Monitoring and Alerting System"
-        ) is True,
-    )
 
     wrapped = '{"issue_type":"definition","command":"","risk_level":"","rollback":"","action_taken":"Readiness probe checks readiness. Liveness probe checks health."}'
     check("wrapper detected", ns["_looks_like_invalid_json_wrapper"](wrapped) is True)

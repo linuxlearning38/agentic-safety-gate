@@ -487,10 +487,6 @@ _INFRA_COMPONENTS = [
     "kafka", "samza", "mantis", "zuul", "resilience4j", "evcache", "netty",
     "cdn", "open connect",
 ]
-_GENERIC_HALLUCINATION_TERMS = {
-    "frontend", "backend", "event sourcing", "microservices architecture",
-}
-
 def _normalize_text(value):
     if value is None:
         return ""
@@ -840,169 +836,6 @@ def _extract_diagram_entities(llava_text: str) -> list:
             found.append(tech)
     return found
 
-def _hallucination_terms(response_text, entities):
-    text = _normalize_text(response_text).lower()
-    entity_terms = {e.lower() for e in entities}
-    problems = []
-    for term in _GENERIC_HALLUCINATION_TERMS:
-        if term in text and term not in entity_terms:
-            problems.append(term)
-    return problems
-
-def _repair_architecture_answer(response_text, entities):
-    text = _normalize_text(response_text).strip()
-    if not text:
-        return text
-    lines = [line for line in text.splitlines() if line.strip()]
-    if entities:
-        entity_lower = [e.lower() for e in entities]
-        filtered = []
-        for line in lines:
-            lower = line.lower()
-            if any(term in lower for term in _GENERIC_HALLUCINATION_TERMS) and not any(e in lower for e in entity_lower):
-                continue
-            filtered.append(line)
-        lines = filtered or lines
-        if not any(any(e in line.lower() for e in entity_lower) for line in lines):
-            lines.insert(0, "Components: " + ", ".join(entities))
-    return "\n".join(lines)
-
-
-def _build_grounded_architecture_answer(context_blocks, entities):
-    entities = [entity for entity in (entities or []) if entity][:6]
-    relevant_lines = []
-    for block in context_blocks or []:
-        for line in block.splitlines():
-            cleaned = _normalize_text(line).strip(" -\t")
-            if cleaned:
-                relevant_lines.append(cleaned)
-    noise_markers = (
-        "docker",
-    )
-    filtered_lines = []
-    for line in relevant_lines:
-        lower = line.lower().strip()
-        if not lower:
-            continue
-        if _is_noisy_architecture_line(line):
-            continue
-        if any(marker in lower for marker in noise_markers):
-            continue
-        if len(lower.split()) < 4:
-            continue
-        entity_hits = sum(1 for entity in entities if entity.lower() in lower)
-        relation_hits = sum(
-            1 for term in ("route", "request", "gateway", "stream", "event", "cache", "store", "read", "write", "monitor", "process", "carry", "ingest")
-            if term in lower
-        )
-        if entities and entity_hits == 0:
-            continue
-        if entity_hits == 0 and relation_hits == 0:
-            continue
-        filtered_lines.append(line)
-    relevant_lines = filtered_lines[:10]
-    if not relevant_lines and not entities:
-        return None
-
-    entity_facts = {}
-    for entity in entities:
-        lower_entity = entity.lower()
-        for line in relevant_lines:
-            if lower_entity in line.lower():
-                entity_facts[entity] = line.strip()
-                break
-
-    request_terms = ("request", "route", "gateway", "proxy", "client", "api", "entry")
-    data_terms = ("data", "event", "stream", "store", "cache", "read", "write", "persist", "kafka", "cassandra")
-    request_flow = []
-    data_flow = []
-    for line in relevant_lines:
-        lower = line.lower()
-        if any(term in lower for term in request_terms) and line not in request_flow:
-            request_flow.append(line)
-        if any(term in lower for term in data_terms) and line not in data_flow:
-            data_flow.append(line)
-
-    entity_fact_lower = {entity.lower(): fact for entity, fact in entity_facts.items()}
-    synthesized_request = []
-    synthesized_data = []
-    if "zuul" in entity_fact_lower:
-        synthesized_request.append("Zuul sits at the edge and routes incoming requests to backend services.")
-    if "kafka" in entity_fact_lower:
-        synthesized_request.append("After synchronous request handling, services publish domain events into Kafka for downstream asynchronous work.")
-        synthesized_data.append("Kafka acts as the durable event backbone between producers and downstream consumers.")
-    if "samza" in entity_fact_lower:
-        synthesized_data.append("Samza consumes stream data, processes it, and emits derived outputs or aggregates.")
-    if "cassandra" in entity_fact_lower:
-        synthesized_data.append("Cassandra stores durable distributed state for serving and downstream systems.")
-    if "evcache" in entity_fact_lower:
-        synthesized_data.append("EVCache serves hot reads to reduce latency in front of durable stores.")
-    if "mantis" in entity_fact_lower:
-        synthesized_data.append("Mantis processes or observes streaming data outside the direct end-user request path.")
-
-    for line in synthesized_request:
-        if line not in request_flow:
-            request_flow.append(line)
-    for line in synthesized_data:
-        if line not in data_flow:
-            data_flow.append(line)
-
-    component_lines = []
-    for entity in entities:
-        if entity.lower() in {"netflix", "ava"} and len(entities) >= 4:
-            continue
-        fact = entity_facts.get(entity)
-        if fact:
-            component_lines.append(f"- {entity}: {fact}")
-        else:
-            component_lines.append(f"- {entity}")
-
-    tech_lines = []
-    for entity in entities:
-        if entity.lower() in {"netflix", "ava"} and len(entities) >= 4:
-            continue
-        fact = entity_facts.get(entity)
-        if fact:
-            tech_lines.append(f"- {entity}: grounded by '{fact}'")
-        else:
-            tech_lines.append(f"- {entity}")
-
-    why_used = []
-    if request_flow:
-        why_used.append("- They are used together to route incoming requests through the right entry and service paths.")
-    if data_flow:
-        why_used.append("- They are used together to move, store, and cache operational or event data with lower latency.")
-    if relevant_lines:
-        why_used.append("- Grounded context shows these components are connected by explicit request/data relationships, not just listed independently.")
-
-    sections = ["**Components:**"]
-    sections.extend(component_lines or ["- No grounded components found."])
-    if request_flow:
-        sections.append("\n**Request Flow:**")
-        sections.extend(f"- {line}" for line in request_flow[:4])
-    if data_flow:
-        sections.append("\n**Data Flow:**")
-        sections.extend(f"- {line}" for line in data_flow[:4])
-    sections.append("\n**Key Technologies:**")
-    sections.extend(tech_lines or ["- No grounded technologies found."])
-    if why_used:
-        sections.append("\n**Why They Are Used:**")
-        sections.extend(why_used[:3])
-    return "\n".join(sections)
-
-
-def _looks_generic_architecture_answer(response_text):
-    text = _normalize_text(response_text).lower()
-    generic_markers = [
-        "distributed streaming platform",
-        "in-memory cache",
-        "monitoring and alerting system",
-        "nosql database",
-        "requests enter through",
-        "routes requests to appropriate microservices",
-    ]
-    return sum(1 for marker in generic_markers if marker in text) >= 2
-
 def _build_diagram_grounding_block(question, context_blocks, extracted_entities):
     lines = [
         "Diagram grounding rules:",
@@ -1018,103 +851,6 @@ def _build_diagram_grounding_block(question, context_blocks, extracted_entities)
         relevant = _extract_relevant_context_lines(context_blocks, extracted_entities, limit=10)
         lines.extend(f"- {line}" for line in relevant[:10])
     return "\n".join(lines)
-
-
-def _looks_like_mermaid_response(response_text):
-    text = _normalize_text(response_text).strip()
-    return text.startswith("```mermaid") or text.startswith("graph TD") or text.startswith("graph LR")
-
-
-def _build_grounded_mermaid_diagram(context_blocks, entities):
-    if not entities:
-        return None
-
-    unique_entities = []
-    seen = set()
-    for entity in entities:
-        lower = entity.lower()
-        if lower not in seen:
-            seen.add(lower)
-            unique_entities.append(entity)
-    unique_entities = unique_entities[:6]
-    if not unique_entities:
-        return None
-
-    node_ids = {entity.lower(): f"N{idx}" for idx, entity in enumerate(unique_entities, start=1)}
-    lines = ["```mermaid", "graph TD"]
-    for entity in unique_entities:
-        safe_label = entity.replace('"', "'")
-        lines.append(f'    {node_ids[entity.lower()]}["{safe_label}"]')
-
-    self_architecture_terms = {entity.lower() for entity in unique_entities}
-    if "ava-agent" in self_architecture_terms:
-        preferred_edges = [
-            ("ava-agent", "flask/gunicorn", "serves"),
-            ("ava-agent", "postgresql", "reads/writes"),
-            ("ava-agent", "redis", "caches"),
-            ("ava-agent", "open policy agent", "checks policy with"),
-            ("ava-agent", "hashicorp vault", "uses secrets from"),
-            ("ava-agent", "ollama host", "calls"),
-        ]
-        added_self_edges = False
-        for left, right, relation in preferred_edges:
-            if left in node_ids and right in node_ids:
-                added_self_edges = True
-                lines.append(
-                    f'    {node_ids[left]} -- "{relation}" --> {node_ids[right]}'
-                )
-        if added_self_edges:
-            lines.append("```")
-            return "\n".join(lines)
-
-    relation_terms = [
-        "handles", "routes", "calls", "uses", "writes", "stores",
-        "publishes", "sends", "reads", "connects", "proxies",
-        "feeds", "triggers", "loads", "carries",
-    ]
-    added_edges = set()
-    relevant_lines = _extract_relevant_context_lines(context_blocks, unique_entities, limit=12)
-    for line in relevant_lines:
-        lower = line.lower()
-        present = [entity for entity in unique_entities if entity.lower() in lower]
-        if len(present) < 2:
-            continue
-        left, right = present[0], present[1]
-        relation = "flows to"
-        for term in relation_terms:
-            if term in lower:
-                relation = term
-                break
-        edge_key = (left.lower(), right.lower(), relation)
-        if edge_key in added_edges:
-            continue
-        added_edges.add(edge_key)
-        lines.append(
-            f'    {node_ids[left.lower()]} -- "{relation}" --> {node_ids[right.lower()]}'
-        )
-
-    if not added_edges and len(unique_entities) >= 2:
-        for left, right in zip(unique_entities, unique_entities[1:]):
-            lines.append(
-                f'    {node_ids[left.lower()]} -- "flows to" --> {node_ids[right.lower()]}'
-            )
-
-    lines.append("```")
-    return "\n".join(lines)
-
-
-def _repair_diagram_response(response_text, context_blocks, entities):
-    text = _normalize_text(response_text).strip()
-    if not text:
-        return _build_grounded_mermaid_diagram(context_blocks, entities) or text
-    if text.startswith("```mermaid"):
-        return text
-    if text.startswith("graph TD") or text.startswith("graph LR"):
-        return f"```mermaid\n{text}\n```"
-    grounded = _build_grounded_mermaid_diagram(context_blocks, entities)
-    if grounded:
-        return grounded + "\n\nGrounded from detected components only."
-    return text
 
 
 def _is_ava_self_architecture_query(query, entities=None):
@@ -1133,58 +869,6 @@ def _is_ava_self_architecture_query(query, entities=None):
             return True
     return False
 
-
-def _diagram_needs_grounded_override(response_text, entities):
-    text = _normalize_text(response_text).lower()
-    if not text:
-        return True
-    generic_markers = [
-        "docker host", "docker daemon", "containers:", "each container runs a specific service",
-    ]
-    if any(marker in text for marker in generic_markers):
-        return True
-    required_entities = [entity.lower() for entity in (entities or []) if entity]
-    if required_entities:
-        hits = sum(1 for entity in required_entities if entity in text)
-        if hits < min(3, len(required_entities)):
-            return True
-    return False
-
-
-def _ava_runtime_diagram_entities():
-    return [
-        "ava-agent",
-        "Flask/Gunicorn",
-        "PostgreSQL",
-        "Redis",
-        "Open Policy Agent",
-        "HashiCorp Vault",
-        "Ollama Host",
-    ]
-
-
-def _build_ava_runtime_diagram_response():
-    return (
-        "```mermaid\n"
-        "graph LR\n"
-        "    A[\"ava-agent:5443\"]\n"
-        "    B[\"Flask/Gunicorn\"]\n"
-        "    C[\"PostgreSQL:5432\"]\n"
-        "    D[\"Redis:6379\"]\n"
-        "    E[\"Open Policy Agent:8181\"]\n"
-        "    F[\"HashiCorp Vault:8200\"]\n"
-        "    G[\"Ollama Host:11434\"]\n"
-        "    A -- \"serves via\" --> B\n"
-        "    A -- \"reads/writes\" --> C\n"
-        "    A -- \"caches with\" --> D\n"
-        "    A -- \"checks policy with\" --> E\n"
-        "    A -- \"uses secrets from\" --> F\n"
-        "    A -- \"calls\" --> G\n"
-        "```\n\n"
-        "Explanation:\n"
-        "- AVA runs as `ava-agent` on port `5443` and uses Flask/Gunicorn to serve requests.\n"
-        "- It stores relational data in PostgreSQL, uses Redis for fast state/caching, checks policy with OPA, reads secrets from Vault, and calls the Ollama host for local model inference."
-    )
 
 def _needs_strict_grounding(query_intent, query):
     if query_intent in {"ava_self", "healing_incident", "follow_up", "memory_recall", "memory_store", "architecture"}:
@@ -1270,25 +954,6 @@ def _is_noisy_architecture_line(line):
         return True
     return False
 
-
-def _filter_architecture_chunks(raw_chunks, entities):
-    if not raw_chunks or not entities:
-        return raw_chunks
-    relation_terms = {
-        "handles", "routes", "calls", "uses", "writes", "stores", "publishes",
-        "sends", "reads", "connects", "proxies", "feeds", "triggers",
-        "loads", "carries", "behind", "through", "via", "gateway",
-        "stream", "event", "cache", "monitor", "process",
-    }
-    filtered = []
-    for chunk in raw_chunks:
-        content = _normalize_text(getattr(chunk, "content", ""))
-        lower = content.lower()
-        entity_hits = sum(1 for entity in entities if entity.lower() in lower)
-        relation_hits = sum(1 for term in relation_terms if term in lower)
-        if entity_hits >= 2 or (entity_hits >= 1 and relation_hits >= 1):
-            filtered.append(chunk)
-    return filtered or raw_chunks
 
 def _build_grounding_block(query, context_blocks, query_intent):
     entities = _extract_query_entities(query)
@@ -1513,44 +1178,6 @@ def _response_summary(response_text):
         return line
     return response_text.split("\n", 1)[0].strip()
 
-def _build_follow_up_response(query):
-    recent = _get_recent_distinct_turns(limit=4)
-    if not recent:
-        return "I don't have enough recent conversation context to answer that follow-up reliably."
-
-    last_turn = recent[-1]
-    previous_turn = recent[-2] if len(recent) >= 2 else None
-    last_query = _normalize_text(last_turn.get("query"))
-    last_response = _normalize_text(last_turn.get("response"))
-    last_topic = _topic_from_turn(last_turn)
-    last_answer_summary = _response_summary(last_response) or last_response
-
-    q = query.lower().strip()
-    if "previous thing" in q or "previous question" in q:
-        if previous_turn:
-            previous_query = _normalize_text(previous_turn.get("query"))
-            previous_topic = _topic_from_turn(previous_turn)
-            if previous_topic == last_topic:
-                return (
-                    f"Your recent questions stayed on the same topic: {last_topic}.\n\n"
-                    f"The latest answer summary was: {last_answer_summary}"
-                )
-            return (
-                f"Your most recent topic was {last_topic}.\n\n"
-                f"The topic before that was {previous_topic}.\n\n"
-                f"They differ because the latest turn focused on {last_topic}, while the earlier turn focused on {previous_topic}.\n\n"
-                f"Latest answer summary: {last_answer_summary}"
-            )
-        return (
-            f"Your most recent previous question was about {last_topic}.\n\n"
-            f"Latest answer summary: {last_answer_summary}"
-        )
-
-    return (
-        f"Your most recent previous question was about {last_topic}.\n\n"
-        f"Latest answer summary: {last_answer_summary}"
-    )
-
 def _looks_like_invalid_json_wrapper(response_text):
     text = _normalize_text(response_text).strip()
     if not text.startswith("{") or '"issue_type"' not in text:
@@ -1575,13 +1202,6 @@ def _repair_definition_wrapper(response_text):
     if action_taken:
         return action_taken
     return text
-
-def _is_follow_up_query(query):
-    q = query.lower().strip()
-    return any(phrase in q for phrase in [
-        "previous thing", "previous question", "previous thing i asked",
-        "previous thing i said", "what did i just say", "what did i just ask",
-    ])
 
 def _json_only_requested(query):
     q = query.lower()
@@ -1824,24 +1444,6 @@ _CONFIDENCE_PREFIXES = {
     'medium': "Based on related documentation, ",
     'low': "I don't have a strong match for this, but based on general DevOps knowledge: ",
 }
-
-def _answer_known_incident_query(query):
-    q = query.lower()
-    if "oomkilled" in q or "oom killed" in q:
-        return (
-            "**Root Cause:** Kubernetes marks a container as `OOMKilled` when it exceeds its memory limit and the kernel terminates it to protect node stability.\n"
-            "**Fix:** Raise the pod memory limit if it is too low, reduce the application's memory use, and compare actual peak usage against the current request and limit.\n"
-            "**Why this works:** `OOMKilled` is specifically a memory-pressure termination, so the durable fix is aligning the workload's memory behavior with Kubernetes limits.\n"
-            "**Watch out for:** A restart can hide the symptom temporarily. Check for memory leaks, bursty traffic, large in-memory caches, or JVM heap settings before only increasing limits."
-        )
-    if "crashloopbackoff" in q:
-        return (
-            "**Root Cause:** `CrashLoopBackOff` means the container keeps starting, failing, and being restarted, so Kubernetes backs off between restart attempts.\n"
-            "**Fix:** Check the container logs, last termination reason, image entrypoint, env vars, config mounts, and readiness or liveness probe settings. Common causes are bad startup commands, missing config, and application crashes.\n"
-            "**Why this works:** `CrashLoopBackOff` is a restart pattern, not the root problem itself. The real fix comes from the failing process or probe.\n"
-            "**Watch out for:** If probes are too aggressive, Kubernetes can restart an otherwise healthy app before it finishes booting."
-        )
-    return None
 
 def _answer_ava_self_query(query, about=None):
     return _resolve_ava_self_response(query, about=about)
