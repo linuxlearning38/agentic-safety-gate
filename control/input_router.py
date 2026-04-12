@@ -22,6 +22,22 @@ AVA_SELF_TOPIC_PATTERNS = {
     ],
 }
 
+ARCHITECTURE_TOPIC_PATTERNS = {
+    "self_runtime": [
+        "your docker architecture", "your architecture", "ava architecture",
+        "docker architecture", "your runtime architecture", "your container architecture",
+    ],
+    "external": [
+        "architecture", "request flow", "data flow", "system design",
+        "topology", "deployment flow", "sequence flow", "component flow",
+    ],
+}
+
+DIAGRAM_MARKERS = (
+    "diagram", "mermaid", "draw", "visualize", "topology", "flowchart",
+    "flow chart", "sequence", "graph ",
+)
+
 TROUBLESHOOTING_TOPIC_PATTERNS = {
     "oomkilled": ["oomkilled", "oom killed"],
     "crashloopbackoff": ["crashloopbackoff", "crashloop"],
@@ -48,6 +64,7 @@ class IntentRoute:
     memory_fact: dict | None = None
     memory_follow_up: str = ""
     recall_label: str | None = None
+    response_mode: str = "text"
     reason: str = ""
 
 
@@ -69,6 +86,28 @@ def classify_troubleshooting_topic(normalized_query: str) -> str | None:
         if any(pattern in q for pattern in patterns):
             return topic
     return None
+
+
+def classify_architecture_topic(normalized_query: str, entities: list[str] | None = None) -> tuple[str, str] | None:
+    q = f" {(normalized_query or '').lower().strip()} "
+    entities = [entity for entity in (entities or []) if entity]
+    wants_diagram = any(marker in q for marker in DIAGRAM_MARKERS)
+    has_architecture_language = any(
+        pattern in q
+        for patterns in ARCHITECTURE_TOPIC_PATTERNS.values()
+        for pattern in patterns
+    )
+    if not wants_diagram and not has_architecture_language:
+        return None
+
+    self_runtime_markers = ARCHITECTURE_TOPIC_PATTERNS["self_runtime"]
+    topic = "self_runtime" if any(marker in q for marker in self_runtime_markers) else "external"
+    if topic != "self_runtime" and " ava " in q and any(word in q for word in ("your", "docker", "runtime", "container")):
+        topic = "self_runtime"
+    if topic != "self_runtime" and not wants_diagram and len(entities) < 2 and "architecture" not in q and "flow" not in q:
+        return None
+    response_mode = "diagram" if wants_diagram else "text"
+    return topic, response_mode
 
 
 def route_query(
@@ -113,6 +152,20 @@ def route_query(
                 recall_label=recall_label,
                 reason="matched deterministic memory recall request",
             )
+
+    architecture_match = classify_architecture_topic(normalized_query, entities)
+    if architecture_match:
+        architecture_topic, response_mode = architecture_match
+        return IntentRoute(
+            raw_query=raw_query,
+            normalized_query=normalized_query,
+            intent="architecture",
+            confidence="high" if architecture_topic == "self_runtime" else "medium",
+            entities=entities,
+            topic=architecture_topic,
+            response_mode=response_mode,
+            reason=f"matched architecture topic '{architecture_topic}' in {response_mode} mode",
+        )
 
     ava_self_topic = classify_ava_self_topic(normalized_query)
     if ava_self_topic:

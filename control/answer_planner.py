@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import re
 
 
 @dataclass
@@ -10,6 +11,103 @@ class AnswerPlan:
     evidence: dict = field(default_factory=dict)
     entities: list[str] = field(default_factory=list)
     confidence: str = "high"
+
+
+ARCHITECTURE_ROLE_HINTS = {
+    "zuul": "edge gateway that receives client traffic and routes requests to backend services",
+    "kafka": "event backbone that carries durable streams between producers and consumers",
+    "cassandra": "durable serving store for large-scale operational or derived data",
+    "evcache": "hot-read cache that reduces latency in front of durable stores",
+    "samza": "stream processor that consumes Kafka topics and computes derived views",
+    "mantis": "stream processing and observability system for real-time analytics",
+    "ava-agent": "main AVA application container that serves API requests",
+    "agent_postgres": "relational database for durable AVA state",
+    "agent_redis": "cache and fast state store",
+    "agent_opa": "policy engine for authorization decisions",
+    "agent_vault": "secret manager for sensitive runtime configuration",
+    "ollama": "local model host used for inference",
+}
+
+
+def _first_sentence(text: str) -> str:
+    match = re.split(r"(?<=[.!?])\s+", (text or "").strip(), maxsplit=1)
+    return match[0].strip()
+
+
+def _pick_architecture_lines(evidence_blocks: list[str], entities: list[str], *terms: str) -> list[str]:
+    picked = []
+    seen = set()
+    for line in evidence_blocks or []:
+        lower = line.lower()
+        if terms and not any(term in lower for term in terms):
+            continue
+        if entities and not any(entity.lower() in lower for entity in entities):
+            continue
+        if lower in seen:
+            continue
+        seen.add(lower)
+        picked.append(_first_sentence(line))
+        if len(picked) >= 4:
+            break
+    return picked
+
+
+def _component_role(entity: str, evidence_blocks: list[str]) -> str:
+    entity_lower = entity.lower()
+    for line in evidence_blocks or []:
+        if entity_lower in line.lower():
+            sentence = _first_sentence(line)
+            if len(sentence) >= 20:
+                return sentence
+    return ARCHITECTURE_ROLE_HINTS.get(entity_lower, f"{entity} participates in the architecture flow shown by the retrieved evidence.")
+
+
+def _build_architecture_mermaid(entities: list[str], evidence_blocks: list[str], topic: str) -> str:
+    lower_entities = {entity.lower(): entity for entity in entities}
+    if topic == "self_runtime":
+        return (
+            "```mermaid\n"
+            "graph LR\n"
+            "    Client[\"User Request\"] --> Ava[\"ava-agent:5443\\nFlask/Gunicorn\"]\n"
+            "    Ava --> Postgres[\"PostgreSQL:5432\"]\n"
+            "    Ava --> Redis[\"Redis:6379\"]\n"
+            "    Ava --> OPA[\"Open Policy Agent:8181\"]\n"
+            "    Ava --> Vault[\"HashiCorp Vault:8200\"]\n"
+            "    Ava --> Ollama[\"Ollama Host\"]\n"
+            "```"
+        )
+
+    edges = []
+    if "zuul" in lower_entities:
+        edges.append(("Client", lower_entities["zuul"]))
+        edges.append((lower_entities["zuul"], "Backend Services"))
+    if "kafka" in lower_entities:
+        edges.append(("Backend Services", lower_entities["kafka"]))
+    if "samza" in lower_entities and "kafka" in lower_entities:
+        edges.append((lower_entities["kafka"], lower_entities["samza"]))
+    if "cassandra" in lower_entities and "kafka" in lower_entities:
+        source = lower_entities.get("samza", lower_entities["kafka"])
+        edges.append((source, lower_entities["cassandra"]))
+    if "evcache" in lower_entities:
+        cache_source = lower_entities.get("cassandra", "Backend Services")
+        edges.append((cache_source, lower_entities["evcache"]))
+        edges.append((lower_entities["evcache"], "Clients"))
+
+    if not edges and len(entities) >= 2:
+        ordered = entities[:]
+        edges = list(zip(ordered, ordered[1:]))
+    if not edges:
+        edges = [
+            ("Clients", "Ingress / Gateway"),
+            ("Ingress / Gateway", "Application Service"),
+            ("Application Service", "Data Store"),
+        ]
+
+    lines = ["```mermaid", "graph LR"]
+    for left, right in edges[:8]:
+        lines.append(f"    {re.sub(r'[^A-Za-z0-9]+', '', left) or 'NodeA'}[\"{left}\"] --> {re.sub(r'[^A-Za-z0-9]+', '', right) or 'NodeB'}[\"{right}\"]")
+    lines.append("```")
+    return "\n".join(lines)
 
 
 def build_ava_self_plan(route, evidence) -> AnswerPlan:
@@ -145,5 +243,94 @@ def build_troubleshooting_plan(route, evidence) -> AnswerPlan:
             "sources": evidence.facts.get("sources", []),
         },
         entities=list(evidence.entities or []),
+        confidence=confidence,
+    )
+
+
+def build_architecture_plan(route, evidence) -> AnswerPlan:
+    entities = list(evidence.entities or [])
+    evidence_blocks = list(evidence.evidence_blocks or [])
+    topic = evidence.topic or route.topic or "external"
+    response_mode = evidence.facts.get("response_mode", route.response_mode or "text")
+
+    component_lines = []
+    for entity in entities[:6]:
+        component_lines.append(f"- **{entity}**: {_component_role(entity, evidence_blocks)}")
+
+    request_flow = _pick_architecture_lines(
+        evidence_blocks,
+        entities,
+        "route", "request", "front door", "gateway", "edge", "client", "service",
+    )
+    data_flow = _pick_architecture_lines(
+        evidence_blocks,
+        entities,
+        "event", "stream", "publish", "consume", "cache", "store", "write", "read", "transport",
+    )
+    why_used = []
+    if entities:
+        if any(entity.lower() == "zuul" for entity in entities):
+            why_used.append("- Zuul is used to keep routing, resiliency, and edge concerns concentrated at the front door.")
+        if any(entity.lower() == "kafka" for entity in entities):
+            why_used.append("- Kafka is used as the durable async transport so services can publish events without blocking client traffic.")
+        if any(entity.lower() == "cassandra" for entity in entities):
+            why_used.append("- Cassandra is used when the system needs a highly available store for large-scale serving data.")
+        if any(entity.lower() == "evcache" for entity in entities):
+            why_used.append("- EVCache is used to reduce read latency by serving hot data from memory.")
+    if not why_used:
+        why_used = [
+            "- These components are used together to separate synchronous request handling from asynchronous data movement and storage.",
+            "- The retrieved evidence shows routing, event transport, storage, and caching working as distinct responsibilities.",
+        ]
+
+    if not request_flow:
+        if topic == "self_runtime":
+            request_flow = [
+                "Client traffic reaches ava-agent, which serves requests through Flask/Gunicorn on port 5443.",
+                "During request handling, ava-agent consults OPA for policy decisions and Vault for secrets when needed.",
+            ]
+        else:
+            request_flow = ["The retrieved evidence shows edge or client-facing services routing requests to backend services before asynchronous processing happens."]
+    if not data_flow:
+        if topic == "self_runtime":
+            data_flow = [
+                "ava-agent persists durable relational state in PostgreSQL.",
+                "ava-agent keeps fast state and caching data in Redis and sends model inference requests to the Ollama host.",
+            ]
+        else:
+            data_flow = ["The retrieved evidence shows events moving through streaming components into durable stores and caches for low-latency reads."]
+
+    if response_mode == "diagram":
+        answer = _build_architecture_mermaid(entities, evidence_blocks, topic)
+        confidence = "high" if topic == "self_runtime" or len(evidence_blocks) >= 2 else "medium"
+    else:
+        sections = [
+            "**Components and Roles:**",
+            *(component_lines or ["- The retrieved evidence did not expose enough named components to build a stronger component map."]),
+            "",
+            "**Request Flow:**",
+            *[f"- {line}" for line in request_flow],
+            "",
+            "**Data Flow:**",
+            *[f"- {line}" for line in data_flow],
+            "",
+            "**Why They Are Used:**",
+            *why_used,
+        ]
+        answer = "\n".join(sections)
+        confidence = "high" if topic == "self_runtime" or len(evidence_blocks) >= 3 else "medium"
+
+    return AnswerPlan(
+        intent="architecture",
+        mode="deterministic",
+        topic=topic,
+        answer=answer,
+        evidence={
+            "topic": topic,
+            "response_mode": response_mode,
+            "evidence_blocks": evidence_blocks,
+            "sources": evidence.facts.get("sources", []),
+        },
+        entities=entities,
         confidence=confidence,
     )

@@ -17,6 +17,8 @@ FUNCTIONS = {
     "_resolve_ava_self_response",
     "_resolve_memory_store_response",
     "_resolve_memory_recall_response",
+    "_retrieve_architecture_chunks",
+    "_resolve_architecture_response",
     "_retrieve_troubleshooting_chunks",
     "_resolve_troubleshooting_response",
     "_extract_query_entities",
@@ -63,11 +65,13 @@ def load_helpers():
         "datetime": datetime,
         "route_query": input_router.route_query,
         "select_ava_self_evidence": evidence_selector.select_ava_self_evidence,
+        "select_architecture_evidence": evidence_selector.select_architecture_evidence,
         "select_memory_store_evidence": evidence_selector.select_memory_store_evidence,
         "select_memory_recall_evidence": evidence_selector.select_memory_recall_evidence,
         "select_troubleshooting_evidence": evidence_selector.select_troubleshooting_evidence,
         "format_ava_self_facts_block": evidence_selector.format_ava_self_facts_block,
         "build_ava_self_plan": answer_planner.build_ava_self_plan,
+        "build_architecture_plan": answer_planner.build_architecture_plan,
         "build_memory_store_plan": answer_planner.build_memory_store_plan,
         "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
         "build_troubleshooting_plan": answer_planner.build_troubleshooting_plan,
@@ -77,6 +81,30 @@ def load_helpers():
             "get_memory": lambda self, key, default=None: self.memory.get(key, default),
             "save_memory": lambda self, key, value: self.memory.__setitem__(key, value),
         })(),
+        "_get_about_data": lambda: {
+            "version": "2.1.2",
+            "built_by": "Manoj, Delhi",
+            "runtime": "WSL2 Ubuntu, RTX 5060 Ti 16GB, Ryzen 1600, 32GB RAM",
+            "containers": {
+                "ava-agent": {"port": 5443, "proto": "HTTPS", "stack": "Flask/Gunicorn, 2 workers"},
+                "agent_postgres": {"port": 5432, "stack": "PostgreSQL 15"},
+                "agent_redis": {"port": 6379, "stack": "Redis 7"},
+                "agent_opa": {"port": 8181, "stack": "Open Policy Agent"},
+                "agent_vault": {"port": 8200, "stack": "HashiCorp Vault"},
+            },
+            "models": {
+                "llm": "qwen2.5:14b (Q4_K_M quantization)",
+                "embedding": "nomic-embed-text",
+                "vision": "llava:13b",
+                "ollama_host": "http://host.docker.internal:11434",
+            },
+            "knowledge_base": {
+                "devops_policies_v2": 3885,
+                "devops_blogs_v1": 2513,
+                "devops_fixes_v1": 20,
+                "devops_patterns_v1": 64,
+            },
+        },
     }
     class FakeChunk:
         def __init__(self, content, source_collection):
@@ -86,6 +114,20 @@ def load_helpers():
         def query(self, query_text, n_policies=4, n_blogs=3, blog_min_relevance=0.45, format_for_llm=True):
             q = query_text.lower()
             chunks = []
+            if "netflix" in q or "zuul" in q or "evcache" in q:
+                chunks.extend([
+                    FakeChunk("SUMMARY: Zuul is the front door for requests from devices and web sites to backend Netflix services.", "patterns"),
+                    FakeChunk("REQUEST FLOW: Client-facing services publish to Kafka after handling synchronous requests or internal state changes.", "patterns"),
+                    FakeChunk("ARCHITECTURE NOTES: Kafka is the event transport and fan-out layer rather than the serving database.", "blogs"),
+                    FakeChunk("Samza consumes Kafka streams and writes processed aggregates to Cassandra.", "patterns"),
+                    FakeChunk("EVCache serves hot reads to reduce latency in front of Cassandra.", "patterns"),
+                    FakeChunk("# Queue depth: kafka_consumer_lag, redis_blocked_clients", "blogs"),
+                ])
+            if "kubernetes deployment flow" in q:
+                chunks.extend([
+                    FakeChunk("Requests enter through an ingress or load balancer and are routed to a Kubernetes Service.", "patterns"),
+                    FakeChunk("The Service sends traffic to healthy Pods, and Pods persist data through their configured backing stores.", "patterns"),
+                ])
             if "oomkilled" in q or "oom killed" in q:
                 chunks.append(FakeChunk("OOMKilled happens when the container exceeds its memory limit.", "policies"))
                 chunks.append(FakeChunk("Reduce memory usage or raise limits after checking actual peaks.", "fixes"))
@@ -199,6 +241,21 @@ def main():
         resolved = ns["_resolve_troubleshooting_response"](query)
         check(f"troubleshooting response {query!r}", expected.lower() in resolved["response"].lower())
         check(f"troubleshooting sources filtered {query!r}", resolved["sources_used"] >= 1)
+
+    architecture_queries = [
+        ("Explain Netflix architecture with Zuul, Kafka, Cassandra, EVCache", "external", "text", "**Components and Roles:**", "Zuul"),
+        ("Create a mermaid diagram of your Docker architecture", "self_runtime", "diagram", "```mermaid", "ava-agent:5443"),
+        ("Draw a diagram showing Kubernetes deployment flow", "external", "diagram", "```mermaid", "Ingress / Gateway"),
+    ]
+    for query, topic, response_mode, expected, extra in architecture_queries:
+        route = ns["_route_query"](query)
+        check(f"architecture route {query!r}", route.intent == "architecture")
+        check(f"architecture topic {query!r}", route.topic == topic)
+        check(f"architecture mode {query!r}", route.response_mode == response_mode)
+        check(f"detect_query_intent {query!r}", ns["detect_query_intent"](query) == "architecture")
+        resolved = ns["_resolve_architecture_response"](query)
+        check(f"architecture response {query!r}", expected.lower() in resolved["response"].lower())
+        check(f"architecture detail {query!r}", extra.lower() in resolved["response"].lower())
 
     print("\nAVA controlled benchmark passed.")
 

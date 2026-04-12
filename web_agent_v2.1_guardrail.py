@@ -24,6 +24,7 @@ from control.react_loop import react_loop
 from control.input_router import route_query
 from control.evidence_selector import (
     select_ava_self_evidence,
+    select_architecture_evidence,
     select_memory_store_evidence,
     select_memory_recall_evidence,
     select_troubleshooting_evidence,
@@ -31,6 +32,7 @@ from control.evidence_selector import (
 )
 from control.answer_planner import (
     build_ava_self_plan,
+    build_architecture_plan,
     build_memory_store_plan,
     build_memory_recall_plan,
     build_troubleshooting_plan,
@@ -392,50 +394,9 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
         entities = _extract_query_entities(query)
 
         # ava_self: controlled migration path — authoritative runtime facts only
-        _self_architecture = query_intent == "architecture" and any(term in query.lower() for term in ["your ", "you ", "ava", "yourself"])
         if query_intent == "ava_self":
             about = _get_about_data()
             return [format_ava_self_facts_block(about)]
-        if _self_architecture:
-            about = _get_about_data()
-            c = about["containers"]
-            m = about["models"]
-            kb = about["knowledge_base"]
-            facts_block = (
-                "AVA System Facts:\n"
-                f"version={about['version']} | phase={about['phase']} | "
-                f"built_by={about['built_by']} | runtime={about['runtime']}\n\n"
-                "Containers and ports:\n"
-                + "\n".join(
-                    f"  {name}: port {info['port']} — {info['stack']}"
-                    for name, info in c.items()
-                )
-                + f"\n\nModels:\n"
-                f"  LLM: {m['llm']}\n"
-                f"  Embedding: {m['embedding']}\n"
-                f"  Vision: {m['vision']}\n"
-                f"  Ollama host: {m['ollama_host']}\n\n"
-                "Knowledge base chunks:\n"
-                + "\n".join(f"  {col}: {count}" for col, count in kb.items())
-            )
-
-            embedding = hybrid_retriever.embedder.embed(query)
-            if not embedding:
-                return [facts_block]
-            patterns = hybrid_retriever._query_collection(
-                hybrid_retriever.patterns_collection, embedding, 6, "patterns"
-            )
-            policies = hybrid_retriever._query_collection(
-                hybrid_retriever.policies_collection, embedding, 2, "policies"
-            )
-            assembled = hybrid_retriever.assemble_context(patterns + policies) if (patterns or policies) else []
-            logger.info(f"[ava_self] facts + {len(patterns)} pattern + {len(policies)} policy chunks → {len(assembled)} blocks")
-            return [facts_block] + (assembled if assembled else [c.content for c in patterns + policies])
-
-        if query_intent == "architecture":
-            n_policies = max(n_policies, 6)
-            n_blogs = max(n_blogs, 4)
-            min_relevance = max(min_relevance, 0.008)
 
         if query_intent == "definition":
             n_policies = max(n_policies, 6)
@@ -449,31 +410,9 @@ def query_knowledge_base(query, n_results=5, n_policies=4, n_blogs=6, min_releva
             blog_min_relevance=min_relevance,
             format_for_llm=False
         )
-        if query_intent == "architecture" and entities:
-            seeded_chunks = []
-            keyword_limit = 8
-            for collection in [
-                getattr(hybrid_retriever, "patterns_collection", None),
-                getattr(hybrid_retriever, "blogs_collection", None),
-                getattr(hybrid_retriever, "fixes_collection", None),
-                getattr(hybrid_retriever, "policies_collection", None),
-            ]:
-                seeded_chunks.extend(hybrid_retriever._keyword_fetch(collection, entities, limit=keyword_limit))
-            seeded_chunks = _filter_architecture_chunks(seeded_chunks, entities)
-            raw_chunks = _filter_architecture_chunks(raw_chunks, entities)
-            if seeded_chunks:
-                seen = set()
-                prioritized = []
-                for chunk in seeded_chunks + (raw_chunks or []):
-                    content = getattr(chunk, "content", None)
-                    if not content or content in seen:
-                        continue
-                    prioritized.append(chunk)
-                    seen.add(content)
-                raw_chunks = prioritized
         if entities:
             boosted_chunks = []
-            keyword_limit = 6 if query_intent == "architecture" else 4
+            keyword_limit = 4
             for collection in [
                 getattr(hybrid_retriever, "patterns_collection", None),
                 getattr(hybrid_retriever, "fixes_collection", None),
@@ -673,6 +612,33 @@ def _resolve_troubleshooting_response(query):
         "confidence": plan.confidence,
         "sources_used": len(evidence.evidence_blocks),
         "topic": plan.topic,
+    }
+
+
+def _retrieve_architecture_chunks(query):
+    return hybrid_retriever.query(
+        query_text=query,
+        n_policies=6,
+        n_blogs=4,
+        blog_min_relevance=0.008,
+        format_for_llm=False,
+    )
+
+
+def _resolve_architecture_response(query):
+    route = _route_query(query)
+    if route.intent != "architecture":
+        return None
+    about = _get_about_data() if route.topic == "self_runtime" else None
+    raw_chunks = [] if about else _retrieve_architecture_chunks(query)
+    evidence = select_architecture_evidence(route, raw_chunks, about=about)
+    plan = build_architecture_plan(route, evidence)
+    return {
+        "response": compose_controlled_response(plan),
+        "confidence": plan.confidence,
+        "sources_used": len(evidence.evidence_blocks),
+        "topic": plan.topic,
+        "response_mode": route.response_mode,
     }
 
 def _chat_payload(response_text="", response_type="knowledge", ok=True, confidence=None,
@@ -1645,7 +1611,7 @@ def _build_healing_response(query):
 def detect_query_intent(query):
     q = _normalize_user_query(query).lower().strip()
     controlled_route = _route_query(query)
-    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting"):
+    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting", "architecture"):
         return controlled_route.intent
     if _is_follow_up_query(q):
         return "follow_up"
@@ -1662,18 +1628,6 @@ def detect_query_intent(query):
         return "healing_incident"
     if re.search(r'\d+\s*%', q) and any(k in q for k in ["disk", "cpu", "memory", "usage", "full"]):
         return "healing_incident"
-    if any(k in q for k in ["diagram", "architecture", "request flow", "data flow", "component", "sequence flow", "topology"]):
-        return "architecture"
-    # Diagram intent takes priority — even for "your" queries
-    _diagram_triggers = [
-        "create a diagram", "draw a diagram", "mermaid diagram",
-        "draw a mermaid", "create mermaid", "show diagram",
-        "architecture diagram", "generate diagram", "make a diagram",
-        "docker diagram", "container diagram", "flow diagram",
-        "draw", "visualize", "create diagram",
-    ]
-    if any(k in q for k in _diagram_triggers):
-        return "architecture"
     # Definition guard runs first — "what is/are" always wins regardless of
     # other keywords present in the query (e.g. "what is the fix for...")
     if q.startswith("what is") or q.startswith("what are"):
@@ -1857,20 +1811,6 @@ def generate_response(query, context, confidence=None, prior_messages=None):
         query_intent = detect_query_intent(query)
         use_structured = is_technical_query(query)
         strict_grounding = _needs_strict_grounding(query_intent, query)
-        extracted_entities = _diagram_entities_from_text(query, "\n".join(context or []))
-        wants_diagram = any(k in query.lower() for k in [
-            "draw", "visualize", "create a diagram", "show me a diagram", "render diagram", "mermaid"
-        ])
-        if query_intent == "architecture" and not wants_diagram:
-            query_entities = _extract_query_entities(query)
-            if query_entities:
-                extracted_entities = query_entities
-        is_ava_self_diagram = wants_diagram and _is_ava_self_architecture_query(query, extracted_entities)
-        if is_ava_self_diagram:
-            extracted_entities = _ava_runtime_diagram_entities()
-            prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
-            answer = _build_ava_runtime_diagram_response()
-            return prefix + answer if prefix else answer
 
         system_parts = ["You are AVA, a senior DevOps AI assistant.\n\nRULES:\n1. Always respond in English only\n2. Use the provided context as your primary grounding source\n3. If the context is partial but clearly relevant, give the best direct answer you can and say what is inferred\n4. Do not lead with phrases like 'the context does not directly say' unless the context is genuinely irrelevant\n5. Prefer direct practical answers over meta commentary about the context\n6. Quote specific config values, commands, and fixes directly from context when available\n7. Be specific, practical, and concise"]
 
@@ -1883,16 +1823,8 @@ def generate_response(query, context, confidence=None, prior_messages=None):
         if query_intent == "comparison":
             system_parts.append("\nFor comparison questions: answer with short sections for each option, then end with when to choose each one.")
 
-        if query_intent == "architecture":
-            system_parts.append("\nFor architecture and diagram questions, structure the answer exactly as: Components, Request Flow, Data Flow, Key Technologies, and Why They Are Used. Use only technologies and relationships explicitly present in the context.")
-            if extracted_entities:
-                system_parts.append("\nGrounded entities you must account for: " + ", ".join(extracted_entities))
-
         if use_structured:
             system_parts.append("\nFor technical problems, always structure your answer as:\n\n**Root Cause:** [1-2 sentences]\n**Fix:** [exact commands or config]\n**Why this works:** [1-2 sentences]\n**Watch out for:** [edge cases or caveats]")
-
-        if wants_diagram:
-            system_parts.append("\nIMPORTANT: When asked for any diagram, architecture, or flow - ALWAYS output ONLY a mermaid diagram. Start with ```mermaid on its own line. Use graph LR for horizontal layouts, graph TD for vertical. Make nodes descriptive. After the diagram add a brief explanation.")
 
         if strict_grounding:
             system_parts.append("\nSTRICT GROUNDING MODE: ONLY use the provided context. Do not use general knowledge or fill gaps from model memory. If the grounded context is insufficient, say exactly: 'I don't have enough grounded context to answer that reliably.'")
@@ -1925,21 +1857,6 @@ def generate_response(query, context, confidence=None, prior_messages=None):
             options={"num_ctx": 8192, "temperature": 0.0 if strict_grounding else 0.2}
         )
         answer = response["message"]["content"]
-        if query_intent == "architecture":
-            if wants_diagram:
-                answer = _repair_diagram_response(answer, context or [], extracted_entities)
-                if _is_ava_self_architecture_query(query, extracted_entities):
-                    grounded_diagram = _build_grounded_mermaid_diagram(context or [], extracted_entities)
-                    if grounded_diagram and _diagram_needs_grounded_override(answer, extracted_entities):
-                        answer = grounded_diagram + "\n\nGrounded from my current AVA runtime components."
-            else:
-                grounded_architecture = _build_grounded_architecture_answer(context or [], extracted_entities)
-                if _hallucination_terms(answer, extracted_entities):
-                    answer = grounded_architecture or _repair_architecture_answer(answer, extracted_entities)
-                elif extracted_entities and not any(entity.lower() in answer.lower() for entity in extracted_entities[:2]):
-                    answer = grounded_architecture or _repair_architecture_answer(answer, extracted_entities)
-                elif grounded_architecture and _looks_generic_architecture_answer(answer):
-                    answer = grounded_architecture
         prefix = _CONFIDENCE_PREFIXES.get(confidence, "")
         return prefix + answer if prefix else answer
 
@@ -2388,6 +2305,20 @@ def ask():
                 time_taken=f"{elapsed:.2f}s",
             ))
 
+        if controlled_route.intent == "architecture":
+            resolved = _resolve_architecture_response(query)
+            response = resolved["response"]
+            elapsed = time.time() - start_time
+            response_type = "diagram" if resolved["response_mode"] == "diagram" else "knowledge"
+            _record_query(query, response, "architecture", elapsed, sources_used=resolved["sources_used"], confidence=resolved["confidence"])
+            return jsonify(_chat_payload(
+                response,
+                response_type=response_type,
+                confidence=resolved["confidence"],
+                sources_used=resolved["sources_used"],
+                time_taken=f"{elapsed:.2f}s",
+            ))
+
         if _is_follow_up_query(query):
             response = _build_follow_up_response(query)
             elapsed = time.time() - start_time
@@ -2459,6 +2390,11 @@ def ask():
                 elif q_route.intent == "troubleshooting":
                     q_context = []
                     q_resolved = _resolve_troubleshooting_response(q)
+                    q_confidence = q_resolved["confidence"]
+                    q_response = q_resolved["response"]
+                elif q_route.intent == "architecture":
+                    q_context = []
+                    q_resolved = _resolve_architecture_response(q)
                     q_confidence = q_resolved["confidence"]
                     q_response = q_resolved["response"]
                 else:
