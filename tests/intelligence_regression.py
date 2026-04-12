@@ -1,4 +1,5 @@
 import ast
+import importlib.util
 import json
 import re
 from datetime import datetime
@@ -10,6 +11,10 @@ SOURCE = Path(__file__).resolve().parents[1] / "web_agent_v2.1_guardrail.py"
 FUNCTIONS = {
     "_normalize_text",
     "_normalize_user_query",
+    "_route_query",
+    "_resolve_ava_self_response",
+    "_resolve_memory_store_response",
+    "_resolve_memory_recall_response",
     "_normalize_fact_key",
     "_canonical_fact_label",
     "_fact_aliases",
@@ -117,12 +122,32 @@ class FakeChunk:
 
 
 def load_helpers():
+    def load_module(name: str, path: Path):
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+        return module
+
     src = SOURCE.read_text(encoding="utf-8")
     tree = ast.parse(src, filename=str(SOURCE))
+    input_router = load_module("ava_input_router", SOURCE.parent / "control" / "input_router.py")
+    evidence_selector = load_module("ava_evidence_selector", SOURCE.parent / "control" / "evidence_selector.py")
+    answer_planner = load_module("ava_answer_planner", SOURCE.parent / "control" / "answer_planner.py")
+    response_composer = load_module("ava_response_composer", SOURCE.parent / "control" / "response_composer.py")
     namespace = {
         "json": json,
         "re": re,
         "datetime": datetime,
+        "route_query": input_router.route_query,
+        "select_ava_self_evidence": evidence_selector.select_ava_self_evidence,
+        "select_memory_store_evidence": evidence_selector.select_memory_store_evidence,
+        "select_memory_recall_evidence": evidence_selector.select_memory_recall_evidence,
+        "format_ava_self_facts_block": evidence_selector.format_ava_self_facts_block,
+        "build_ava_self_plan": answer_planner.build_ava_self_plan,
+        "build_memory_store_plan": answer_planner.build_memory_store_plan,
+        "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
+        "compose_controlled_response": response_composer.compose_response,
         "db": FakeDB(),
         "healer": FakeHealer(),
     }
@@ -161,6 +186,10 @@ def main():
         "memory request parse plain remember",
         ns["_extract_memory_request"]("Remember: server=prod-india-01")["fact"]["label"] == "server",
     )
+    check(
+        "memory store route is controlled",
+        ns["_route_query"]("2. Remember this: server=prod-india-01").intent == "memory_store",
+    )
     cleaned_query = ns["_normalize_user_query"]("2. 1. what models are you running?")
     check("numbered query prefixes strip repeatedly", cleaned_query == "what models are you running?")
     noisy_query = ns["_normalize_user_query"]("1.2.4.a.b.c.d.e.---a-b-44-4-4-4-4-4-= what models are you running?")
@@ -182,6 +211,10 @@ def main():
     check(
         "recall label extract contractions",
         ns["_extract_recall_label"]("What's my server name?") == "server name",
+    )
+    check(
+        "memory recall route is controlled",
+        ns["_route_query"]("What is my server name?").intent == "memory_recall",
     )
 
     fake_db.queries = [
