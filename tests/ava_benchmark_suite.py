@@ -140,6 +140,10 @@ def load_helpers():
                 answer = "Photosynthesis is how plants convert sunlight, water, and carbon dioxide into glucose and oxygen."
             elif "machine learning" in prompt:
                 answer = "Machine learning is a field of AI where models learn patterns from data."
+            elif "network security" in prompt:
+                answer = "Network security is the practice of protecting networks and their traffic from attacks and unauthorized access."
+            elif re.search(r"\bwhat is server\b", prompt):
+                answer = "A server is a system that provides services or resources to other systems over a network."
             elif "tcp vs udp" in prompt or "tcp versus udp" in prompt:
                 answer = "TCP is reliable and connection-oriented, while UDP is faster and connectionless."
             else:
@@ -352,13 +356,22 @@ def main():
         ("What is 2+2?", "4"),
         ("Explain photosynthesis", "plants"),
         ("What is machine learning?", "machine learning"),
+        ("What is network security?", "security"),
+        ("What is server?", "server"),
         ("TCP vs UDP", "tcp"),
     ]
     for query, expected in general_queries:
         route = ns["_route_query"](query)
+        check(f"general route {query!r}", route.intent == "general_qwen")
         check(f"general direct gate {query!r}", ns["_should_direct_unknown_to_llm"](query, route=route) is True)
         resolved = ns["_resolve_general_unknown_response"](query, route=route)
         check(f"general response {query!r}", expected in resolved["response"].lower() and resolved["sources_used"] == 0)
+
+    pod_network_route = ns["_route_query"]("My pod network is failing")
+    check("troubleshooting route 'My pod network is failing'", pod_network_route.intent == "troubleshooting")
+    delete_route = ns["_route_query"]("Delete all pods")
+    check("dangerous route 'Delete all pods' stays off general_qwen", delete_route.intent != "general_qwen")
+    check("dangerous direct gate 'Delete all pods' is false", ns["_should_direct_unknown_to_llm"]("Delete all pods", route=delete_route) is False)
 
     print("\nAVA controlled benchmark passed.")
 
