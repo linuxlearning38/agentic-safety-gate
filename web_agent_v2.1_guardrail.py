@@ -1331,7 +1331,7 @@ def _build_healing_response(query):
 def detect_query_intent(query):
     q = _normalize_user_query(query).lower().strip()
     controlled_route = _route_query(query)
-    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting", "architecture", "follow_up", "comparison", "definition"):
+    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting", "architecture", "follow_up", "comparison", "definition", "general_qwen"):
         return controlled_route.intent
     if _is_healing_query(q):
         return "healing_incident"
@@ -1496,21 +1496,10 @@ def _answer_ava_self_query(query, about=None):
 
 def _should_direct_unknown_to_llm(query, route=None):
     route = route or _route_query(query)
-    if route.intent not in ("unknown", "definition", "comparison"):
+    if route.intent not in ("general_qwen", "unknown"):
         return False
     q = _normalize_user_query(query).lower().strip()
     if not q or _is_healing_query(q):
-        return False
-    domain_markers = (
-        "kubernetes", "docker", "container", "containers", "pod", "pods", "deployment",
-        "service", "ingress", "namespace", "cluster", "node", "kubectl", "helm",
-        "terraform", "aws", "azure", "gcp", "redis", "postgres", "mysql", "cassandra",
-        "kafka", "zuul", "evcache", "samza", "mantis", "nginx", "configmap", "secret",
-        "readiness probe", "liveness probe", "probe", "oomkilled", "crashloopbackoff",
-        "imagepullbackoff", "canary", "blue-green", "ci/cd", "devops", "linux", "s3",
-        "iam", "vpc", "ecs", "eks", "aks", "gke", "grafana", "prometheus",
-    )
-    if any(marker in q for marker in domain_markers):
         return False
     blocked_markers = (
         "delete", "remove", "destroy", "drop ", "truncate", "wipe", "shutdown",

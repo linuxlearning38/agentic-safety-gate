@@ -176,6 +176,10 @@ class FakeOllama:
             answer = "Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen."
         elif "machine learning" in prompt:
             answer = "Machine learning is a branch of AI where models learn patterns from data to make predictions or decisions."
+        elif "network security" in prompt:
+            answer = "Network security is the practice of protecting networks and traffic from unauthorized access, misuse, and attacks."
+        elif re.search(r"\bwhat is server\b", prompt):
+            answer = "A server is a system that provides data, services, or resources to other systems over a network."
         elif "tcp vs udp" in prompt or "tcp versus udp" in prompt:
             answer = "TCP is connection-oriented and reliable, while UDP is connectionless and lower-overhead."
         else:
@@ -339,9 +343,16 @@ def main():
     check("comparison route is controlled", comparison_route.intent == "comparison")
     check("comparison route extracts targets", len(comparison_route.comparison_targets) == 2)
     check("definition route is controlled", ns["_route_query"]("What is readiness probe?").intent == "definition")
+    check("oomkilled definition stays controlled", ns["_route_query"]("What is OOMKilled?").intent == "definition")
+    check("capital routes to general_qwen", ns["_route_query"]("What is the capital of France?").intent == "general_qwen")
+    check("network security routes to general_qwen", ns["_route_query"]("What is network security?").intent == "general_qwen")
+    check("server routes to general_qwen", ns["_route_query"]("What is server?").intent == "general_qwen")
+    check("photosynthesis routes to general_qwen", ns["_route_query"]("Explain photosynthesis").intent == "general_qwen")
+    check("math routes to general_qwen", ns["_route_query"]("What is 2+2?").intent == "general_qwen")
     check("general question bypasses kb", ns["_should_direct_unknown_to_llm"]("What is machine learning?") is True)
     check("general comparison bypasses kb", ns["_should_direct_unknown_to_llm"]("TCP vs UDP") is True)
     check("devops definition stays controlled", ns["_should_direct_unknown_to_llm"]("What is readiness probe?") is False)
+    check("devops troubleshooting beats weak markers", ns["_route_query"]("My pod network is failing").intent == "troubleshooting")
     check("dangerous query does not bypass kb", ns["_should_direct_unknown_to_llm"]("Delete all pods in kube-system") is False)
 
     fake_db.queries = [

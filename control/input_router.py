@@ -45,7 +45,7 @@ TROUBLESHOOTING_TOPIC_PATTERNS = {
     "imagepullbackoff": ["imagepullbackoff", "image pull backoff", "image pull error"],
     "pending": [" pending", "containercreating", "container creating"],
     "service_down": ["service is down", "service down", "unreachable", "can't connect", "cannot connect", "timeout"],
-    "generic": ["error", "failed", "not working", "broken", "troubleshoot", "debug", "fix", "issue", "problem"],
+    "generic": ["error", "failed", "failing", "not working", "broken", "troubleshoot", "debug", "fix", "issue", "problem"],
 }
 
 EXPLICIT_EXECUTION_MARKERS = (
@@ -68,12 +68,42 @@ DEFINITION_MARKERS = (
     "what is ", "what are ", "define ", "explain ",
 )
 
+STRONG_DEVOPS_MARKERS = (
+    "kubernetes", "k8s", "docker", "helm", "terraform", "configmap",
+    "oomkilled", "crashloopbackoff", "crashloop", "imagepullbackoff", "imagepull",
+    "ingress", "pvc", "istio", "grafana", "prometheus", "vault", "opa", "kubectl",
+    "dockerfile", "kubeconfig", "pod", "namespace", "deployment", "daemonset",
+    "statefulset", "replicaset", "cronjob", "readiness", "liveness", "probe",
+)
+
+WEAK_DEVOPS_MARKERS = (
+    "network", "security", "memory", "cpu", "disk", "server", "service",
+    "git", "container", "cluster", "node", "pipeline", "ci", "cd",
+    "monitoring", "logging", "ssl", "tls", "jwt", "redis", "postgres",
+    "kafka", "cassandra", "nginx", "linux", "aws", "azure", "gcp",
+)
+
+ACTION_STYLE_MARKERS = (
+    "delete", "remove", "destroy", "drop", "truncate", "wipe", "shutdown",
+    "restart", " stop ", "terminate", " kill ", "run ", "execute", "apply ",
+    "sudo ", "chmod ", "chown ", "rm ",
+    "del ", "format ", "curl ", "wget ", "ssh ", "scp ", "powershell ", "cmd /c",
+    "bash ", "write a command", "give me a command", "rollout", "scale ",
+)
+
+OPERATIONAL_CONTEXT_MARKERS = (
+    "my ", "our ", "in kubernetes", "in docker", "in production", "failing",
+    "failed", "not working", "broken", "issue", "problem", "debug", "fix",
+    "deploy", "deployment", "pod", "container", "cluster", "namespace",
+    "service", "node", "pipeline", "image", "registry", "volume", "pvc",
+)
+
 
 @dataclass
 class IntentRoute:
     raw_query: str
     normalized_query: str
-    intent: str
+    intent: str | None
     confidence: str = "low"
     entities: list[str] = field(default_factory=list)
     topic: str | None = None
@@ -176,6 +206,28 @@ def classify_definition_topic(normalized_query: str) -> str | None:
     return None
 
 
+def is_action_style_query(normalized_query: str) -> bool:
+    q = f" {(normalized_query or '').lower().strip()} "
+    return any(marker in q for marker in ACTION_STYLE_MARKERS)
+
+
+def devops_domain_score(normalized_query: str) -> tuple[int, int, int]:
+    q = f" {(normalized_query or '').lower().strip()} "
+    strong_hits = sum(1 for marker in STRONG_DEVOPS_MARKERS if marker in q)
+    weak_hits = sum(1 for marker in WEAK_DEVOPS_MARKERS if marker in q)
+    return strong_hits * 2 + weak_hits, strong_hits, weak_hits
+
+
+def is_grounded_devops_query(normalized_query: str) -> bool:
+    q = (normalized_query or "").lower().strip()
+    score, strong_hits, weak_hits = devops_domain_score(q)
+    if strong_hits >= 1:
+        return True
+    if score < 2:
+        return False
+    return any(marker in q for marker in OPERATIONAL_CONTEXT_MARKERS) or weak_hits >= 3
+
+
 def route_query(
     query: str,
     *,
@@ -233,17 +285,6 @@ def route_query(
             reason=f"matched architecture topic '{architecture_topic}' in {response_mode} mode",
         )
 
-    if is_follow_up_query(normalized_query):
-        return IntentRoute(
-            raw_query=raw_query,
-            normalized_query=normalized_query,
-            intent="follow_up",
-            confidence="high",
-            entities=entities,
-            topic="follow_up",
-            reason="matched controlled follow-up request",
-        )
-
     ava_self_topic = classify_ava_self_topic(normalized_query)
     if ava_self_topic:
         return IntentRoute(
@@ -254,6 +295,27 @@ def route_query(
             entities=entities,
             topic=ava_self_topic,
             reason=f"matched ava_self topic '{ava_self_topic}'",
+        )
+
+    if is_action_style_query(normalized_query):
+        return IntentRoute(
+            raw_query=raw_query,
+            normalized_query=normalized_query,
+            intent=None,
+            confidence="medium",
+            entities=entities,
+            reason="action-style request bypasses general_qwen routing",
+        )
+
+    if is_follow_up_query(normalized_query):
+        return IntentRoute(
+            raw_query=raw_query,
+            normalized_query=normalized_query,
+            intent="follow_up",
+            confidence="high",
+            entities=entities,
+            topic="follow_up",
+            reason="matched controlled follow-up request",
         )
 
     troubleshooting_topic = classify_troubleshooting_topic(normalized_query)
@@ -270,6 +332,17 @@ def route_query(
 
     comparison_targets = extract_comparison_targets(normalized_query)
     if comparison_targets:
+        if not is_grounded_devops_query(normalized_query):
+            return IntentRoute(
+                raw_query=raw_query,
+                normalized_query=normalized_query,
+                intent="general_qwen",
+                confidence="medium",
+                entities=entities,
+                topic="general_qwen",
+                comparison_targets=comparison_targets,
+                reason="comparison request classified outside grounded DevOps domain",
+            )
         return IntentRoute(
             raw_query=raw_query,
             normalized_query=normalized_query,
@@ -283,6 +356,16 @@ def route_query(
 
     definition_topic = classify_definition_topic(normalized_query)
     if definition_topic:
+        if not is_grounded_devops_query(normalized_query):
+            return IntentRoute(
+                raw_query=raw_query,
+                normalized_query=normalized_query,
+                intent="general_qwen",
+                confidence="medium",
+                entities=entities,
+                topic="general_qwen",
+                reason="definition request classified outside grounded DevOps domain",
+            )
         return IntentRoute(
             raw_query=raw_query,
             normalized_query=normalized_query,
@@ -291,6 +374,17 @@ def route_query(
             entities=entities,
             topic=definition_topic,
             reason="matched controlled definition request",
+        )
+
+    if not is_grounded_devops_query(normalized_query):
+        return IntentRoute(
+            raw_query=raw_query,
+            normalized_query=normalized_query,
+            intent="general_qwen",
+            confidence="medium",
+            entities=entities,
+            topic="general_qwen",
+            reason="query classified outside grounded DevOps domain",
         )
 
     return IntentRoute(
