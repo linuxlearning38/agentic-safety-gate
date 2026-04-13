@@ -1494,6 +1494,62 @@ def _answer_ava_self_query(query, about=None):
     return _resolve_ava_self_response(query, about=about)
 
 
+def _should_direct_unknown_to_llm(query, route=None):
+    route = route or _route_query(query)
+    if route.intent not in ("unknown", "definition", "comparison"):
+        return False
+    q = _normalize_user_query(query).lower().strip()
+    if not q or _is_healing_query(q):
+        return False
+    domain_markers = (
+        "kubernetes", "docker", "container", "containers", "pod", "pods", "deployment",
+        "service", "ingress", "namespace", "cluster", "node", "kubectl", "helm",
+        "terraform", "aws", "azure", "gcp", "redis", "postgres", "mysql", "cassandra",
+        "kafka", "zuul", "evcache", "samza", "mantis", "nginx", "configmap", "secret",
+        "readiness probe", "liveness probe", "probe", "oomkilled", "crashloopbackoff",
+        "imagepullbackoff", "canary", "blue-green", "ci/cd", "devops", "linux", "s3",
+        "iam", "vpc", "ecs", "eks", "aks", "gke", "grafana", "prometheus",
+    )
+    if any(marker in q for marker in domain_markers):
+        return False
+    blocked_markers = (
+        "delete", "remove", "destroy", "drop ", "truncate", "wipe", "shutdown",
+        "restart", "stop ", "terminate", "kill ", "run ", "execute", "apply ",
+        "kubectl", "docker ", "systemctl", "sudo ", "chmod ", "chown ", "rm ",
+        "del ", "format ", "curl ", "wget ", "ssh ", "scp ", "powershell ",
+        "cmd /c", "bash ", "sh ", "write a command", "give me a command to run",
+    )
+    return not any(marker in q for marker in blocked_markers)
+
+
+def _resolve_general_unknown_response(query, prior_messages=None, route=None):
+    route = route or _route_query(query)
+    if not _should_direct_unknown_to_llm(query, route=route):
+        return None
+    messages = [{
+        "role": "system",
+        "content": (
+            "You are AVA, a helpful AI assistant. "
+            "This is a general question outside AVA's local DevOps knowledge base. "
+            "Answer it directly from your model knowledge in clear English. "
+            "Do not mention missing retrieved context, internal tools, or AVA runtime details unless the user asked about them."
+        ),
+    }]
+    if prior_messages:
+        messages.extend(prior_messages)
+    messages.append({"role": "user", "content": query})
+    response = ollama.chat(
+        model=LLM_MODEL,
+        messages=messages,
+        options={"num_ctx": 4096, "temperature": 0.2},
+    )
+    return {
+        "response": _normalize_text(response["message"]["content"]),
+        "confidence": "medium",
+        "sources_used": 0,
+    }
+
+
 def generate_response(query, context, confidence=None, prior_messages=None):
     """Phase 3: Structured response with memory, CoT, Mermaid, fail-safe.
     Phase 5B: prior_messages injects up to 3 turns of conversation history.
@@ -2085,6 +2141,20 @@ def ask():
                 confidence="high",
                 time_taken=f"{elapsed:.2f}s",
             ))
+
+        if _should_direct_unknown_to_llm(query, route=controlled_route):
+            prior_messages = _get_recent_prior_messages(n=2)
+            resolved = _resolve_general_unknown_response(query, prior_messages=prior_messages, route=controlled_route)
+            response = resolved["response"]
+            elapsed = time.time() - start_time
+            _record_query(query, response, "general", elapsed, confidence=resolved["confidence"])
+            return jsonify(_chat_payload(
+                response,
+                response_type="knowledge",
+                confidence=resolved["confidence"],
+                sources_used=resolved["sources_used"],
+                time_taken=f"{elapsed:.2f}s",
+            ))
         
         # Multi-question detection — split and answer each separately
         questions = detect_multiple_questions(query)
@@ -2123,6 +2193,11 @@ def ask():
                 elif q_route.intent == "definition":
                     q_context = []
                     q_resolved = _resolve_definition_response(q)
+                    q_confidence = q_resolved["confidence"]
+                    q_response = q_resolved["response"]
+                elif _should_direct_unknown_to_llm(q, route=q_route):
+                    q_context = []
+                    q_resolved = _resolve_general_unknown_response(q, route=q_route)
                     q_confidence = q_resolved["confidence"]
                     q_response = q_resolved["response"]
                 else:

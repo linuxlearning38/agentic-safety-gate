@@ -26,6 +26,7 @@ FUNCTIONS = {
     "_resolve_definition_response",
     "_retrieve_troubleshooting_chunks",
     "_resolve_troubleshooting_response",
+    "_is_healing_query",
     "_get_recent_distinct_turns",
     "_summarize_topic",
     "_topic_from_turn",
@@ -42,6 +43,8 @@ FUNCTIONS = {
     "_extract_recall_label",
     "_recall_chat_fact",
     "_answer_ava_self_query",
+    "_should_direct_unknown_to_llm",
+    "_resolve_general_unknown_response",
     "detect_query_intent",
 }
 
@@ -126,6 +129,22 @@ def load_helpers():
         def __init__(self, content, source_collection):
             self.content = content
             self.source_collection = source_collection
+    class FakeOllama:
+        def chat(self, model, messages, options=None):
+            prompt = messages[-1]["content"].lower()
+            if "capital of france" in prompt:
+                answer = "Paris is the capital of France."
+            elif "2+2" in prompt:
+                answer = "2+2 equals 4."
+            elif "photosynthesis" in prompt:
+                answer = "Photosynthesis is how plants convert sunlight, water, and carbon dioxide into glucose and oxygen."
+            elif "machine learning" in prompt:
+                answer = "Machine learning is a field of AI where models learn patterns from data."
+            elif "tcp vs udp" in prompt or "tcp versus udp" in prompt:
+                answer = "TCP is reliable and connection-oriented, while UDP is faster and connectionless."
+            else:
+                answer = "This is a direct general answer."
+            return {"message": {"content": answer}}
     class FakeHybridRetriever:
         def query(self, query_text, n_policies=4, n_blogs=3, blog_min_relevance=0.45, format_for_llm=True):
             q = query_text.lower()
@@ -171,6 +190,8 @@ def load_helpers():
         def _strip_section_labels(self, text):
             return text
     namespace["hybrid_retriever"] = FakeHybridRetriever()
+    namespace["ollama"] = FakeOllama()
+    namespace["LLM_MODEL"] = "qwen2.5:14b"
     segments = []
     for node in tree.body:
         if isinstance(node, ast.Assign):
@@ -325,6 +346,19 @@ def main():
         check(f"detect_query_intent {query!r}", ns["detect_query_intent"](query) == "definition")
         resolved = ns["_resolve_definition_response"](query)
         check(f"definition response {query!r}", subject.lower() in resolved["response"].lower() and expected.lower() in resolved["response"].lower())
+
+    general_queries = [
+        ("What is the capital of France?", "paris"),
+        ("What is 2+2?", "4"),
+        ("Explain photosynthesis", "plants"),
+        ("What is machine learning?", "machine learning"),
+        ("TCP vs UDP", "tcp"),
+    ]
+    for query, expected in general_queries:
+        route = ns["_route_query"](query)
+        check(f"general direct gate {query!r}", ns["_should_direct_unknown_to_llm"](query, route=route) is True)
+        resolved = ns["_resolve_general_unknown_response"](query, route=route)
+        check(f"general response {query!r}", expected in resolved["response"].lower() and resolved["sources_used"] == 0)
 
     print("\nAVA controlled benchmark passed.")
 
