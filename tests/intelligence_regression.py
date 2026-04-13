@@ -53,6 +53,8 @@ FUNCTIONS = {
     "_looks_like_invalid_json_wrapper",
     "_repair_definition_wrapper",
     "_answer_ava_self_query",
+    "_should_direct_unknown_to_llm",
+    "_resolve_general_unknown_response",
     "detect_query_intent",
 }
 
@@ -163,6 +165,24 @@ class FakeHybridRetriever:
         return text
 
 
+class FakeOllama:
+    def chat(self, model, messages, options=None):
+        prompt = messages[-1]["content"].lower()
+        if "capital of france" in prompt:
+            answer = "Paris is the capital of France."
+        elif "2+2" in prompt:
+            answer = "2+2 equals 4."
+        elif "photosynthesis" in prompt:
+            answer = "Photosynthesis is the process by which plants use sunlight to convert carbon dioxide and water into glucose and oxygen."
+        elif "machine learning" in prompt:
+            answer = "Machine learning is a branch of AI where models learn patterns from data to make predictions or decisions."
+        elif "tcp vs udp" in prompt or "tcp versus udp" in prompt:
+            answer = "TCP is connection-oriented and reliable, while UDP is connectionless and lower-overhead."
+        else:
+            answer = "This is a direct general answer."
+        return {"message": {"content": answer}}
+
+
 def load_helpers():
     def load_module(name: str, path: Path):
         spec = importlib.util.spec_from_file_location(name, path)
@@ -200,6 +220,8 @@ def load_helpers():
         "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
         "build_troubleshooting_plan": answer_planner.build_troubleshooting_plan,
         "compose_controlled_response": response_composer.compose_response,
+        "ollama": FakeOllama(),
+        "LLM_MODEL": "qwen2.5:14b",
         "db": FakeDB(),
         "healer": FakeHealer(),
         "hybrid_retriever": FakeHybridRetriever(),
@@ -317,6 +339,10 @@ def main():
     check("comparison route is controlled", comparison_route.intent == "comparison")
     check("comparison route extracts targets", len(comparison_route.comparison_targets) == 2)
     check("definition route is controlled", ns["_route_query"]("What is readiness probe?").intent == "definition")
+    check("general question bypasses kb", ns["_should_direct_unknown_to_llm"]("What is machine learning?") is True)
+    check("general comparison bypasses kb", ns["_should_direct_unknown_to_llm"]("TCP vs UDP") is True)
+    check("devops definition stays controlled", ns["_should_direct_unknown_to_llm"]("What is readiness probe?") is False)
+    check("dangerous query does not bypass kb", ns["_should_direct_unknown_to_llm"]("Delete all pods in kube-system") is False)
 
     fake_db.queries = [
         {"query": "Remember this exactly: cluster=prod-west-2", "response": "Okay", "intent": "memory"},
@@ -450,6 +476,8 @@ def main():
     check("controlled definition response is deterministic", "readiness probe" in definition_resolved["response"].lower() and "receive traffic" in definition_resolved["response"].lower())
     configmap_resolved = ns["_resolve_definition_response"]("What is a ConfigMap?")
     check("controlled configmap definition response is grounded", "configmap" in configmap_resolved["response"].lower() and "configuration data" in configmap_resolved["response"].lower())
+    general_resolved = ns["_resolve_general_unknown_response"]("What is machine learning?")
+    check("controlled general response uses direct llm path", "machine learning" in general_resolved["response"].lower() and general_resolved["sources_used"] == 0)
 
     wrapped = '{"issue_type":"definition","command":"","risk_level":"","rollback":"","action_taken":"Readiness probe checks readiness. Liveness probe checks health."}'
     check("wrapper detected", ns["_looks_like_invalid_json_wrapper"](wrapped) is True)
