@@ -62,6 +62,8 @@ FUNCTIONS = {
     "extract_operational_clarification",
     "detect_multiple_questions",
     "detect_query_intent",
+    "_is_learning_query",
+    "_is_single_destructive_request",
 }
 
 CONSTANTS = {
@@ -71,6 +73,7 @@ CONSTANTS = {
     "_KNOWN_DIAGRAM_TECH",
     "_RAW_COMMAND_PREFIXES",
     "_RAW_COMMAND_STARTERS",
+    "_LEARNING_PREFIXES",
 }
 
 
@@ -633,6 +636,81 @@ def main():
         "wrapper repaired",
         ns["_repair_definition_wrapper"](wrapped) == "Readiness probe checks readiness. Liveness probe checks health.",
     )
+
+    # ── Destructive blocking — new patterns ──────────────────────────────────
+    destr = ns["_is_single_destructive_request"]
+    learn = ns["_is_learning_query"]
+
+    # Learning prefix gate — these must NOT block
+    check("learning: how do I delete all pods",     not destr("how do I delete all pods"))
+    check("learning: what does rm -rf do",          not destr("what does rm -rf do"))
+    check("learning: explain mkfs",                 not destr("explain mkfs"))
+    check("learning: what is shutdown",             not destr("what is shutdown"))
+    check("learning: how to format a disk",         not destr("how to format a disk"))
+    check("learning: why does dd wipe disks",       not destr("why does dd wipe disks"))
+
+    # Legacy patterns preserved
+    check("legacy: rm -rf / still blocks",          destr("rm -rf /"))
+    check("legacy: drop all tables still blocks",   destr("drop all tables"))
+    check("legacy: truncate my database blocks",    destr("truncate my database"))
+
+    # Mass deletion
+    check("blocks: delete all pods",                destr("delete all pods"))
+    check("blocks: delete all deployments",         destr("delete all deployments"))
+    check("blocks: delete all services",            destr("delete all services"))
+    check("blocks: delete all namespaces",          destr("delete all namespaces"))
+    check("blocks: delete all nodes",               destr("delete all nodes"))
+    check("blocks: delete all secrets",             destr("delete all secrets"))
+    check("blocks: delete all containers",          destr("delete all containers"))
+    check("blocks: please delete all pods",         destr("please delete all pods"))
+    check("blocks: delete all the pods",            destr("delete all the pods"))
+    check("blocks: kubectl delete --all",           destr("kubectl delete --all"))
+    check("blocks: kubectl delete pods --all",      destr("kubectl delete pods --all"))
+    check("blocks: kill all containers",            destr("kill all containers"))
+
+    # Disk destruction
+    check("blocks: format /dev/sda",                destr("format /dev/sda"))
+    check("blocks: mkfs.ext4 /dev/sda",             destr("mkfs.ext4 /dev/sda"))
+    check("blocks: mkfs.xfs /dev/sdb1",             destr("mkfs.xfs /dev/sdb1"))
+    check("blocks: mkfs bare",                      destr("mkfs"))
+    check("blocks: dd if=/dev/zero of=/dev/sda",    destr("dd if=/dev/zero of=/dev/sda"))
+    check("blocks: wipefs /dev/sda",                destr("wipefs /dev/sda"))
+    check("blocks: shred /dev/sda",                 destr("shred /dev/sda"))
+    check("blocks: fdisk /dev/sda",                 destr("fdisk /dev/sda"))
+
+    # Critical system file overwrite
+    check("blocks: echo '' > /etc/passwd",          destr('echo "" > /etc/passwd'))
+    check("blocks: > /etc/shadow",                  destr("> /etc/shadow"))
+    check("blocks: > /etc/sudoers",                 destr("> /etc/sudoers"))
+    check("blocks: > /etc/fstab",                   destr("> /etc/fstab"))
+    check("blocks: echo x >> /etc/passwd",          destr("echo x >> /etc/passwd"))
+
+    # Permissions / auth destruction
+    check("blocks: chmod -R 777 /",                 destr("chmod -R 777 /"))
+    check("blocks: chmod 777 /etc",                 destr("chmod 777 /etc"))
+    check("blocks: chmod -R 000 /etc",              destr("chmod -R 000 /etc"))
+    check("blocks: usermod -l root",                destr("usermod -l root"))
+    check("blocks: passwd -d root",                 destr("passwd -d root"))
+
+    # System control
+    check("blocks: shutdown",                       destr("shutdown"))
+    check("blocks: halt",                           destr("halt"))
+    check("blocks: poweroff",                       destr("poweroff"))
+    check("blocks: reboot -f",                      destr("reboot -f"))
+    check("blocks: init 0",                         destr("init 0"))
+    check("blocks: init 6",                         destr("init 6"))
+    check("blocks: kill -9 -1",                     destr("kill -9 -1"))
+    check("blocks: killall5",                       destr("killall5"))
+
+    # Fork bomb
+    check("blocks: fork bomb",                      destr(":(){ :|:& };:"))
+
+    # Safe operations must NOT be blocked
+    check("safe: restart docker service not blocked",   not destr("restart docker service"))
+    check("safe: run date not blocked",                  not destr("run date"))
+    check("safe: what is kubernetes not blocked",        not destr("what is kubernetes"))
+    check("safe: check disk not blocked",                not destr("check disk"))
+    check("safe: show running containers not blocked",   not destr("show running containers"))
 
     print("\nIntelligence regression tests passed.")
 
