@@ -541,6 +541,22 @@ def _blocked_action_result(query: str, reason: str, threat: str, blast_radius: s
 
 
 def _resolve_direct_action_query(query: str) -> dict | None:
+    # Destructive check MUST come before extract_explicit_command_request.
+    # 'echo' and 'kill' are both in _RAW_COMMAND_STARTERS — without this order,
+    # they get routed to execute_command_secure which returns approval_required
+    # instead of critical-blocked.
+    if _is_single_destructive_request(query):
+        blocked_result = _blocked_action_result(
+            query,
+            "Destructive infrastructure or database requests are blocked by policy.",
+            "destructive_request",
+        )
+        return {
+            "kind": "command",
+            "result": blocked_result,
+            "response": _command_response_text(blocked_result),
+        }
+
     explicit_command = extract_explicit_command_request(query)
     if explicit_command:
         result = execute_tool_safe(
@@ -553,18 +569,6 @@ def _resolve_direct_action_query(query: str) -> dict | None:
             "kind": "command",
             "result": result,
             "response": _command_response_text(result),
-        }
-
-    if _is_single_destructive_request(query):
-        blocked_result = _blocked_action_result(
-            query,
-            "Destructive infrastructure or database requests are blocked by policy.",
-            "destructive_request",
-        )
-        return {
-            "kind": "command",
-            "result": blocked_result,
-            "response": _command_response_text(blocked_result),
         }
 
     operational_tool = extract_operational_tool_request(query)

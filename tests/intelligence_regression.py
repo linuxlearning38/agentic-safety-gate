@@ -705,6 +705,19 @@ def main():
     # Fork bomb
     check("blocks: fork bomb",                      destr(":(){ :|:& };:"))
 
+    # Live-path ordering guards: echo/kill are in _RAW_COMMAND_STARTERS so
+    # extract_explicit_command_request would grab them first → approval_required.
+    # These tests confirm _is_single_destructive_request catches them AND that
+    # extract_explicit_command_request would have matched (proving ordering matters).
+    check(
+        "live path: echo > /etc/passwd blocked despite being a cmd starter",
+        destr('echo "" > /etc/passwd') and ns["extract_explicit_command_request"]('echo "" > /etc/passwd') is not None,
+    )
+    check(
+        "live path: kill -9 -1 blocked despite being a cmd starter",
+        destr("kill -9 -1") and ns["extract_explicit_command_request"]("kill -9 -1") is not None,
+    )
+
     # Safe operations must NOT be blocked
     check("safe: restart docker service not blocked",   not destr("restart docker service"))
     check("safe: run date not blocked",                  not destr("run date"))

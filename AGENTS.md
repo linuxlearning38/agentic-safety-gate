@@ -145,6 +145,11 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
 - Timestamp:
   - 2026-04-17 Asia/Calcutta (updated — identity leak fix)
 - Latest changes made:
+  - Fixed destructive blocking ordering bug in `web_agent_v2.1_guardrail.py`:
+    - Root cause: `_resolve_direct_action_query` called `extract_explicit_command_request` BEFORE `_is_single_destructive_request`. Both `echo` and `kill` are in `_RAW_COMMAND_STARTERS`, so "echo \"\" > /etc/passwd" and "kill -9 -1" were extracted as raw commands and routed to `execute_command_secure`. That function ran `analyze_command_security` which returned `approval_required` (credential_access threat for /etc/passwd → medium, unknown command for kill-9-1 → medium) — never critical-blocked.
+    - Fix: swapped the two checks in `_resolve_direct_action_query` so `_is_single_destructive_request` runs first. If it matches, return blocked immediately — `execute_command_secure` and `security_layer` never see the query.
+    - Added 2 "live path" regression tests that confirm: (1) both queries match `_is_single_destructive_request`, AND (2) `extract_explicit_command_request` would have caught them too — proving the ordering fix is what closes the gap.
+    - 184 regression checks pass. Live container ordering confirmed: `if _is_single_destructive_request` at char 335, `explicit_command = extract_explicit_command_request` at char 741 in `_resolve_direct_action_query`.
   - Expanded destructive command blocking in `web_agent_v2.1_guardrail.py`:
     - Root cause: `_is_single_destructive_request` only matched narrow action+target pairs (delete service, drop table, etc.) — mass-deletion, disk format, system file overwrite, permission destruction, system control, and fork bombs all fell through to knowledge routing or approval
     - Fix: replaced the 6-pattern function with an 8-category expanded version covering 30+ patterns; all checked BEFORE knowledge/approval routing
