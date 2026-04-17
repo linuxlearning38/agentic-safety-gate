@@ -17,7 +17,7 @@ import time
 import logging
 import threading
 from datetime import datetime
-from control.secure_executor import execute_command_secure, execute_approved_command
+from control.secure_executor import execute_command_secure, execute_tool_safe, execute_approved_command
 from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
@@ -310,47 +310,22 @@ def is_command_safe(cmd):
     
     return True, "Command is safe"
 
-def analyze_command_output(cmd, output):
-    """Generate brief analysis of command output"""
-    try:
-        # Skip analysis for empty or very short outputs
-        if not output or len(output.strip()) < 10:
-            return None
-        
-        # Create a concise prompt for analysis
-        prompt = f"""Analyze this command output and provide a brief 2-3 sentence summary of key insights.
-
-Command: {cmd}
-Output:
-{output[:1000]}
-
-Provide only the summary, no preamble. Focus on important numbers, status, or findings."""
-        
-        response = ollama.chat(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        return response['message']['content'].strip()
-    except Exception as e:
-        logger.error(f"Analysis error: {e}")
-        return None
-
 def execute_command(cmd, query=""):
     """Execute command with AgentGuard security controls"""
-    result = execute_command_secure(cmd, query)
-    
-    if result["status"] == "executed":
+    result = execute_tool_safe("raw_command", {"command": cmd}, query=query, source="ask_command")
+
+    if result["status"] == "success":
         return {
             'success': True,
             'blocked': False,
-            'output': result["output"]["stdout"],
-            'error': result["output"]["stderr"],
-            'returncode': result["output"]["returncode"],
+            'output': result.get("output", ""),
+            'error': result.get("error", ""),
+            'returncode': 0,
             'security': {
                 'risk': result.get("risk"),
                 'threats': result.get("threats", [])
-            }
+            },
+            'command_repr': result.get("command_repr", cmd),
         }
     
     elif result["status"] == "blocked":
@@ -371,7 +346,7 @@ def execute_command(cmd, query=""):
             'blocked': False,
             'approval_required': True,
             'approval_id': result["approval_id"],
-            'reason': result["reason"],
+            'reason': result.get("reason", ""),
             'command': cmd,
             'security': {
                 'risk': result["risk"],
@@ -382,7 +357,582 @@ def execute_command(cmd, query=""):
         }
     
     else:
-        return {'success': False, 'blocked': False, 'reason': 'Unknown error'}
+        return {
+            'success': False,
+            'blocked': False,
+            'reason': result.get("reason") or result.get("error") or "Unknown error",
+            'error': result.get("error", ""),
+            'command': result.get("command_repr", cmd),
+            'security': {
+                'risk': result.get("risk"),
+                'threats': result.get("threats", []),
+                'blast_radius': result.get("blast_radius"),
+            },
+        }
+
+
+def _build_command_response(exec_result: dict):
+    return {
+        'success': exec_result.get('status') == 'success',
+        'blocked': exec_result.get('status') == 'blocked',
+        'approval_required': exec_result.get('status') == 'approval_required',
+        'approval_id': exec_result.get('approval_id'),
+        'output': exec_result.get('output', ''),
+        'error': exec_result.get('error', ''),
+        'reason': exec_result.get('reason', ''),
+        'command': exec_result.get('command_repr', ''),
+        'security': {
+            'risk': exec_result.get('risk'),
+            'threats': exec_result.get('threats', []),
+            'blast_radius': exec_result.get('blast_radius'),
+        },
+        'metadata': exec_result.get('metadata', {}),
+    }
+
+
+def _command_response_text(result: dict) -> str:
+    status = result.get("status")
+    risk = (result.get("risk") or "unknown").upper()
+    command = result.get("command_repr") or result.get("command") or "requested action"
+    if status == "approval_required":
+        approval_id = result.get("approval_id") or "pending"
+        return (
+            f"Approval required for {risk.lower()}-risk action.\n"
+            f"Action: {command}\n"
+            f"Approval ID: {approval_id}"
+        )
+    if status == "blocked":
+        return result.get("reason") or result.get("error") or "Action blocked by security policy."
+    return result.get("output") or result.get("error") or result.get("reason") or ""
+
+
+def _is_compound_dangerous_request(query: str) -> bool:
+    q = f" {_normalize_user_query(query).lower()} "
+    dangerous_markers = (
+        " rm -rf ", " delete ", " drain ", " drop ", " truncate ",
+        " shutdown ", " wipe ", " destroy ", " format ",
+    )
+    hits = sum(1 for marker in dangerous_markers if marker in q)
+    return hits >= 2
+
+
+_LEARNING_PREFIXES = (
+    "how ", "how do ", "how to ", "how can ", "how would ", "how does ",
+    "what ", "what is ", "what are ", "what does ", "what would ", "what happens ",
+    "why ", "why does ", "why would ", "why is ",
+    "explain ", "tell me about ", "describe ", "can you explain",
+    "could you explain", "show me how", "walk me through",
+)
+
+
+def _is_learning_query(q: str) -> bool:
+    """Return True when the query is asking to learn, not requesting execution."""
+    return any(q.startswith(prefix) for prefix in _LEARNING_PREFIXES)
+
+
+def _is_single_destructive_request(query: str) -> bool:
+    q_raw   = (query or "").strip()
+    q_plain = _normalize_user_query(q_raw).lower().strip()
+    q       = f" {q_plain} "   # padded for word-boundary substring matching
+
+    # Learning queries are informational — user wants to understand, not execute
+    if _is_learning_query(q_plain):
+        return False
+
+    # ── 1. Legacy patterns (preserved exactly) ────────────────────────────────
+    legacy_patterns = (
+        (" delete ", (" service ", " deployment ", " pod ", " namespace ", " database ", " cluster ")),
+        (" drop ",   (" table ", " tables ", " database ", " schema ")),
+        (" truncate ", (" table ", " tables ", " database ")),
+        (" wipe ",   (" disk ", " database ", " service ", " deployment ")),
+        (" destroy ", (" service ", " deployment ", " database ", " cluster ")),
+        (" format ", (" disk ", " drive ", " volume ")),
+    )
+    for action, targets in legacy_patterns:
+        if action in q and any(target in q for target in targets):
+            return True
+
+    # ── 2. Mass deletion ──────────────────────────────────────────────────────
+    if "delete all " in q_plain:
+        return True
+    if " delete " in q and " --all" in q:
+        return True
+    if "kubectl delete --all" in q_plain:
+        return True
+    if " kill all " in q and any(r in q for r in (" containers ", " pods ", " processes ")):
+        return True
+
+    # ── 3. rm -rf on critical system paths ────────────────────────────────────
+    for variant in (
+        "rm -rf /", "rm -rf /*", "rm -rf /home", "rm -rf /var",
+        "rm -rf /etc", "rm -rf /usr", "rm -rf /boot", "rm -rf /root",
+        "rm -r /", "rm --force /",
+    ):
+        if variant in q_plain:
+            return True
+
+    # ── 4. Disk destruction ───────────────────────────────────────────────────
+    if "format /dev/" in q_plain:
+        return True
+    if "mkfs" in q_plain:
+        return True
+    if "wipefs" in q_plain:
+        return True
+    if "shred /dev/" in q_plain:
+        return True
+    if "fdisk /dev/" in q_plain:
+        return True
+    if "dd if=" in q_plain and "of=/dev/" in q_plain:
+        return True
+
+    # ── 5. Critical system file overwrite ─────────────────────────────────────
+    for critical_file in (
+        "/etc/passwd", "/etc/shadow", "/etc/sudoers", "/etc/fstab", "/etc/hosts",
+    ):
+        if ("> "  + critical_file) in q_plain:
+            return True
+        if (">>" + critical_file) in q_plain:
+            return True
+        if re.search(r"echo\b.*>\s*" + re.escape(critical_file), q_plain):
+            return True
+    if "> /boot/" in q_plain:
+        return True
+
+    # ── 6. Permissions / auth destruction ─────────────────────────────────────
+    system_paths = ("/", "/etc", "/usr", "/bin", "/sbin", "/boot", "/root")
+    if re.search(r"\bchmod\b.*(777|000|0777|a\+rwx|ugo\+rwx)", q_plain):
+        if any(p in q_plain for p in system_paths):
+            return True
+    if re.search(r"\bchown\b.+-[rR].+root.*/", q_plain, re.IGNORECASE):
+        return True
+    if re.search(r"\bchown\b.+-[rR].*\s+\d+:\d+\s+/", q_plain):
+        return True
+    if "usermod -l root" in q_plain or "passwd -d root" in q_plain:
+        return True
+
+    # ── 7. System control ─────────────────────────────────────────────────────
+    for cmd in ("shutdown", "halt", "poweroff", "reboot -f", "init 0", "init 6", "kill -9 -1", "killall5"):
+        if (
+            q_plain == cmd
+            or q_plain.startswith(f"{cmd} ")
+            or q_plain.endswith(f" {cmd}")
+            or f" {cmd} " in q
+        ):
+            return True
+
+    # ── 8. Fork bomb ──────────────────────────────────────────────────────────
+    # Check raw query — normalization strips special chars
+    if ":(){ :|:& };" in q_raw or ":(){ :|: & };" in q_raw:
+        return True
+
+    return False
+
+
+def _blocked_action_result(query: str, reason: str, threat: str, blast_radius: str = "critical") -> dict:
+    return {
+        "status": "blocked",
+        "risk": "critical",
+        "reason": reason,
+        "command_repr": _normalize_user_query(query),
+        "approval_id": None,
+        "threats": [threat],
+        "blast_radius": blast_radius,
+    }
+
+
+def _resolve_direct_action_query(query: str) -> dict | None:
+    explicit_command = extract_explicit_command_request(query)
+    if explicit_command:
+        result = execute_tool_safe(
+            "raw_command",
+            {"command": explicit_command},
+            query=query,
+            source="ask_command",
+        )
+        return {
+            "kind": "command",
+            "result": result,
+            "response": _command_response_text(result),
+        }
+
+    if _is_single_destructive_request(query):
+        blocked_result = _blocked_action_result(
+            query,
+            "Destructive infrastructure or database requests are blocked by policy.",
+            "destructive_request",
+        )
+        return {
+            "kind": "command",
+            "result": blocked_result,
+            "response": _command_response_text(blocked_result),
+        }
+
+    operational_tool = extract_operational_tool_request(query)
+    if operational_tool:
+        exec_result = execute_tool_safe(
+            operational_tool["tool_name"],
+            operational_tool["tool_args"],
+            query=query,
+            source="ask_operational",
+        )
+        return {
+            "kind": "command",
+            "result": exec_result,
+            "response": _command_response_text(exec_result),
+        }
+
+    operational_clarification = extract_operational_clarification(query)
+    if operational_clarification:
+        return {
+            "kind": "knowledge",
+            "response": operational_clarification,
+            "confidence": "high",
+        }
+
+    return None
+
+
+_RAW_COMMAND_PREFIXES = (
+    "run ",
+    "execute ",
+    "shell ",
+    "cmd ",
+    "command ",
+)
+
+_RAW_COMMAND_STARTERS = (
+    "df", "free", "ps", "top", "uptime", "uname", "whoami", "pwd", "ls", "cat",
+    "grep", "find", "head", "tail", "wc", "which", "hostname", "echo", "git",
+    "docker", "kubectl", "helm", "terraform", "systemctl", "service", "journalctl",
+    "curl", "wget", "ssh", "scp", "bash", "sh", "python", "python3", "rm", "mv",
+    "cp", "chmod", "chown", "kill", "pkill", "netstat", "ss",
+)
+
+
+def extract_explicit_command_request(query: str) -> str | None:
+    q = _normalize_user_query(query).strip()
+    if not q:
+        return None
+
+    lower = q.lower()
+    for prefix in _RAW_COMMAND_PREFIXES:
+        if lower.startswith(prefix):
+            candidate = q[len(prefix):].strip()
+            return candidate or None
+
+    first_token = q.split()[0].lower()
+    if first_token in _RAW_COMMAND_STARTERS:
+        return q
+
+    return None
+
+
+def looks_like_operational_request(query: str) -> bool:
+    q = _normalize_user_query(query).strip().lower()
+    if not q:
+        return False
+
+    action_terms = (
+        "show", "check", "list", "get", "restart", "scale", "describe",
+        "scan", "inspect", "tail", "view", "display", "run", "execute",
+    )
+    target_terms = (
+        "disk", "memory", "pod", "pods", "node", "nodes", "service", "services",
+        "deployment", "deployments", "container", "containers", "docker",
+        "kubernetes", "cluster", "logs", "log", "status", "health", "image",
+        "process", "processes", "port", "ports", "update", "updates", "package",
+        "packages", "security", "auth", "ssh", "vulnerability", "vulnerabilities",
+        "cve", "cves", "suspicious",
+    )
+
+    first_word = q.split()[0]
+    if first_word not in action_terms:
+        return False
+
+    return any(term in q for term in target_terms)
+
+
+def extract_operational_tool_request(query: str) -> dict | None:
+    q = _normalize_user_query(query).strip()
+    if not q:
+        return None
+
+    lower = q.lower()
+
+    namespace_match = re.search(r"\b(?:in|from|for)\s+namespace\s+([a-z0-9-]+)\b", lower)
+    namespace = namespace_match.group(1) if namespace_match else "default"
+
+    scale_match = re.search(
+        r"\bscale\s+(?:the\s+)?deployment\s+(?!to\b)([a-z0-9][a-z0-9._-]*)\s+(?:to\s+)?(\d+)\s+replicas?\b",
+        lower,
+    )
+    if scale_match:
+        return {
+            "tool_name": "scale_deployment",
+            "tool_args": {
+                "deployment": scale_match.group(1),
+                "replicas": int(scale_match.group(2)),
+                "namespace": namespace,
+            },
+        }
+
+    rollback_match = re.search(
+        r"\brollback\s+(?:the\s+)?deployment\s+(?!my\b|the\b)([a-z0-9][a-z0-9._-]*)\b|\brollback\s+(?!my\b|the\b)([a-z0-9][a-z0-9._-]*)\s+deployment\b",
+        lower,
+    )
+    if rollback_match:
+        deployment_name = rollback_match.group(1) or rollback_match.group(2)
+        return {
+            "tool_name": "rollback_deployment",
+            "tool_args": {
+                "deployment": deployment_name,
+                "namespace": namespace,
+            },
+        }
+
+    restart_pod_match = re.search(
+        r"\brestart\s+(?:the\s+)?(?:pod|deployment)\s+(?!my\b|the\b)([a-z0-9][a-z0-9._-]*)\b",
+        lower,
+    )
+    restart_named_pod_match = re.search(
+        r"\brestart\s+(?!my\b|the\b)([a-z0-9][a-z0-9._-]*)\s+(?:pod|deployment)\b",
+        lower,
+    )
+    restart_target = None
+    if restart_pod_match:
+        restart_target = restart_pod_match.group(1)
+    elif restart_named_pod_match:
+        restart_target = restart_named_pod_match.group(1)
+
+    if restart_target:
+        return {
+            "tool_name": "restart_pod",
+            "tool_args": {
+                "deployment": restart_target,
+                "namespace": namespace,
+            },
+        }
+
+    restart_service_match = re.search(
+        r"\brestart\s+(?:the\s+)?(?:service\s+)?([a-z0-9][a-z0-9._-]*)\s+service\b|\brestart\s+service\s+([a-z0-9][a-z0-9._-]*)\b",
+        lower,
+    )
+    if restart_service_match:
+        service_name = restart_service_match.group(1) or restart_service_match.group(2)
+        if service_name:
+            return {
+                "tool_name": "restart_service",
+                "tool_args": {"service": service_name},
+            }
+
+    docker_service_restart_phrases = (
+        "restart docker service",
+        "restart the docker service",
+        "restart my docker service",
+        "restart docker daemon",
+    )
+    if any(phrase in lower for phrase in docker_service_restart_phrases):
+        return {
+            "tool_name": "restart_service",
+            "tool_args": {"service": "docker"},
+        }
+
+    if any(phrase in lower for phrase in ("show disk usage", "check disk usage", "list disk usage", "disk usage", "check disk")):
+        return {"tool_name": "check_disk", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "show memory usage", "check memory usage", "memory usage", "check memory",
+        "check my memory", "show my memory", "memory status", "ram usage", "check ram",
+    )):
+        return {"tool_name": "check_memory", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "verify my system", "check my system", "verify system", "system check",
+        "check system health", "system health", "what's wrong with my system",
+        "what is wrong with my system", "diagnose my system", "inspect my system",
+    )):
+        return {"tool_name": "verify_system", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "check docker", "show docker status", "docker status", "verify docker",
+        "is my docker running", "is docker running", "is my docker running correctly",
+        "docker daemon is not responding", "docker not responding", "check my docker",
+        "is docker healthy",
+    )):
+        return {"tool_name": "check_docker", "tool_args": {}}
+
+    if any(phrase in lower for phrase in ("show running containers", "list running containers", "show containers", "list containers")):
+        return {"tool_name": "list_containers", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "show running processes", "show processes", "check processes", "list processes",
+        "top processes", "show top processes", "show unusual processes",
+    )):
+        return {"tool_name": "check_processes", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "show listening ports", "check listening ports", "show open ports", "check open ports",
+        "list open ports", "list listening ports", "which ports are open",
+    )):
+        return {"tool_name": "check_listening_ports", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "show failed services", "check failed services", "failed services", "which services failed",
+    )):
+        return {"tool_name": "check_failed_services", "tool_args": {}}
+
+    inspect_service_match = re.search(
+        r"\b(?:inspect|investigate|check)\s+(?:the\s+)?service\s+([a-z0-9][a-z0-9._-]*)\b",
+        lower,
+    )
+    if inspect_service_match:
+        return {"tool_name": "inspect_service", "tool_args": {"service": inspect_service_match.group(1)}}
+
+    if any(phrase in lower for phrase in (
+        "check auth failures", "show auth failures", "check login failures", "show login failures",
+        "check ssh failures", "show ssh failures", "failed logins",
+    )):
+        return {"tool_name": "check_auth_events", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "check persistence points", "show persistence points", "check cron jobs and timers",
+        "inspect persistence", "review cron and timers",
+    )):
+        return {"tool_name": "check_persistence_points", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "check for updates", "show updates", "show package updates", "check package updates",
+        "show security updates", "check security updates", "what packages need updates",
+    )):
+        return {"tool_name": "check_updates", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "install security updates", "apply security updates", "patch my system",
+        "patch the system", "install package updates", "apply package updates",
+        "update my system",
+    )):
+        return {"tool_name": "install_updates", "tool_args": {}}
+
+    patch_package_match = re.search(
+        r"\b(?:patch|update|upgrade)\s+package\s+([a-z0-9][a-z0-9+._:-]*)\b",
+        lower,
+    )
+    if patch_package_match:
+        return {"tool_name": "patch_package", "tool_args": {"package": patch_package_match.group(1)}}
+
+    if any(phrase in lower for phrase in (
+        "scan my system for vulnerabilities", "scan the system for vulnerabilities",
+        "show cves affecting this host", "show cves on this host", "check vulnerabilities",
+        "check cves", "scan host vulnerabilities", "vulnerability scan",
+    )):
+        return {"tool_name": "scan_host_vulnerabilities", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "is anything suspicious on this system", "check suspicious activity",
+        "review recent security events", "inspect suspicious activity", "check for suspicious activity",
+        "is my system suspicious",
+    )):
+        return {"tool_name": "check_suspicious_activity", "tool_args": {}}
+
+    stop_process_match = re.search(
+        r"\b(?:stop|kill|terminate)\s+(?:the\s+)?(?:suspicious\s+)?process\s+(\d+)\b",
+        lower,
+    )
+    if stop_process_match:
+        return {
+            "tool_name": "stop_process",
+            "tool_args": {"pid": int(stop_process_match.group(1))},
+        }
+
+    inspect_process_match = re.search(
+        r"\b(?:inspect|investigate|check)\s+(?:the\s+)?process\s+(\d+)\b",
+        lower,
+    )
+    if inspect_process_match:
+        return {
+            "tool_name": "inspect_process",
+            "tool_args": {"pid": int(inspect_process_match.group(1))},
+        }
+
+    if any(phrase in lower for phrase in ("show pod status", "check pod status", "list pods", "get pods", "show pods")):
+        return {
+            "tool_name": "check_pod_status",
+            "tool_args": {"namespace": namespace},
+        }
+
+    logs_match = re.search(
+        r"\b(?:show|check|get|tail|view)\s+(?:the\s+)?logs?\s+(?:for\s+)?(?:pod\s+)?([a-z0-9][a-z0-9._-]*)\b",
+        lower,
+    )
+    if logs_match:
+        return {
+            "tool_name": "check_logs",
+            "tool_args": {"pod_name": logs_match.group(1), "namespace": namespace},
+        }
+
+    describe_match = re.search(
+        r"\b(?:describe|inspect|check)\s+(?:the\s+)?pod\s+([a-z0-9][a-z0-9._-]*)\b",
+        lower,
+    )
+    if describe_match:
+        return {
+            "tool_name": "check_pod_describe",
+            "tool_args": {"pod_name": describe_match.group(1), "namespace": namespace},
+        }
+
+    service_status_match = re.search(
+        r"\b(?:show|check|get)\s+(?:the\s+)?status\s+(?:of\s+)?(?:service\s+)?([a-z0-9][a-z0-9._-]*)\b",
+        lower,
+    )
+    if service_status_match and "pod" not in lower:
+        return {
+            "tool_name": "check_service_health",
+            "tool_args": {"service": service_status_match.group(1)},
+        }
+
+    node_status_phrases = ("show node status", "check node status", "list nodes", "get nodes", "show cluster nodes")
+    if any(phrase in lower for phrase in node_status_phrases):
+        return {"tool_name": "check_node_status", "tool_args": {}}
+
+    return None
+
+
+def extract_operational_clarification(query: str) -> str | None:
+    q = _normalize_text(query).strip().lower()
+    if not q:
+        return None
+
+    if re.search(r"\bscale\s+(?:the\s+)?deployment\s+to\s+\d+\s+replicas?\b", q):
+        return "I can queue a deployment scale action, but I need the deployment name. Example: scale deployment nginx to 5 replicas."
+
+    if re.search(r"\brollback\s+(?:my\s+|the\s+)?deployment\b", q):
+        return "I can queue a deployment rollback, but I need the deployment name. Example: rollback deployment nginx."
+
+    if "restart my service" in q or "restart the service" in q:
+        return "I can queue a service restart, but I need the service name. Example: restart service docker."
+
+    if q in {"restart my pod", "restart the pod", "restart deployment"}:
+        return "I can queue a deployment restart, but I need the deployment name. Example: restart the pod nginx."
+
+    if q in {"show me pod logs", "show pod logs", "get pod logs", "check pod logs"}:
+        return "I can fetch pod logs, but I need the pod name. Example: show me pod logs for nginx-7d8b49557c-abc12."
+
+    if q in {"check my service", "check service", "show my service", "show service"}:
+        return "I can check a service, but I need the service name. Example: check service api-gateway."
+
+    if q in {"restart my deployment", "restart the deployment"}:
+        return "I can queue a deployment restart, but I need the deployment name. Example: restart deployment nginx."
+
+    if q in {"stop suspicious process", "stop process", "kill process", "terminate process"}:
+        return "I can queue a process stop action, but I need the PID. Example: stop suspicious process 4321."
+
+    if q in {"patch package", "update package", "upgrade package"}:
+        return "I can queue a package patch action, but I need the package name. Example: patch package openssl."
+
+    if "show me the result" in q and "restart" in q and not re.search(r"\brestart\b.+\b(?:docker|service|pod|deployment)\s+[a-z0-9._-]+\b", q):
+        return "I can queue the restart, but I need the exact target first. Example: restart service docker."
+
+    return None
 
 def get_embedding(text):
     try:
@@ -618,13 +1168,17 @@ def _resolve_troubleshooting_response(query):
 
 
 def _retrieve_architecture_chunks(query):
-    return hybrid_retriever.query(
-        query_text=query,
-        n_policies=6,
-        n_blogs=4,
-        blog_min_relevance=0.008,
-        format_for_llm=False,
-    )
+    try:
+        return hybrid_retriever.query(
+            query_text=query,
+            n_policies=6,
+            n_blogs=4,
+            blog_min_relevance=0.008,
+            format_for_llm=False,
+        )
+    except Exception as e:
+        logger.warning(f"[Architecture] Retrieval fallback triggered: {e}")
+        return []
 
 
 def _resolve_architecture_response(query):
@@ -1802,6 +2356,11 @@ def detect_multiple_questions(query):
         questions.append(last if last.endswith('?') else last + '?')
         return questions[:3]
 
+    if "," in query and looks_like_operational_request(query):
+        split_parts = split_multi_query(query)
+        if len(split_parts) >= 2:
+            return split_parts[:3]
+
     return [query]
 
 
@@ -1826,84 +2385,6 @@ def is_meta_question(query):
     ]
     query_lower = query.lower()
     return any(pattern in query_lower for pattern in meta_patterns)
-
-def analyze_query_with_llm(query):
-    """Use Qwen to analyze query and determine the best action"""
-    try:
-        # Create a focused prompt for Qwen
-        prompt = f"""You are a query analyzer for a DevOps AI assistant. Analyze this query and determine the appropriate action.
-
-Query: "{query}"
-
-Respond in JSON format with ONE of these action types:
-
-1. COMMAND - If user wants to execute a system command
-   {{"action": "COMMAND", "command": "exact command to run", "reasoning": "brief explanation"}}
-
-2. DIRECT_ANSWER - If you can answer directly without searching
-   {{"action": "DIRECT_ANSWER", "answer": "your concise answer", "reasoning": "brief explanation"}}
-
-3. KNOWLEDGE - If you need to search the knowledge base
-   {{"action": "KNOWLEDGE", "reasoning": "brief explanation"}}
-
-Available commands (whitelist):
-- Basic: date, whoami, pwd, ls, cat, grep, df, free, ps, top, uptime, uname, echo, head, tail, wc, find, which, hostname
-- Server: ollama, docker, systemctl, git, curl, wget, netstat, ss
-
-Examples:
-- "check my git status" → {{"action": "COMMAND", "command": "git status", "reasoning": "user wants git repository status"}}
-- "what are running processes" → {{"action": "COMMAND", "command": "ps aux", "reasoning": "user wants to see active processes"}}
-- "which model are you using" → {{"action": "DIRECT_ANSWER", "answer": "I'm using Qwen 2.5 14B via Ollama", "reasoning": "meta question about the assistant"}}
-- "how to secure S3" → {{"action": "KNOWLEDGE", "reasoning": "requires DevOps knowledge base"}}
-
-Respond ONLY with valid JSON, no other text."""
-
-        # Call Qwen via Ollama
-        response = ollama.chat(
-            model=LLM_MODEL,
-            messages=[{'role': 'user', 'content': prompt}],
-            options={'temperature': 0.1}  # Low temperature for consistent structured output
-        )
-        
-        result_text = response['message']['content'].strip()
-        
-        # Try to extract JSON if wrapped in markdown
-        import re
-        import json
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
-        if json_match:
-            result_text = json_match.group(0)
-        
-        # Parse JSON response
-        result = json.loads(result_text)
-        
-        logger.info(f"[LLM Analysis] Action: {result.get('action')}, Reasoning: {result.get('reasoning')}")
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"[LLM Analysis] Error: {e}")
-        # Fallback to knowledge search on error
-        return {"action": "KNOWLEDGE", "reasoning": "fallback due to analysis error"}
-
-def extract_command_from_query(query):
-    """Extract command from natural language query using LLM analysis"""
-    analysis = analyze_query_with_llm(query)
-    
-    if analysis.get('action') == 'COMMAND':
-        proposed_cmd = analysis.get('command', '').strip()
-        
-        if proposed_cmd:
-            # Security validation - same whitelist enforcement as before
-            is_safe, reason = is_command_safe(proposed_cmd)
-            if is_safe:
-                logger.info(f"[Command Extraction] Approved: {proposed_cmd}")
-                return proposed_cmd
-            else:
-                logger.warning(f"[Command Extraction] Blocked: {proposed_cmd} - {reason}")
-                return None
-    
-    return None
 
 def get_ava_introduction():
     """Return AVA's self-introduction"""
@@ -1978,25 +2459,34 @@ I'm here to help with your DevOps journey - ask me anything!"""
 def ask():
     start_time = time.time()
     try:
-        data = request.json
-        query = _normalize_user_query(data.get('query', ''))
+        data = request.json or {}
+        raw_query = (data.get('query', '') or '').strip()
+        normalized_query = _normalize_user_query(raw_query)
+        preserve_raw_query = any((
+            extract_explicit_command_request(raw_query),
+            extract_operational_tool_request(raw_query),
+            extract_operational_clarification(raw_query),
+            _is_compound_dangerous_request(raw_query),
+            _is_single_destructive_request(raw_query),
+        ))
+        query = raw_query if preserve_raw_query else normalized_query
 
         if not query:
             return jsonify({'error': 'No query provided'}), 400
 
-        # FIX 1: Dependency health gate — abort early if LLM is down
+        logger.info(f"Query: {query}")
+        controlled_route = _route_query(query)
+
+        # Dependency gate only for routes that genuinely require the general LLM path.
         deps = _check_dependencies()
-        if not deps["ollama"]:
-            logger.warning("[/ask] Ollama unavailable — returning 503")
+        if controlled_route.intent == "general_qwen" and not deps["ollama"]:
+            logger.warning("[/ask] Ollama unavailable for general_qwen — returning 503")
             return jsonify({
                 "error":        "ollama_unavailable",
                 "confidence":   "low",
-                "response":     "LLM service is unavailable. Cannot process query.",
+                "response":     "LLM service is unavailable. Cannot process this general query right now.",
                 "dependencies": deps,
             }), 503
-
-        logger.info(f"Query: {query}")
-        controlled_route = _route_query(query)
 
         if controlled_route.intent == "memory_store":
             resolved = _resolve_memory_store_response(query)
@@ -2020,6 +2510,138 @@ def ask():
                 response,
                 response_type="memory",
                 confidence=confidence,
+                time_taken=f"{elapsed:.2f}s",
+            ))
+
+        if _is_compound_dangerous_request(query):
+            elapsed = time.time() - start_time
+            blocked_result = _blocked_action_result(
+                query,
+                "Multiple destructive actions in one request are blocked. Submit one action at a time for review.",
+                "compound_destructive_request",
+            )
+            save_history({
+                'timestamp': datetime.now().isoformat(),
+                'query': query,
+                'type': 'command',
+                'blocked': True,
+                'time_taken': f"{elapsed:.2f}s"
+            })
+            return jsonify(_chat_payload(
+                _command_response_text(blocked_result),
+                response_type='command',
+                time_taken=f"{elapsed:.2f}s",
+                result=_build_command_response(blocked_result),
+            ))
+
+        # Multi-question detection — split and answer each separately before
+        # generic knowledge routing so operational prompts do not collapse.
+        questions = detect_multiple_questions(query)
+        if len(questions) > 1:
+            logger.info(f"[*] Multi-question detected: {len(questions)} questions")
+            combined_results = []
+            total_sources = 0
+
+            for idx, q in enumerate(questions, 1):
+                logger.info(f"[{idx}/{len(questions)}] Processing: {q}")
+                q_context = []
+                q_direct = _resolve_direct_action_query(q)
+                if q_direct:
+                    if q_direct["kind"] == "command":
+                        combined_results.append({
+                            "number": idx,
+                            "question": q,
+                            "type": "command",
+                            "result": _build_command_response(q_direct["result"]),
+                        })
+                    else:
+                        combined_results.append({
+                            "number": idx,
+                            "question": q,
+                            "type": "knowledge",
+                            "response": q_direct["response"],
+                        })
+                    continue
+
+                q_route = _route_query(q)
+                if q_route.intent == "ava_self":
+                    q_response = _resolve_ava_self_response(q)
+                elif q_route.intent == "troubleshooting":
+                    q_resolved = _resolve_troubleshooting_response(q)
+                    q_response = q_resolved["response"]
+                    total_sources += q_resolved["sources_used"]
+                elif q_route.intent == "architecture":
+                    q_resolved = _resolve_architecture_response(q)
+                    q_response = q_resolved["response"]
+                    total_sources += q_resolved["sources_used"]
+                elif q_route.intent == "follow_up":
+                    q_resolved = _resolve_follow_up_response(q)
+                    q_response = q_resolved["response"]
+                    total_sources += q_resolved["sources_used"]
+                elif q_route.intent == "comparison":
+                    q_resolved = _resolve_comparison_response(q)
+                    q_response = q_resolved["response"]
+                    total_sources += q_resolved["sources_used"]
+                elif q_route.intent == "definition":
+                    q_resolved = _resolve_definition_response(q)
+                    q_response = q_resolved["response"]
+                    total_sources += q_resolved["sources_used"]
+                elif _should_direct_unknown_to_llm(q, route=q_route) and not looks_like_operational_request(q):
+                    q_resolved = _resolve_general_unknown_response(q, route=q_route)
+                    q_response = q_resolved["response"]
+                    total_sources += q_resolved["sources_used"]
+                else:
+                    q_context = query_knowledge_base(q, query_intent=detect_query_intent(q))
+                    total_sources += len(q_context)
+                    q_response = generate_response(q, q_context, confidence=score_context_confidence(q_context, q))
+
+                combined_results.append({
+                    "number": idx,
+                    "question": q,
+                    "type": "knowledge",
+                    "response": q_response,
+                })
+
+            elapsed = time.time() - start_time
+            save_history({
+                'timestamp': datetime.now().isoformat(),
+                'query': query,
+                'type': 'multi',
+                'parts': len(questions),
+                'time_taken': f"{elapsed:.2f}s"
+            })
+            return jsonify(_chat_payload(
+                "",
+                response_type='multi',
+                sources_used=total_sources,
+                time_taken=f"{elapsed:.2f}s",
+                results=combined_results,
+            ))
+
+        direct_action = _resolve_direct_action_query(query)
+        if direct_action:
+            elapsed = time.time() - start_time
+            if direct_action["kind"] == "command":
+                result = direct_action["result"]
+                save_history({
+                    'timestamp': datetime.now().isoformat(),
+                    'query': query,
+                    'type': 'command',
+                    'blocked': result.get('status') == 'blocked',
+                    'time_taken': f"{elapsed:.2f}s"
+                })
+                return jsonify(_chat_payload(
+                    direct_action["response"],
+                    response_type='command',
+                    time_taken=f"{elapsed:.2f}s",
+                    result=_build_command_response(result),
+                ))
+
+            _record_query(query, direct_action["response"], "knowledge", elapsed, confidence=direct_action.get("confidence", "high"))
+            return jsonify(_chat_payload(
+                direct_action["response"],
+                response_type='knowledge',
+                confidence=direct_action.get("confidence", "high"),
                 time_taken=f"{elapsed:.2f}s",
             ))
 
@@ -2131,7 +2753,7 @@ def ask():
                 time_taken=f"{elapsed:.2f}s",
             ))
 
-        if _should_direct_unknown_to_llm(query, route=controlled_route):
+        if _should_direct_unknown_to_llm(query, route=controlled_route) and not looks_like_operational_request(query):
             prior_messages = _get_recent_prior_messages(n=2)
             resolved = _resolve_general_unknown_response(query, prior_messages=prior_messages, route=controlled_route)
             response = resolved["response"]
@@ -2143,77 +2765,6 @@ def ask():
                 confidence=resolved["confidence"],
                 sources_used=resolved["sources_used"],
                 time_taken=f"{elapsed:.2f}s",
-            ))
-        
-        # Multi-question detection — split and answer each separately
-        questions = detect_multiple_questions(query)
-        if len(questions) > 1:
-            logger.info(f"[*] Multi-question detected: {len(questions)} questions")
-            combined_parts = []
-            total_sources = 0
-
-            for idx, q in enumerate(questions, 1):
-                logger.info(f"[{idx}/{len(questions)}] Processing: {q}")
-                q_route = _route_query(q)
-                if q_route.intent == "ava_self":
-                    q_context = []
-                    q_confidence = "high"
-                    q_response = _resolve_ava_self_response(q)
-                elif q_route.intent == "troubleshooting":
-                    q_context = []
-                    q_resolved = _resolve_troubleshooting_response(q)
-                    q_confidence = q_resolved["confidence"]
-                    q_response = q_resolved["response"]
-                elif q_route.intent == "architecture":
-                    q_context = []
-                    q_resolved = _resolve_architecture_response(q)
-                    q_confidence = q_resolved["confidence"]
-                    q_response = q_resolved["response"]
-                elif q_route.intent == "follow_up":
-                    q_context = []
-                    q_resolved = _resolve_follow_up_response(q)
-                    q_confidence = q_resolved["confidence"]
-                    q_response = q_resolved["response"]
-                elif q_route.intent == "comparison":
-                    q_context = []
-                    q_resolved = _resolve_comparison_response(q)
-                    q_confidence = q_resolved["confidence"]
-                    q_response = q_resolved["response"]
-                elif q_route.intent == "definition":
-                    q_context = []
-                    q_resolved = _resolve_definition_response(q)
-                    q_confidence = q_resolved["confidence"]
-                    q_response = q_resolved["response"]
-                elif _should_direct_unknown_to_llm(q, route=q_route):
-                    q_context = []
-                    q_resolved = _resolve_general_unknown_response(q, route=q_route)
-                    q_confidence = q_resolved["confidence"]
-                    q_response = q_resolved["response"]
-                else:
-                    q_context = query_knowledge_base(q, query_intent=detect_query_intent(q))
-                    q_confidence = score_context_confidence(q_context, q)
-                    q_response = generate_response(q, q_context, confidence=q_confidence)
-                combined_parts.append(
-                    f"---\n\n**Question {idx}:** {q}\n\n{q_response}"
-                )
-                total_sources += len(q_context)
-
-            combined_response = "\n\n".join(combined_parts)
-            elapsed = time.time() - start_time
-
-            save_history({
-                'timestamp': datetime.now().isoformat(),
-                'query': query,
-                'type': 'multi',
-                'parts': len(questions),
-                'time_taken': f"{elapsed:.2f}s"
-            })
-
-            return jsonify(_chat_payload(
-                combined_response,
-                response_type='knowledge',
-                sources_used=total_sources,
-                time_taken=f"{elapsed:.2f}s"
             ))
         
         # ── Phase 4: Command Graph — deterministic diagnostics ──────────────
@@ -2359,169 +2910,97 @@ def ask():
             ))
         # ── End ReAct Loop ──────────────────────────────────────────────────
 
-        # Phase 3: Force KNOWLEDGE routing for how/why/fix queries
-        if force_knowledge_routing(query):
-            logger.info("[*] Force-routing to knowledge base (knowledge pattern detected)")
-            action_type = "KNOWLEDGE"
-            analysis = {"action": "KNOWLEDGE", "reasoning": "forced by knowledge pattern"}
-        else:
-            # Use LLM to analyze query and decide action
-            logger.info("[*] Analyzing query with LLM...")
-            analysis = analyze_query_with_llm(query)
-            action_type = analysis.get('action')
-        
-        if action_type == 'COMMAND':
-            # Try to extract and validate command
-            extracted_cmd = extract_command_from_query(query)
-            if extracted_cmd:
-                logger.info(f"Extracted command: {extracted_cmd}")
-                result = execute_command(extracted_cmd, query)
-                
-                # Add analysis for successful commands
-                if result.get('success') and result.get('output'):
-                    logger.info("[*] Analyzing command output...")
-                    cmd_analysis = analyze_command_output(extracted_cmd, result['output'])
-                    if cmd_analysis:
-                        result['analysis'] = cmd_analysis
-                
-                elapsed = time.time() - start_time
-                
-                save_history({
-                    'timestamp': datetime.now().isoformat(),
-                    'query': query,
-                    'type': 'command',
-                    'blocked': result.get('blocked', False),
-                    'time_taken': f"{elapsed:.2f}s"
-                })
-                
-                return jsonify(_chat_payload(
-                    result.get('output') or result.get('error') or result.get('reason') or "",
-                    response_type='command',
-                    time_taken=f"{elapsed:.2f}s",
-                    result=result,
-                ))
-            else:
-                # Command blocked by security
-                elapsed = time.time() - start_time
-                return jsonify(_chat_payload(
-                    "This command was blocked by security restrictions.",
-                    response_type='knowledge',
-                    sources_used=0,
-                    time_taken=f"{elapsed:.2f}s"
-                ))
-                
-        elif action_type == 'DIRECT_ANSWER':
-            # Use LLM's direct answer
-            logger.info("[*] Using direct answer from LLM")
-            answer = analysis.get('answer', 'I can help with that.')
-            elapsed = time.time() - start_time
-            
-            save_history({
-                'timestamp': datetime.now().isoformat(),
-                'query': query,
-                'type': 'direct_answer',
-                'time_taken': f"{elapsed:.2f}s"
-            })
-            
-            return jsonify(_chat_payload(
-                answer,
-                response_type='knowledge',
-                sources_used=0,
-                time_taken=f"{elapsed:.2f}s"
-            ))
-        
-        else:  # KNOWLEDGE or fallback
-            # Handle regular DevOps questions with RAG
-            logger.info("[*] Searching knowledge base...")
-            query_intent = detect_query_intent(query)
-            context = query_knowledge_base(query, query_intent=query_intent)
-            logger.info(f"[*] Found {len(context)} relevant chunks")
+        # Final fallback: knowledge/exact answer path only.
+        logger.info("[*] Searching knowledge base...")
+        query_intent = detect_query_intent(query)
+        context = query_knowledge_base(query, query_intent=query_intent)
+        logger.info(f"[*] Found {len(context)} relevant chunks")
 
-            # Phase 4.5: Score context confidence before generating
-            confidence = score_context_confidence(context, query)
-            confidence = _apply_confidence_rules(confidence, context, query)
-            logger.info(f"[*] Context confidence: {confidence}")
-            logger.info(f"[*] Thinking with {LLM_MODEL}...")
+        # Phase 4.5: Score context confidence before generating
+        confidence = score_context_confidence(context, query)
+        confidence = _apply_confidence_rules(confidence, context, query)
+        logger.info(f"[*] Context confidence: {confidence}")
+        logger.info(f"[*] Thinking with {LLM_MODEL}...")
 
-            # Phase 5B: load recent conversation history for multi-turn context
-            prior_messages = _get_recent_prior_messages(n=3)
-            if prior_messages:
-                logger.info(f"[MultiTurn] Injecting {len(prior_messages) // 2} prior turns")
+        # Phase 5B: load recent conversation history for multi-turn context
+        prior_messages = _get_recent_prior_messages(n=3)
+        if prior_messages:
+            logger.info(f"[MultiTurn] Injecting {len(prior_messages) // 2} prior turns")
 
-            response = generate_response(query, context, confidence=confidence, prior_messages=prior_messages)
-            if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
-                response = _repair_definition_wrapper(response)
+        response = generate_response(query, context, confidence=confidence, prior_messages=prior_messages)
+        if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
+            response = _repair_definition_wrapper(response)
 
-            # Phase 3: Fail-safe retry
-            if context and len(context) < 2 and is_weak_response(response):
-                logger.info("[FAILSAFE] Weak response - retrying with extended retrieval...")
-                retry_chunks = hybrid_retriever.query(
-                    query_text=query,
-                    n_policies=6,
-                    n_blogs=10,
-                    blog_min_relevance=0.001,
-                    format_for_llm=False
+        # Phase 3: Fail-safe retry
+        if context and len(context) < 2 and is_weak_response(response):
+            logger.info("[FAILSAFE] Weak response - retrying with extended retrieval...")
+            retry_chunks = hybrid_retriever.query(
+                query_text=query,
+                n_policies=6,
+                n_blogs=10,
+                blog_min_relevance=0.001,
+                format_for_llm=False
+            )
+            if retry_chunks:
+                retry_context = hybrid_retriever.assemble_context(
+                    retry_chunks, max_articles=5, max_chunks_per_article=4
                 )
-                if retry_chunks:
-                    retry_context = hybrid_retriever.assemble_context(
-                        retry_chunks, max_articles=5, max_chunks_per_article=4
-                    )
-                    retry_confidence = score_context_confidence(retry_context, query)
-                    retry_confidence = _apply_confidence_rules(retry_confidence, retry_context, query)
-                    response = generate_response(query, retry_context, confidence=retry_confidence, prior_messages=prior_messages)
-                    if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
-                        response = _repair_definition_wrapper(response)
-                    confidence = retry_confidence
-                    logger.info("[FAILSAFE] Retry complete")
+                retry_confidence = score_context_confidence(retry_context, query)
+                retry_confidence = _apply_confidence_rules(retry_confidence, retry_context, query)
+                response = generate_response(query, retry_context, confidence=retry_confidence, prior_messages=prior_messages)
+                if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
+                    response = _repair_definition_wrapper(response)
+                confidence = retry_confidence
+                logger.info("[FAILSAFE] Retry complete")
 
-            # Pending 3: Memory auto-update — persist resolved issues
-            if is_technical_query(query) and not is_weak_response(response):
-                update_memory_issue(query, response[:200])
-                logger.info("[MEMORY] Issue saved to ava_memory.json")
+        # Pending 3: Memory auto-update — persist resolved issues
+        if is_technical_query(query) and not is_weak_response(response):
+            update_memory_issue(query, response[:200])
+            logger.info("[MEMORY] Issue saved to ava_memory.json")
 
-            # Phase 4.5: Update live stats counters
-            STATS['query_count'] += 1
-            # token count: word count approximation (more accurate than char/4)
-            response_tokens = len(response.split())
-            STATS['total_tokens'] += response_tokens
-            STATS['avg_tokens_per_query'] = STATS['total_tokens'] // STATS['query_count']
+        # Phase 4.5: Update live stats counters
+        STATS['query_count'] += 1
+        # token count: word count approximation (more accurate than char/4)
+        response_tokens = len(response.split())
+        STATS['total_tokens'] += response_tokens
+        STATS['avg_tokens_per_query'] = STATS['total_tokens'] // STATS['query_count']
 
-            elapsed = time.time() - start_time
+        elapsed = time.time() - start_time
 
-            save_history({
-                'timestamp': datetime.now().isoformat(),
-                'query': query,
-                'type': 'knowledge',
-                'sources_used': len(context),
-                'time_taken': f"{elapsed:.2f}s",
-                'response_preview': response[:200] + '...' if len(response) > 200 else response
-            })
+        save_history({
+            'timestamp': datetime.now().isoformat(),
+            'query': query,
+            'type': 'knowledge',
+            'sources_used': len(context),
+            'time_taken': f"{elapsed:.2f}s",
+            'response_preview': response[:200] + '...' if len(response) > 200 else response
+        })
 
-            # Phase 5B: persist to SQLite for multi-turn retrieval
-            # Strip confidence prefix so it doesn't compound on future turns
-            try:
-                clean_response = response
-                for prefix in _CONFIDENCE_PREFIXES.values():
-                    if clean_response.startswith(prefix):
-                        clean_response = clean_response[len(prefix):]
-                        break
-                db.save_query(
-                    query=query,
-                    response=clean_response,
-                    confidence=confidence,
-                    intent=query_intent,
-                    sources_used=len(context),
-                )
-            except Exception as _dbe:
-                logger.warning(f"[DB] save_query failed: {_dbe}")
-
-            return jsonify(_chat_payload(
-                response,
-                response_type='knowledge',
-                sources_used=len(context),
+        # Phase 5B: persist to SQLite for multi-turn retrieval
+        # Strip confidence prefix so it doesn't compound on future turns
+        try:
+            clean_response = response
+            for prefix in _CONFIDENCE_PREFIXES.values():
+                if clean_response.startswith(prefix):
+                    clean_response = clean_response[len(prefix):]
+                    break
+            db.save_query(
+                query=query,
+                response=clean_response,
                 confidence=confidence,
-                time_taken=f"{elapsed:.2f}s"
-            ))
+                intent=query_intent,
+                sources_used=len(context),
+            )
+        except Exception as _dbe:
+            logger.warning(f"[DB] save_query failed: {_dbe}")
+
+        return jsonify(_chat_payload(
+            response,
+            response_type='knowledge',
+            sources_used=len(context),
+            confidence=confidence,
+            time_taken=f"{elapsed:.2f}s"
+        ))
         
     except Exception as e:
         logger.error(f"Error in ask endpoint: {e}")
@@ -2848,16 +3327,18 @@ def execute_approved_route():
             duration     = _dur,
         )
 
-        if result.get('status') == 'executed':
+        if result.get('status') == 'success':
             return jsonify({
                 'status':  'executed',
-                'command': result.get('command', ''),
-                'output':  result.get('output', {}),
+                'command': result.get('command_repr', ''),
+                'output':  result.get('output', ''),
+                'mode':    result.get('mode', ''),
+                'risk':    result.get('risk', ''),
             })
         else:
             return jsonify({
                 'status': 'error',
-                'error':  result.get('error', 'Unknown error'),
+                'error':  result.get('error') or result.get('reason') or 'Unknown error',
             }), 400
 
     except Exception as e:
@@ -2907,16 +3388,9 @@ def run_tool_route(tool_name):
         if not tool:
             return jsonify({'error': f"Tool '{tool_name}' not found"}), 404
 
-        if tool.risk_level != 'low':
-            return jsonify({
-                'error':      f"Tool '{tool_name}' is {tool.risk_level} risk",
-                'message':    'Use /ask to run medium/high risk tools through the approval workflow',
-                'risk_level': tool.risk_level,
-            }), 403
-
         logger.info(f"[Tool] Direct run: {tool_name}({tool_args})")
         _t0    = time.time()
-        result = tool_registry.execute(tool_name, tool_args)
+        result = execute_tool_safe(tool_name, tool_args, query=f"tool_route:{tool_name}", source="tools_route")
         _dur   = time.time() - _t0
 
         report_tool_execution(
@@ -2933,6 +3407,9 @@ def run_tool_route(tool_name):
             'status':  result.get('status'),
             'output':  result.get('output', ''),
             'error':   result.get('error', ''),
+            'approval_id': result.get('approval_id'),
+            'risk': result.get('risk'),
+            'reason': result.get('reason', ''),
         })
 
     except Exception as e:
@@ -3264,6 +3741,51 @@ HTML_TEMPLATE = r'''
             background: #2a2a2a;
             color: #fff;
         }
+
+        .thread-list {
+            margin-top: 18px;
+            flex: 1;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 0 2px 18px 0;
+            scrollbar-gutter: stable;
+        }
+
+        .thread-list-title {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-faint);
+            margin-bottom: 10px;
+            padding: 0 4px;
+        }
+
+        .thread-list .chat-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            padding: 12px 14px;
+            margin-bottom: 8px;
+            white-space: normal;
+            line-height: 1.45;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.04);
+            border-radius: 14px;
+        }
+
+        .thread-query {
+            color: #ececec;
+            font-size: 13px;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+
+        .thread-meta {
+            color: var(--text-faint);
+            font-size: 11px;
+        }
         
         /* Modal */
         .modal {
@@ -3290,10 +3812,29 @@ HTML_TEMPLATE = r'''
             overflow: hidden;
             animation: slideUp 0.3s;
         }
-        
+
+        .modal.side-panel {
+            background: rgba(0, 0, 0, 0.64);
+        }
+
+        .modal.side-panel .modal-content {
+            margin: 0 0 0 auto;
+            width: min(460px, 100%);
+            max-width: 460px;
+            height: 100vh;
+            max-height: 100vh;
+            border-radius: 22px 0 0 22px;
+            animation: slideInPanel 0.24s ease;
+        }
+
         @keyframes slideUp {
             from { transform: translateY(50px); opacity: 0; }
             to { transform: translateY(0); opacity: 1; }
+        }
+
+        @keyframes slideInPanel {
+            from { transform: translateX(24px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
         }
         
         .modal-header {
@@ -3817,6 +4358,809 @@ HTML_TEMPLATE = r'''
             background: #51cf6622;
             color: #51cf66;
         }
+
+        /* Codex-inspired shell overrides */
+        :root {
+            --bg-app: #141414;
+            --bg-panel: #191919;
+            --bg-panel-2: #1f1f1f;
+            --bg-panel-3: #262626;
+            --bg-panel-4: #2d2d2d;
+            --border-soft: #2f2f2f;
+            --border-strong: #3a3a3a;
+            --text-main: #f2f2f2;
+            --text-muted: #9b9b9b;
+            --text-faint: #737373;
+            --accent: #7c8cff;
+            --accent-soft: rgba(124, 140, 255, 0.14);
+            --danger: #ff6b6b;
+            --danger-soft: rgba(255, 107, 107, 0.12);
+            --warning: #f2c572;
+            --warning-soft: rgba(242, 197, 114, 0.12);
+            --success: #63d297;
+            --success-soft: rgba(99, 210, 151, 0.12);
+            --shadow-shell: 0 18px 50px rgba(0, 0, 0, 0.28);
+        }
+
+        body {
+            background:
+                radial-gradient(circle at top, rgba(124, 140, 255, 0.08), transparent 26%),
+                linear-gradient(180deg, #171717 0%, #121212 100%);
+            color: var(--text-main);
+        }
+
+        .app-container {
+            padding: 16px;
+            gap: 16px;
+            background: transparent;
+        }
+
+        .sidebar {
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            width: 284px;
+            height: calc(100vh - 32px);
+            max-height: calc(100vh - 32px);
+            min-height: 0;
+            padding: 16px 14px 148px;
+            background: rgba(20, 20, 20, 0.94);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 22px;
+            box-shadow: var(--shadow-shell);
+            backdrop-filter: blur(12px);
+            overflow: hidden;
+        }
+
+        .sidebar-header {
+            padding: 8px 8px 14px;
+            margin-bottom: 14px;
+        }
+
+        .sidebar-title {
+            font-size: 29px;
+            font-weight: 600;
+            letter-spacing: -0.04em;
+        }
+
+        .sidebar-subtitle {
+            margin-top: 6px;
+            color: var(--text-faint);
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        .sidebar-btn {
+            padding: 12px 14px;
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 14px;
+            color: #d5d5d5;
+            font-size: 15px;
+            font-weight: 500;
+        }
+
+        .sidebar-btn:hover {
+            background: rgba(255, 255, 255, 0.05);
+            border-color: rgba(255, 255, 255, 0.06);
+        }
+
+        .nav-icon {
+            width: 18px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: #c8c8c8;
+            font-size: 15px;
+        }
+
+        .profile-card {
+            margin-top: 12px;
+            padding: 12px 14px;
+            background: linear-gradient(180deg, rgba(124, 140, 255, 0.08), rgba(124, 140, 255, 0.03));
+            border: 1px solid rgba(124, 140, 255, 0.18);
+            border-radius: 16px;
+        }
+
+        .profile-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .profile-avatar {
+            width: 34px;
+            height: 34px;
+            border-radius: 12px;
+            background: linear-gradient(180deg, #8a96ff 0%, #7481f4 100%);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 700;
+            flex-shrink: 0;
+        }
+
+        .profile-meta {
+            min-width: 0;
+            flex: 1;
+        }
+
+        .profile-name {
+            color: #f3f3f3;
+            font-size: 13px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .profile-role {
+            display: inline-flex;
+            margin-top: 4px;
+            padding: 3px 8px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.06);
+            color: #c5ccff;
+            font-size: 11px;
+        }
+
+        .profile-power {
+            background: none;
+            border: none;
+            color: #7f7f7f;
+            cursor: pointer;
+            font-size: 15px;
+            padding: 4px;
+            border-radius: 8px;
+        }
+
+        .profile-power:hover {
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--danger);
+        }
+
+        .sidebar-quick {
+            margin-top: 18px;
+            padding: 14px;
+            border-radius: 18px;
+            background: rgba(255, 255, 255, 0.025);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            flex-shrink: 0;
+        }
+
+        .sidebar-quick-title {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-faint);
+            margin-bottom: 12px;
+        }
+
+        .quick-stat-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .quick-stat {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 13px;
+            color: #d8d8d8;
+        }
+
+        .quick-stat-value {
+            color: #f0f0f0;
+            font-weight: 600;
+        }
+
+        .main-content {
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 26px;
+            overflow: hidden;
+            background: rgba(18, 18, 18, 0.92);
+            box-shadow: var(--shadow-shell);
+            backdrop-filter: blur(10px);
+        }
+
+        .workspace-bar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 16px 22px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0));
+        }
+
+        .mobile-topbar {
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            background: rgba(18, 18, 18, 0.96);
+        }
+
+        .mobile-topbar-title {
+            font-size: 15px;
+            font-weight: 600;
+        }
+
+        .mobile-topbar-btn {
+            width: 38px;
+            height: 38px;
+            border-radius: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            background: rgba(255, 255, 255, 0.03);
+            color: #efefef;
+            cursor: pointer;
+        }
+
+        .sidebar-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.56);
+            z-index: 999;
+        }
+
+        .workspace-title {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .workspace-title h1 {
+            font-size: 16px;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+        }
+
+        .workspace-title p {
+            font-size: 12px;
+            color: var(--text-faint);
+        }
+
+        .workspace-pills {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .workspace-pill {
+            padding: 6px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            background: rgba(255, 255, 255, 0.03);
+            color: var(--text-muted);
+            font-size: 12px;
+            white-space: nowrap;
+        }
+
+        .workspace-pill.primary {
+            color: #dfe3ff;
+            background: var(--accent-soft);
+            border-color: rgba(124, 140, 255, 0.28);
+        }
+
+        .security-inline-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 18px;
+            height: 18px;
+            padding: 0 6px;
+            margin-left: auto;
+            border-radius: 999px;
+            background: #ff5a5a;
+            color: white;
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+        .chat-area {
+            padding: 28px 28px 18px;
+            gap: 30px;
+        }
+
+        .welcome-screen {
+            max-width: 920px;
+            margin: 0 auto;
+            align-items: flex-start;
+            justify-content: center;
+            text-align: left;
+        }
+
+        .welcome-title {
+            font-size: 42px;
+            line-height: 1.05;
+            letter-spacing: -0.05em;
+            margin-bottom: 10px;
+        }
+
+        .welcome-subtitle {
+            color: var(--text-muted);
+            max-width: 680px;
+            margin-bottom: 18px;
+        }
+
+        .example-prompts {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            max-width: 760px;
+            margin-top: 16px;
+        }
+
+        .example-prompt {
+            background: rgba(255, 255, 255, 0.025);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 18px;
+            padding: 16px 18px;
+        }
+
+        .example-prompt:hover {
+            background: rgba(255, 255, 255, 0.04);
+            border-color: rgba(255, 255, 255, 0.08);
+            transform: translateY(-1px);
+        }
+
+        .message,
+        .loading-message {
+            max-width: 980px;
+        }
+
+        .message-avatar {
+            width: 42px;
+            height: 42px;
+            border-radius: 14px;
+            background: linear-gradient(180deg, #7f8cf7 0%, #6a6ff0 100%);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+        }
+
+        .message.user .message-avatar {
+            background: linear-gradient(180deg, #5957d6 0%, #716af0 100%);
+        }
+
+        .message-content {
+            max-width: 820px;
+            padding-top: 2px;
+        }
+
+        .message-header {
+            margin-bottom: 10px;
+        }
+
+        .message-author {
+            font-size: 15px;
+        }
+
+        .message-meta {
+            color: var(--text-faint);
+        }
+
+        .message-text {
+            color: #dfdfdf;
+            line-height: 1.82;
+            font-size: 15px;
+        }
+
+        .message.user .message-text {
+            display: inline-block;
+            padding: 12px 16px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            color: #f6f6f6;
+            font-weight: 400;
+        }
+
+        .message-actions {
+            margin-top: 14px;
+        }
+
+        .action-btn {
+            padding: 7px 12px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.03);
+            border-color: rgba(255, 255, 255, 0.06);
+            color: var(--text-muted);
+        }
+
+        .action-btn:hover {
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text-main);
+        }
+
+        .status-card {
+            padding: 16px 18px;
+            border-radius: 18px;
+            border: 1px solid var(--border-soft);
+            background: var(--bg-panel-2);
+        }
+
+        .status-card-title {
+            font-size: 13px;
+            font-weight: 700;
+            margin-bottom: 10px;
+            letter-spacing: 0.01em;
+        }
+
+        .status-card-copy {
+            color: #d9d9d9;
+            font-size: 14px;
+            line-height: 1.7;
+        }
+
+        .status-card-meta {
+            margin-top: 10px;
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .status-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 5px 9px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            background: rgba(255, 255, 255, 0.03);
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+
+        .status-card.blocked {
+            background: var(--danger-soft);
+            border-color: rgba(255, 107, 107, 0.28);
+        }
+
+        .status-card.blocked .status-card-title {
+            color: #ff8a8a;
+        }
+
+        .status-card.approval {
+            background: var(--warning-soft);
+            border-color: rgba(242, 197, 114, 0.25);
+        }
+
+        .status-card.approval .status-card-title {
+            color: #ffd990;
+        }
+
+        .status-card.executed {
+            background: rgba(255, 255, 255, 0.02);
+            border-color: rgba(255, 255, 255, 0.07);
+        }
+
+        .terminal-block {
+            margin-top: 10px;
+            background: #111;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 16px;
+            overflow: hidden;
+        }
+
+        .terminal-label {
+            padding: 10px 14px;
+            font-size: 12px;
+            color: var(--text-faint);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .findings-block {
+            margin-top: 12px;
+            display: grid;
+            gap: 10px;
+        }
+
+        .findings-panel {
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.03);
+            overflow: hidden;
+        }
+
+        .findings-label {
+            padding: 10px 14px;
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: rgba(255, 255, 255, 0.58);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        }
+
+        .findings-list {
+            list-style: none;
+            margin: 0;
+            padding: 12px 14px;
+            display: grid;
+            gap: 10px;
+        }
+
+        .findings-item {
+            color: #e6e6e6;
+            font-size: 13px;
+            line-height: 1.55;
+        }
+
+        .findings-item-title {
+            color: #ffffff;
+            font-weight: 600;
+            margin-bottom: 2px;
+        }
+
+        .findings-item-copy {
+            color: rgba(255, 255, 255, 0.74);
+        }
+
+        .findings-item-subcopy {
+            color: rgba(255, 255, 255, 0.56);
+            margin-top: 4px;
+            font-size: 12px;
+        }
+
+        .findings-actions {
+            margin-top: 10px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .findings-action-btn {
+            appearance: none;
+            border: 1px solid rgba(132, 146, 255, 0.28);
+            background: rgba(103, 115, 225, 0.12);
+            color: #dfe5ff;
+            border-radius: 999px;
+            padding: 7px 12px;
+            font-size: 12px;
+            line-height: 1;
+            cursor: pointer;
+            transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+        }
+
+        .findings-action-btn:hover {
+            background: rgba(103, 115, 225, 0.2);
+            border-color: rgba(132, 146, 255, 0.42);
+            transform: translateY(-1px);
+        }
+
+        .findings-action-btn:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .terminal-output {
+            margin: 0;
+            padding: 16px 18px;
+            background: transparent;
+            border: none;
+            border-radius: 0;
+        }
+
+        .terminal-output code {
+            color: #aef1c8;
+        }
+
+        .input-container {
+            padding: 18px 24px 22px;
+            background: linear-gradient(180deg, rgba(18, 18, 18, 0), rgba(18, 18, 18, 0.96) 18%);
+        }
+
+        .input-wrapper {
+            max-width: 980px;
+        }
+
+        .input-box {
+            padding: 16px 18px 12px;
+            border-radius: 24px;
+            border-color: rgba(255, 255, 255, 0.08);
+            background: rgba(41, 41, 41, 0.88);
+            min-height: 92px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .input-box:focus-within {
+            border-color: rgba(124, 140, 255, 0.4);
+            box-shadow: 0 0 0 4px rgba(124, 140, 255, 0.08);
+        }
+
+        .input-actions {
+            margin-right: 0;
+            align-self: flex-end;
+        }
+
+        #queryInput {
+            min-height: 44px;
+            font-size: 17px;
+        }
+
+        .send-btn {
+            width: 44px;
+            height: 44px;
+            border-radius: 14px;
+            background: linear-gradient(180deg, #8a96ff 0%, #7481f4 100%);
+        }
+
+        .composer-meta {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            width: 100%;
+            padding-left: 42px;
+            margin-top: 2px;
+        }
+
+        .composer-pill {
+            padding: 5px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            background: rgba(255, 255, 255, 0.025);
+            color: var(--text-faint);
+            font-size: 12px;
+        }
+
+        .sidebar-footer {
+            position: absolute;
+            left: 14px;
+            right: 14px;
+            bottom: 12px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+            background: linear-gradient(180deg, rgba(20, 20, 20, 0), rgba(20, 20, 20, 0.92) 18%, rgba(20, 20, 20, 1) 100%);
+            z-index: 2;
+        }
+
+        .sidebar-footer-card {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            cursor: pointer;
+            min-height: 56px;
+        }
+
+        .sidebar-footer-card:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .sidebar-footer-text {
+            min-width: 0;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        .sidebar-footer-name {
+            color: #f3f3f3;
+            font-size: 13px;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .sidebar-footer-role {
+            color: var(--text-faint);
+            font-size: 11px;
+            margin-top: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .disclaimer {
+            margin-top: 10px;
+            color: var(--text-faint);
+        }
+
+        .modal-content {
+            background: rgba(28, 28, 28, 0.96);
+            border-color: rgba(255, 255, 255, 0.08);
+            border-radius: 24px;
+        }
+
+        .history-item,
+        .stat-card,
+        .security-stat,
+        .audit-entry {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 16px;
+        }
+
+        @media (max-width: 980px) {
+            .app-container {
+                padding: 10px;
+                gap: 10px;
+            }
+
+            .sidebar {
+                width: 232px;
+            }
+
+            .example-prompts {
+                grid-template-columns: 1fr;
+            }
+
+            .workspace-bar {
+                padding: 14px 16px;
+            }
+
+            .chat-area {
+                padding: 20px 16px 16px;
+            }
+
+            .input-container {
+                padding: 14px 16px 18px;
+            }
+        }
+
+        @media (max-width: 760px) {
+            .app-container {
+                padding: 0;
+            }
+
+            .sidebar {
+                display: flex;
+                position: fixed;
+                top: 12px;
+                bottom: 12px;
+                left: 12px;
+                width: min(88vw, 320px);
+                height: auto;
+                max-height: none;
+                z-index: 1001;
+                transform: translateX(calc(-100% - 18px));
+                transition: transform 0.22s ease;
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+            }
+
+            .sidebar-overlay.open {
+                display: block;
+            }
+
+            .main-content {
+                border-radius: 0;
+                border-left: none;
+                border-right: none;
+            }
+
+            .mobile-topbar {
+                display: flex;
+            }
+
+            .workspace-bar {
+                display: none;
+            }
+
+            .composer-meta {
+                padding-left: 0;
+                flex-wrap: wrap;
+            }
+
+            .modal.side-panel .modal-content {
+                max-width: 100%;
+                width: 100%;
+                border-radius: 18px 18px 0 0;
+                height: min(82vh, 82vh);
+                max-height: min(82vh, 82vh);
+                margin: auto 0 0 0;
+            }
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
@@ -3824,7 +5168,7 @@ HTML_TEMPLATE = r'''
 </head>
 <body>
 
-    < Day 5: Login Overlay -->
+    <!-- Login Overlay -->
     <div id="loginOverlay" style="display:flex;position:fixed;inset:0;background:rgba(10,10,20,0.97);z-index:9999;align-items:center;justify-content:center;font-family:Inter,sans-serif;">
         <div style="background:#12121f;border:1px solid #2a2a4a;border-radius:16px;padding:40px 48px;width:380px;box-shadow:0 24px 60px rgba(0,0,0,0.8);">
             <div style="text-align:center;margin-bottom:32px;">
@@ -3851,121 +5195,132 @@ HTML_TEMPLATE = r'''
             <div style="text-align:center;margin-top:20px;font-size:11px;color:#444;">Tokens expire after 24 hours</div>
         </div>
     </div>
-    < End Login Overlay -->
+    <!-- End Login Overlay -->
 
+    <div id="sidebarOverlay" class="sidebar-overlay" onclick="closeSidebar()"></div>
     <div class="app-container">
         <!-- Sidebar -->
-        <div class="sidebar">
+        <div class="sidebar" id="sidebar">
             <div class="sidebar-header">
                 <div class="sidebar-title">AVA</div>
-                <div id="userBadge" style="
-                    margin-top:8px; padding:6px 10px;
-                    background:#1a1a2e; border:1px solid #2a2a4a;
-                    border-radius:8px; font-size:12px; color:#888;
-                    display:flex; align-items:center; justify-content:space-between;
-                ">
-                    <span>
-                        <span style="color:#667eea;">&#9632;</span>
-                        <span id="userBadgeName" style="color:#ccc; margin-left:4px;">...</span>
-                        <span id="userBadgeRole" style="
-                            margin-left:6px; font-size:10px; padding:2px 6px;
-                            border-radius:4px; background:#2a2a4a; color:#888;
-                        "></span>
-                    </span>
-                    <button onclick="logoutAva()" title="Sign out" style="
-                        background:none; border:none; color:#555; cursor:pointer;
-                        font-size:16px; padding:0 2px; line-height:1;
-                    " onmouseover="this.style.color='#ff6b6b'"
-                       onmouseout="this.style.color='#555'">&#x23FB;</button>
+                <div class="sidebar-subtitle">Unified DevOps assistant with grounded answers, secured actions, and approval-aware execution.</div>
+                <div class="profile-card">
+                    <div class="profile-row">
+                        <div class="profile-avatar" id="sessionAvatar">A</div>
+                        <div class="profile-meta">
+                            <div class="profile-name" id="sessionBadgeName">admin</div>
+                            <div class="profile-role" id="sessionBadgeRole">admin</div>
+                        </div>
+                        <button class="profile-power" onclick="logoutAva()" title="Sign out">&#x23FB;</button>
+                    </div>
                 </div>
             </div>
             
             <button class="sidebar-btn" onclick="newChat()">
-                <span>+</span>
+                <span class="nav-icon">+</span>
                 <span>New chat</span>
             </button>
             
             <button class="sidebar-btn" onclick="showHistoryModal()">
-                <span>📜</span>
+                <span class="nav-icon">◷</span>
                 <span>History</span>
             </button>
             
             <button class="sidebar-btn" onclick="showStatsModal()">
-                <span>📊</span>
+                <span class="nav-icon">◫</span>
                 <span>Stats</span>
             </button>
             
             <button class="sidebar-btn" onclick="showSettingsModal()">
-                <span>⚙️</span>
+                <span class="nav-icon">⚙</span>
                 <span>Settings</span>
             </button>
             
             <button class="sidebar-btn" onclick="showSecurityModal()">
-                <span>🛡️</span>
+                <span class="nav-icon">⛨</span>
                 <span>Security</span>
-                <span id="securityBadge" class="badge" style="display: none;"></span>
+                <span id="securityBadge" class="security-inline-badge" style="display: none;"></span>
             </button>
+
+            <div class="sidebar-quick">
+                <div class="sidebar-quick-title">Quick Status</div>
+                <div class="quick-stat-list">
+                    <div class="quick-stat">
+                        <span>Approval queue</span>
+                        <span class="quick-stat-value" id="quickApprovalCount">0</span>
+                    </div>
+                    <div class="quick-stat">
+                        <span>Blocked today</span>
+                        <span class="quick-stat-value" id="quickBlockedCount">0</span>
+                    </div>
+                    <div class="quick-stat">
+                        <span>Commands today</span>
+                        <span class="quick-stat-value" id="quickCommandCount">0</span>
+                    </div>
+                </div>
+            </div>
             
             <!-- Recent Chats removed from sidebar — use History button instead -->
-            <div id="recentChats" style="display:none;"></div>
+            <div class="thread-list">
+                <div class="thread-list-title">Recent Threads</div>
+                <div id="recentChats"></div>
+            </div>
 
-            < Bottom user badge — like Claude sidebar -->
-            <div id="userBadge" onclick="logoutAva()" title="Click to sign out" style="
-                position:absolute; bottom:0; left:0; right:0;
-                padding:12px 14px;
-                background:#0f0f1a;
-                border-top:1px solid #2a2a4a;
-                display:flex; align-items:center; gap:10px;
-                cursor:pointer; transition:background 0.2s;
-            "
-            onmouseover="this.style.background='#1a1a2e'"
-            onmouseout="this.style.background='#0f0f1a'">
-                <div style="
-                    width:32px; height:32px; border-radius:50%;
-                    background:linear-gradient(135deg,#667eea,#764ba2);
-                    display:flex; align-items:center; justify-content:center;
-                    font-size:14px; font-weight:700; color:white; flex-shrink:0;
-                " id="userAvatar">M</div>
-                <div style="flex:1; min-width:0;">
-                    <div id="userBadgeName" style="
-                        color:#e0e0e0; font-size:13px; font-weight:500;
-                        white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-                    ">...</div>
-                    <div id="userBadgeRole" style="
-                        font-size:11px; color:#667eea; margin-top:1px;
-                    ">...</div>
+            <!-- Sidebar footer -->
+            <div class="sidebar-footer">
+                <div class="sidebar-footer-card" onclick="logoutAva()" title="Click to sign out">
+                    <div class="profile-avatar" id="userAvatar">A</div>
+                    <div class="sidebar-footer-text">
+                        <div class="sidebar-footer-name" id="userBadgeName">admin</div>
+                        <div class="sidebar-footer-role" id="userBadgeRole">Signed in</div>
+                    </div>
+                    <div style="color:#595959; font-size:14px;">&#x23FB;</div>
                 </div>
-                <div title="Sign out" style="color:#444; font-size:14px;">&#x23FB;</div>
             </div>
         </div>
         
         <!-- Main Content -->
         <div class="main-content">
-            <!-- Top bar removed for more space - stats moved to Stats modal -->
+            <div class="mobile-topbar">
+                <button class="mobile-topbar-btn" onclick="openSidebar()">☰</button>
+                <div class="mobile-topbar-title">Project Ava</div>
+                <button class="mobile-topbar-btn" onclick="newChat()">＋</button>
+            </div>
+            <div class="workspace-bar">
+                <div class="workspace-title">
+                    <h1>Project Ava</h1>
+                    <p>Single serving contract: exact answers, grounded DevOps knowledge, and secured action handling.</p>
+                </div>
+                <div class="workspace-pills">
+                    <span class="workspace-pill primary">AVA Runtime</span>
+                    <span class="workspace-pill">Qwen 2.5 14B</span>
+                    <span class="workspace-pill">Approval Guard</span>
+                </div>
+            </div>
             
             <!-- Chat Area -->
             
             <div class="chat-area" id="chatArea">
                 <div class="welcome-screen" id="welcomeScreen">
-                    <div class="welcome-title">What can I help with?</div>
-                    <div class="welcome-subtitle">Ask about DevOps, infrastructure, Terraform, Kubernetes, or run shell commands</div>
+                    <div class="welcome-title">Operate infrastructure through one assistant.</div>
+                    <div class="welcome-subtitle">Ask for exact operational checks, grounded DevOps explanations, or secured actions. AVA will execute, request approval, or block when policy requires it.</div>
                     
                     <div class="example-prompts">
-                        <div class="example-prompt" onclick="askExample('How to secure S3 buckets in production?')">
-                            <div class="example-icon">🔒</div>
-                            <div class="example-text">Secure S3 buckets</div>
+                        <div class="example-prompt" onclick="askExample('verify my system')">
+                            <div class="example-icon">🧭</div>
+                            <div class="example-text">Verify system state</div>
                         </div>
-                        <div class="example-prompt" onclick="askExample('Design a highly available RDS setup')">
-                            <div class="example-icon">🗄️</div>
-                            <div class="example-text">HA database design</div>
-                        </div>
-                        <div class="example-prompt" onclick="askExample('How to reduce Docker image size?')">
+                        <div class="example-prompt" onclick="askExample('check docker')">
                             <div class="example-icon">🐳</div>
-                            <div class="example-text">Optimize Docker images</div>
+                            <div class="example-text">Inspect Docker runtime</div>
                         </div>
-                        <div class="example-prompt" onclick="askExample('Kubernetes deployment strategies')">
-                            <div class="example-icon">☸️</div>
-                            <div class="example-text">K8s deployments</div>
+                        <div class="example-prompt" onclick="askExample('restart docker service')">
+                            <div class="example-icon">⚠️</div>
+                            <div class="example-text">Queue an approval-required action</div>
+                        </div>
+                        <div class="example-prompt" onclick="askExample('What is the difference between readiness probe and liveness probe?')">
+                            <div class="example-icon">📘</div>
+                            <div class="example-text">Ask a grounded DevOps question</div>
                         </div>
                     </div>
                 </div>
@@ -3984,6 +5339,11 @@ HTML_TEMPLATE = r'''
                         <button class="send-btn" onclick="sendQuery()" id="sendBtn">
                             <span>→</span>
                         </button>
+                        <div class="composer-meta">
+                            <span class="composer-pill">Local</span>
+                            <span class="composer-pill">Qwen 2.5 14B</span>
+                            <span class="composer-pill">Approval-aware</span>
+                        </div>
                     </div>
                     <div class="disclaimer">
                         AVA is a DevOps AI agent that can make mistakes. Verify important information.
@@ -3995,7 +5355,7 @@ HTML_TEMPLATE = r'''
     </div>
     
     <!-- History Modal -->
-    <div id="historyModal" class="modal">
+    <div id="historyModal" class="modal side-panel">
         <div class="modal-content">
             <div class="modal-header">
                 <span class="modal-title">Query History</span>
@@ -4008,7 +5368,7 @@ HTML_TEMPLATE = r'''
     </div>
     
     <!-- Stats Modal -->
-    <div id="statsModal" class="modal">
+    <div id="statsModal" class="modal side-panel">
         <div class="modal-content">
             <div class="modal-header">
                 <span class="modal-title">Knowledge Base Stats</span>
@@ -4066,7 +5426,7 @@ HTML_TEMPLATE = r'''
     
     
     <!-- Security Modal -->
-    <div id="securityModal" class="modal">
+    <div id="securityModal" class="modal side-panel">
         <div class="modal-content">
             <div class="modal-header">
                 <span class="modal-title">🛡️ Security Dashboard</span>
@@ -4165,13 +5525,21 @@ HTML_TEMPLATE = r'''
             // Update user badge
             const nameEl = document.getElementById('userBadgeName');
             const roleEl = document.getElementById('userBadgeRole');
+            const sessionNameEl = document.getElementById('sessionBadgeName');
+            const sessionRoleEl = document.getElementById('sessionBadgeRole');
             if (nameEl) nameEl.textContent = window._avaUser || '';
+            if (sessionNameEl) sessionNameEl.textContent = window._avaUser || '';
             const avatarEl = document.getElementById('userAvatar');
+            const sessionAvatarEl = document.getElementById('sessionAvatar');
             if (avatarEl && window._avaUser) avatarEl.textContent = window._avaUser[0].toUpperCase();
+            if (sessionAvatarEl && window._avaUser) sessionAvatarEl.textContent = window._avaUser[0].toUpperCase();
             if (roleEl) {
                 roleEl.textContent = role;
                 roleEl.style.background = role === 'admin' ? '#1a3a1a' : '#2a2a4a';
                 roleEl.style.color = role === 'admin' ? '#4caf50' : '#888';
+            }
+            if (sessionRoleEl) {
+                sessionRoleEl.textContent = role;
             }
             // Disable execution buttons for readonly users
             if (role === 'readonly') {
@@ -4208,6 +5576,11 @@ HTML_TEMPLATE = r'''
             const token = getToken();
             if (!token) {
                 showLoginOverlay();
+                loadSecurityData();
+                fetch('/stats').then(r => r.json()).then(data => {
+                    const quickCommandCount = document.getElementById('quickCommandCount');
+                    if (quickCommandCount) quickCommandCount.textContent = data.query_count || 0;
+                }).catch(() => {});
                 return;
             }
             try {
@@ -4227,6 +5600,11 @@ HTML_TEMPLATE = r'''
             } catch {
                 showLoginOverlay();
             }
+            loadSecurityData();
+            fetch('/stats').then(r => r.json()).then(data => {
+                const quickCommandCount = document.getElementById('quickCommandCount');
+                if (quickCommandCount) quickCommandCount.textContent = data.query_count || 0;
+            }).catch(() => {});
         })();
         // ── End Auth ──────────────────────────────────────────────────────────
 
@@ -4269,7 +5647,10 @@ HTML_TEMPLATE = r'''
                         return;
                     }
                     container.innerHTML = recent.map(h => 
-                        `<div class="chat-item">${h.query.substring(0, 30)}${h.query.length > 30 ? '...' : ''}</div>`
+                        `<div class="chat-item">
+                            <div class="thread-query">${escapeHtml(h.query)}</div>
+                            <div class="thread-meta">${escapeHtml(h.type || 'query')} • ${escapeHtml(h.time_taken || '')}</div>
+                        </div>`
                     ).join('');
                 })
                 .catch(err => {
@@ -4280,6 +5661,7 @@ HTML_TEMPLATE = r'''
         function newChat() {
             console.log('newChat called');
             try {
+                closeSidebar();
                 location.reload();
             } catch (err) {
                 console.error('Error in newChat:', err);
@@ -4289,6 +5671,7 @@ HTML_TEMPLATE = r'''
         function showHistoryModal() {
             console.log('showHistoryModal called');
             try {
+                closeSidebar();
                 document.getElementById('historyModal').style.display = 'block';
                 fetch('/history')
                     .then(r => r.json())
@@ -4318,10 +5701,13 @@ HTML_TEMPLATE = r'''
         function showStatsModal() {
             console.log('showStatsModal called');
             try {
+                closeSidebar();
                 document.getElementById('statsModal').style.display = 'block';
                 fetch('/stats')
                     .then(r => r.json())
                     .then(data => {
+                        const quickCommandCount = document.getElementById('quickCommandCount');
+                        if (quickCommandCount) quickCommandCount.textContent = data.query_count || 0;
                         const content = document.getElementById('statsContent');
                         content.innerHTML = `
                             <div class="stat-card">
@@ -4374,6 +5760,7 @@ HTML_TEMPLATE = r'''
         function showSettingsModal() {
             console.log('showSettingsModal called');
             try {
+                closeSidebar();
                 document.getElementById('settingsModal').style.display = 'block';
             } catch (err) {
                 console.error('Error in showSettingsModal:', err);
@@ -4387,6 +5774,20 @@ HTML_TEMPLATE = r'''
             } catch (err) {
                 console.error('Error in closeModal:', err);
             }
+        }
+
+        function openSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebarOverlay');
+            if (sidebar) sidebar.classList.add('open');
+            if (overlay) overlay.classList.add('open');
+        }
+
+        function closeSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebarOverlay');
+            if (sidebar) sidebar.classList.remove('open');
+            if (overlay) overlay.classList.remove('open');
         }
         
         // Close modal on outside click
@@ -4411,6 +5812,18 @@ HTML_TEMPLATE = r'''
         function askExample(query) {
             document.getElementById('queryInput').value = query;
             sendQuery();
+        }
+
+        function submitSuggestedPrompt(button) {
+            const encodedPrompt = button && button.getAttribute('data-prompt');
+            if (!encodedPrompt) return;
+            try {
+                const prompt = decodeURIComponent(encodedPrompt);
+                if (!prompt) return;
+                askExample(prompt);
+            } catch (err) {
+                console.error('Error submitting suggested prompt:', err);
+            }
         }
         
         function hideWelcome() {
@@ -4465,6 +5878,151 @@ HTML_TEMPLATE = r'''
             const loading = document.getElementById('loadingMessage');
             if (loading) loading.remove();
         }
+
+        function renderCommandCard(result) {
+            const normalized = result && typeof result === 'object' ? result : {};
+            const metadata = normalized.metadata && typeof normalized.metadata === 'object' ? normalized.metadata : {};
+            const risk = escapeHtml(
+                ((normalized.security && normalized.security.risk) || normalized.risk || 'unknown').toString()
+            );
+            const approvalId = escapeHtml(normalized.approval_id || '');
+            const command = escapeHtml(normalized.command || normalized.command_repr || 'requested action');
+            const reason = escapeHtml(normalized.reason || normalized.error || 'Action could not be completed.');
+            const output = escapeHtml(normalized.output || 'Command executed successfully');
+            const alerts = Array.isArray(metadata.alerts) ? metadata.alerts : [];
+            const suggestedActions = Array.isArray(metadata.suggested_actions) ? metadata.suggested_actions : [];
+            const remediationCandidates = Array.isArray(metadata.remediation_candidates) ? metadata.remediation_candidates : [];
+            const newListeners = Array.isArray(metadata.new_listeners) ? metadata.new_listeners : [];
+            const newFailedServices = Array.isArray(metadata.new_failed_services) ? metadata.new_failed_services : [];
+            const authFailureDelta = Number(metadata.auth_failure_delta || 0);
+            const primaryConcern = metadata.primary_concern && typeof metadata.primary_concern === 'object' ? metadata.primary_concern : null;
+
+            const renderStringList = (title, items) => {
+                if (!items.length) return '';
+                const rows = items.map(item => `<li class="findings-item">${escapeHtml(String(item))}</li>`).join('');
+                return `<div class="findings-panel">
+                    <div class="findings-label">${escapeHtml(title)}</div>
+                    <ul class="findings-list">${rows}</ul>
+                </div>`;
+            };
+
+            const renderPrimaryConcern = (concern) => {
+                if (!concern || !concern.title) return '';
+                const severity = escapeHtml(String(concern.severity || 'unknown'));
+                const confidence = escapeHtml(String(concern.confidence || 'medium'));
+                const evidence = Array.isArray(concern.evidence) ? concern.evidence.slice(0, 3) : [];
+                const nextAction = safeString(concern.next_action || '');
+                const evidenceHtml = evidence.length
+                    ? `<ul class="findings-list">${evidence.map(item => `<li class="findings-item">${escapeHtml(String(item))}</li>`).join('')}</ul>`
+                    : '';
+                const actionButton = nextAction && !nextAction.toLowerCase().startsWith('no urgent action')
+                    ? `<div class="findings-actions">
+                        <button class="findings-action-btn" data-prompt="${encodeURIComponent(nextAction)}" onclick="submitSuggestedPrompt(this)">Run next action</button>
+                    </div>`
+                    : '';
+                return `<div class="findings-panel primary-concern-panel">
+                    <div class="findings-label">Primary concern</div>
+                    <div class="findings-item-title">${escapeHtml(String(concern.title))}</div>
+                    <div class="status-card-meta" style="margin: 10px 0 8px 0;">
+                        <span class="status-chip">Severity: ${severity}</span>
+                        <span class="status-chip">Confidence: ${confidence}</span>
+                    </div>
+                    ${evidenceHtml}
+                    ${nextAction ? `<div class="findings-item-copy" style="margin-top: 10px;">Next action: ${escapeHtml(nextAction)}</div>` : ''}
+                    ${actionButton}
+                </div>`;
+            };
+
+            const renderCandidateList = (title, items) => {
+                if (!items.length) return '';
+                const rows = items.map(item => {
+                    const label = escapeHtml(String(item.prompt || item.package || item.action || 'Remediation candidate'));
+                    const detail = item.package && item.action
+                        ? `${escapeHtml(String(item.package))} · ${escapeHtml(String(item.action))}`
+                        : '';
+                    const subcopy = item.command_intent
+                        ? `Intent: ${escapeHtml(String(item.command_intent))}`
+                        : '';
+                    const prompt = safeString(item.prompt || '');
+                    const actionButton = prompt
+                        ? `<div class="findings-actions">
+                            <button class="findings-action-btn" data-prompt="${encodeURIComponent(prompt)}" onclick="submitSuggestedPrompt(this)">Run through AVA</button>
+                        </div>`
+                        : '';
+                    return `<li class="findings-item">
+                        <div class="findings-item-title">${label}</div>
+                        ${detail ? `<div class="findings-item-copy">${detail}</div>` : ''}
+                        ${subcopy ? `<div class="findings-item-subcopy">${subcopy}</div>` : ''}
+                        ${actionButton}
+                    </li>`;
+                }).join('');
+                return `<div class="findings-panel">
+                    <div class="findings-label">${escapeHtml(title)}</div>
+                    <ul class="findings-list">${rows}</ul>
+                </div>`;
+            };
+
+            const renderMetadataPanels = () => {
+                const panels = [
+                    renderPrimaryConcern(primaryConcern),
+                    renderStringList('Alerts', alerts),
+                    renderStringList('Suggested actions', suggestedActions),
+                    renderCandidateList('Remediation candidates', remediationCandidates),
+                    renderStringList('New listeners', newListeners),
+                    renderStringList('New failed services', newFailedServices),
+                    authFailureDelta > 0 ? renderStringList('Auth trend', [`Authentication failure count increased by ${authFailureDelta} since the previous baseline`]) : ''
+                ].filter(Boolean);
+                if (!panels.length) return '';
+                return `<div class="findings-block">${panels.join('')}</div>`;
+            };
+
+            if (normalized.blocked) {
+                return `<div class="status-card blocked">
+                    <div class="status-card-title">Command blocked</div>
+                    <div class="status-card-copy">${reason}</div>
+                    <div class="status-card-meta">
+                        <span class="status-chip">Risk: ${risk}</span>
+                    </div>
+                </div>`;
+            }
+
+            if (normalized.approval_required) {
+                return `<div class="status-card approval">
+                    <div class="status-card-title">Approval required</div>
+                    <div class="status-card-copy">${reason}</div>
+                    <div class="status-card-meta">
+                        <span class="status-chip">Risk: ${risk}</span>
+                        ${approvalId ? `<span class="status-chip">Approval ID: ${approvalId}</span>` : ''}
+                    </div>
+                    <div class="terminal-block">
+                        <div class="terminal-label">Requested action</div>
+                        <pre class="terminal-output"><code>${command}</code></pre>
+                    </div>
+                </div>`;
+            }
+
+            if (normalized.success) {
+                const analysisHtml = normalized.analysis ? `<div class="status-card-meta"><span class="status-chip">Analysis available</span></div>` : '';
+                const metadataHtml = renderMetadataPanels();
+                return `<div class="status-card executed">
+                    <div class="status-card-title">Command executed</div>
+                    <div class="terminal-block">
+                        <div class="terminal-label">Execution output</div>
+                        <pre class="terminal-output"><code>${output}</code></pre>
+                    </div>
+                    ${metadataHtml}
+                    ${analysisHtml}
+                </div>`;
+            }
+
+            return `<div class="status-card blocked">
+                <div class="status-card-title">Execution failed</div>
+                <div class="status-card-copy">${reason}</div>
+                <div class="status-card-meta">
+                    <span class="status-chip">Risk: ${risk}</span>
+                </div>
+            </div>`;
+        }
         
         function addAVAMessage(data) {
             removeLoadingMessage();
@@ -4485,26 +6043,7 @@ HTML_TEMPLATE = r'''
                     content += `<div style="font-size: 13px; color: #888; margin-bottom: 8px;">Question ${part.number}: ${escapeHtml(part.question)}</div>`;
                     
                     if (part.type === 'command') {
-                        if (part.result.blocked) {
-                            content += `<div style="color: #ff6b6b; padding: 12px; background: #2a1a1a; border-left: 3px solid #ff6b6b; border-radius: 6px;">
-                                <strong>🛡️ Command Blocked</strong><br>
-                                ${escapeHtml(part.result.reason)}
-                            </div>`;
-                        } else if (part.result.success) {
-                            const output = escapeHtml(part.result.output || 'Command executed successfully');
-                            let analysisHtml = '';
-                            if (part.result.analysis) {
-                                analysisHtml = `<div style="margin-top: 12px; padding: 12px; background: #1a1a2e; border-left: 3px solid #667eea; border-radius: 6px;">
-                                    <div style="font-size: 12px; color: #667eea; margin-bottom: 6px; font-weight: 600;">📊 Analysis</div>
-                                    <div style="color: #ddd; font-size: 14px; line-height: 1.6;">${escapeHtml(part.result.analysis)}</div>
-                                </div>`;
-                            }
-                            content += `<div style="font-size: 12px; color: #667eea; margin-bottom: 6px;">✓ Command executed</div>
-                                <pre style="background: #0a0a0a; border: 1px solid #333; border-radius: 8px; padding: 16px; overflow-x: auto; margin: 0;">
-                                    <code style="color: #00ff00; font-family: 'Monaco', 'Courier New', monospace; font-size: 13px; line-height: 1.6;">${output}</code>
-                                </pre>
-                                ${analysisHtml}`;
-                        }
+                        content += renderCommandCard(part.result);
                     } else {
                         content += formatResponse(part.response);
                     }
@@ -4516,37 +6055,7 @@ HTML_TEMPLATE = r'''
             }
             // Handle single command response
             else if (data.type === 'command' && data.result) {
-                if (data.result.blocked) {
-                    content = `<div style="color: #ff6b6b; padding: 12px; background: #2a1a1a; border-left: 3px solid #ff6b6b; border-radius: 6px;">
-                        <strong>🛡️ Command Blocked</strong><br>
-                        ${escapeHtml(data.result.reason)}<br>
-                        <small style="color: #aaa;">${data.result.suggestion || ''}</small>
-                    </div>`;
-                } else if (data.result.success) {
-                    const output = escapeHtml(data.result.output || 'Command executed successfully');
-                    let analysisHtml = '';
-                    
-                    // Add analysis if available
-                    if (data.result.analysis) {
-                        analysisHtml = `<div style="margin-top: 12px; padding: 12px; background: #1a1a2e; border-left: 3px solid #667eea; border-radius: 6px;">
-                            <div style="font-size: 12px; color: #667eea; margin-bottom: 6px; font-weight: 600;">📊 Analysis</div>
-                            <div style="color: #ddd; font-size: 14px; line-height: 1.6;">${escapeHtml(data.result.analysis)}</div>
-                        </div>`;
-                    }
-                    
-                    content = `<div style="margin: 8px 0;">
-                        <div style="font-size: 12px; color: #667eea; margin-bottom: 6px;">✓ Command executed</div>
-                        <pre style="background: #0a0a0a; border: 1px solid #333; border-radius: 8px; padding: 16px; overflow-x: auto; margin: 0;">
-                            <code style="color: #00ff00; font-family: 'Monaco', 'Courier New', monospace; font-size: 13px; line-height: 1.6;">${output}</code>
-                        </pre>
-                        ${analysisHtml}
-                    </div>`;
-                } else {
-                    content = `<div style="color: #ff6b6b; padding: 12px; background: #2a1a1a; border-left: 3px solid #ff6b6b; border-radius: 6px;">
-                        <strong>❌ Error</strong><br>
-                        ${escapeHtml(data.result.reason || 'Command failed')}
-                    </div>`;
-                }
+                content = renderCommandCard(data.result);
             } else {
                 // Handle single knowledge response
                 content = formatResponse(data.response);
@@ -4799,6 +6308,7 @@ HTML_TEMPLATE = r'''
         
         // Security Dashboard Functions
         function showSecurityModal() {
+            closeSidebar();
             document.getElementById('securityModal').style.display = 'block';
             loadSecurityData();
         }
@@ -4819,6 +6329,21 @@ HTML_TEMPLATE = r'''
         }
         
         function displaySecurityData(stats, audit) {
+            const quickApprovalCount = document.getElementById('quickApprovalCount');
+            const quickBlockedCount = document.getElementById('quickBlockedCount');
+            if (quickApprovalCount) quickApprovalCount.textContent = stats.pending || 0;
+            if (quickBlockedCount) quickBlockedCount.textContent = stats.blocked || 0;
+
+            const badge = document.getElementById('securityBadge');
+            if (badge) {
+                if ((stats.pending || 0) > 0) {
+                    badge.textContent = stats.pending;
+                    badge.style.display = 'inline-flex';
+                } else {
+                    badge.style.display = 'none';
+                }
+            }
+
             const content = document.getElementById('securityContent');
             
             let html = '<div style="margin-bottom: 24px;">';

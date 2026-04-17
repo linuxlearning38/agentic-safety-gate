@@ -145,6 +145,20 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
 - Timestamp:
   - 2026-04-17 Asia/Calcutta (updated — identity leak fix)
 - Latest changes made:
+  - Expanded destructive command blocking in `web_agent_v2.1_guardrail.py`:
+    - Root cause: `_is_single_destructive_request` only matched narrow action+target pairs (delete service, drop table, etc.) — mass-deletion, disk format, system file overwrite, permission destruction, system control, and fork bombs all fell through to knowledge routing or approval
+    - Fix: replaced the 6-pattern function with an 8-category expanded version covering 30+ patterns; all checked BEFORE knowledge/approval routing
+    - Added `_LEARNING_PREFIXES` tuple and `_is_learning_query()` helper — any query beginning with "how", "what", "why", "explain", etc. is treated as informational and NOT blocked, preserving AVA as a knowledge assistant
+    - Category 1 — Mass deletion: "delete all <pods|deployments|services|namespaces|nodes|secrets|containers>", "kubectl delete --all", "kill all containers"
+    - Category 2 — rm -rf on critical paths: /, /*, /home, /var, /etc, /usr, /boot, /root
+    - Category 3 — Disk destruction: "format /dev/", mkfs (any variant), wipefs, shred /dev/, fdisk /dev/, dd if= + of=/dev/
+    - Category 4 — Critical system file overwrite: redirect (> or >>) to /etc/passwd, /etc/shadow, /etc/sudoers, /etc/fstab, /etc/hosts, /boot/; also echo-pipe patterns
+    - Category 5 — Permissions/auth destruction: chmod 777/000 on system paths, chown -R root on /, usermod -l root, passwd -d root
+    - Category 6 — System control: shutdown, halt, poweroff, reboot -f, init 0, init 6, kill -9 -1, killall5
+    - Category 7 — Fork bomb: ":(){ :|:& }:;" (checked on raw query before normalization strips special chars)
+    - Added 67 regression checks (was 115, now 182): 6 learning-not-blocked, 3 legacy-preserved, 40 new-block cases, 5 safe-preserved cases; all pass
+    - Live container verified: all 50 cases correct (40 block + 10 safe)
+    - Differentiation is clean: "how do I delete all pods" → not blocked; "delete all pods" → blocked; "please delete all pods" → blocked
   - Fixed identity leak: authorship and safety questions now route deterministically to `ava_self` instead of falling through to Qwen (which identifies itself as built by Alibaba Cloud):
     - Root cause: `AVA_SELF_TOPIC_PATTERNS` in `control/input_router.py` only covered name/model/runtime topics; "who built you", "are you safe to use", and similar questions had no ava_self match and fell to the general_qwen path
     - Fix: added `"authorship"` topic patterns (`who built you`, `who made you`, `who created you`, `who developed you`, `what are you made of`) and `"safety"` topic patterns (`are you safe to use`, `are you safe`, `is ava safe`) to `AVA_SELF_TOPIC_PATTERNS`
