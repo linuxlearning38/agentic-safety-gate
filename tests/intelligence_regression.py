@@ -55,6 +55,12 @@ FUNCTIONS = {
     "_answer_ava_self_query",
     "_should_direct_unknown_to_llm",
     "_resolve_general_unknown_response",
+    "split_multi_query",
+    "extract_explicit_command_request",
+    "looks_like_operational_request",
+    "extract_operational_tool_request",
+    "extract_operational_clarification",
+    "detect_multiple_questions",
     "detect_query_intent",
 }
 
@@ -63,6 +69,8 @@ CONSTANTS = {
     "_ENTITY_STOP_WORDS",
     "_INFRA_COMPONENTS",
     "_KNOWN_DIAGRAM_TECH",
+    "_RAW_COMMAND_PREFIXES",
+    "_RAW_COMMAND_STARTERS",
 }
 
 
@@ -327,6 +335,50 @@ def main():
         "troubleshooting route is controlled",
         ns["_route_query"]("What causes OOMKilled in Kubernetes?").intent == "troubleshooting",
     )
+    check(
+        "self name route is controlled",
+        ns["_route_query"]("what is your name").intent == "ava_self",
+    )
+    check(
+        "authorship route is controlled — who built you",
+        ns["_route_query"]("who built you").intent == "ava_self",
+    )
+    check(
+        "authorship route topic — who built you",
+        ns["_route_query"]("who built you").topic == "authorship",
+    )
+    check(
+        "authorship route is controlled — who made you",
+        ns["_route_query"]("who made you").intent == "ava_self",
+    )
+    check(
+        "authorship route is controlled — who created you",
+        ns["_route_query"]("who created you").intent == "ava_self",
+    )
+    check(
+        "authorship route is controlled — who developed you",
+        ns["_route_query"]("who developed you").intent == "ava_self",
+    )
+    check(
+        "authorship route is controlled — what are you made of",
+        ns["_route_query"]("what are you made of").intent == "ava_self",
+    )
+    check(
+        "safety route is controlled — are you safe to use",
+        ns["_route_query"]("are you safe to use").intent == "ava_self",
+    )
+    check(
+        "safety route topic — are you safe to use",
+        ns["_route_query"]("are you safe to use").topic == "safety",
+    )
+    check(
+        "safety route is controlled — are you safe",
+        ns["_route_query"]("are you safe").intent == "ava_self",
+    )
+    check(
+        "safety route is controlled — is ava safe",
+        ns["_route_query"]("is ava safe").intent == "ava_self",
+    )
     architecture_route = ns["_route_query"]("Explain Netflix architecture with Zuul, Kafka, Cassandra, EVCache")
     check("architecture route is controlled", architecture_route.intent == "architecture")
     check("architecture route topic", architecture_route.topic == "external")
@@ -335,6 +387,9 @@ def main():
     check("architecture diagram route is controlled", architecture_diagram_route.intent == "architecture")
     check("architecture diagram topic", architecture_diagram_route.topic == "self_runtime")
     check("architecture diagram mode", architecture_diagram_route.response_mode == "diagram")
+    lifecycle_diagram_route = ns["_route_query"]("create a mermaid diagram of kubernetes, docker, and devops lifecycle")
+    check("lifecycle diagram route is controlled", lifecycle_diagram_route.intent == "architecture")
+    check("lifecycle diagram mode", lifecycle_diagram_route.response_mode == "diagram")
     check(
         "follow_up route is controlled",
         ns["_route_query"]("How is it different from the previous thing I asked?").intent == "follow_up",
@@ -354,6 +409,42 @@ def main():
     check("devops definition stays controlled", ns["_should_direct_unknown_to_llm"]("What is readiness probe?") is False)
     check("devops troubleshooting beats weak markers", ns["_route_query"]("My pod network is failing").intent == "troubleshooting")
     check("dangerous query does not bypass kb", ns["_should_direct_unknown_to_llm"]("Delete all pods in kube-system") is False)
+    check("explicit run command extracted", ns["extract_explicit_command_request"]("run df -h /data") == "df -h /data")
+    check("literal destructive command extracted", ns["extract_explicit_command_request"]("rm -rf /") == "rm -rf /")
+    check("general question not extracted as command", ns["extract_explicit_command_request"]("What is the capital of France?") is None)
+    check("operational natural language detected", ns["looks_like_operational_request"]("show disk usage") is True)
+    check("general knowledge not treated as operational", ns["looks_like_operational_request"]("show me the capital of France") is False)
+    check("disk usage maps to check_disk", ns["extract_operational_tool_request"]("show disk usage") == {"tool_name": "check_disk", "tool_args": {}})
+    check("verify system maps to verify_system", ns["extract_operational_tool_request"]("verify my system") == {"tool_name": "verify_system", "tool_args": {}})
+    check("docker health maps to check_docker", ns["extract_operational_tool_request"]("check docker") == {"tool_name": "check_docker", "tool_args": {}})
+    check("running containers map to list_containers", ns["extract_operational_tool_request"]("show running containers") == {"tool_name": "list_containers", "tool_args": {}})
+    check("pod status maps to check_pod_status", ns["extract_operational_tool_request"]("show pod status") == {"tool_name": "check_pod_status", "tool_args": {"namespace": "default"}})
+    check("restart pod maps to restart_pod", ns["extract_operational_tool_request"]("restart the pod nginx") == {"tool_name": "restart_pod", "tool_args": {"deployment": "nginx", "namespace": "default"}})
+    check("restart my docker service maps to restart_service", ns["extract_operational_tool_request"]("restart my docker service") == {"tool_name": "restart_service", "tool_args": {"service": "docker"}})
+    check("rollback deployment maps to rollback_deployment", ns["extract_operational_tool_request"]("rollback deployment nginx") == {"tool_name": "rollback_deployment", "tool_args": {"deployment": "nginx", "namespace": "default"}})
+    check("ambiguous restart my pod does not map to restart_pod", ns["extract_operational_tool_request"]("restart my pod") is None)
+    check("ambiguous scale asks for deployment name", ns["extract_operational_clarification"]("scale deployment to 5 replicas") == "I can queue a deployment scale action, but I need the deployment name. Example: scale deployment nginx to 5 replicas.")
+    check("ambiguous rollback asks for deployment name", ns["extract_operational_clarification"]("rollback my deployment") == "I can queue a deployment rollback, but I need the deployment name. Example: rollback deployment nginx.")
+    check("ambiguous service restart asks for service name", ns["extract_operational_clarification"]("restart my service and show me the result") == "I can queue a service restart, but I need the service name. Example: restart service docker.")
+    check("ambiguous pod logs asks for pod name", ns["extract_operational_clarification"]("show me pod logs") == "I can fetch pod logs, but I need the pod name. Example: show me pod logs for nginx-7d8b49557c-abc12.")
+    check("ambiguous service check asks for service name", ns["extract_operational_clarification"]("check my service") == "I can check a service, but I need the service name. Example: check service api-gateway.")
+    check("running processes map to check_processes", ns["extract_operational_tool_request"]("show running processes") == {"tool_name": "check_processes", "tool_args": {}})
+    check("listening ports map to check_listening_ports", ns["extract_operational_tool_request"]("show listening ports") == {"tool_name": "check_listening_ports", "tool_args": {}})
+    check("auth failures map to check_auth_events", ns["extract_operational_tool_request"]("check ssh failures") == {"tool_name": "check_auth_events", "tool_args": {}})
+    check("inspect service maps to inspect_service", ns["extract_operational_tool_request"]("inspect service nginx") == {"tool_name": "inspect_service", "tool_args": {"service": "nginx"}})
+    check("persistence points map to check_persistence_points", ns["extract_operational_tool_request"]("check persistence points") == {"tool_name": "check_persistence_points", "tool_args": {}})
+    check("security updates map to check_updates", ns["extract_operational_tool_request"]("show security updates") == {"tool_name": "check_updates", "tool_args": {}})
+    check("failed services map to check_failed_services", ns["extract_operational_tool_request"]("check failed services") == {"tool_name": "check_failed_services", "tool_args": {}})
+    check("install updates maps to install_updates", ns["extract_operational_tool_request"]("install security updates") == {"tool_name": "install_updates", "tool_args": {}})
+    check("patch package maps to patch_package", ns["extract_operational_tool_request"]("patch package openssl") == {"tool_name": "patch_package", "tool_args": {"package": "openssl"}})
+    check("vulnerability scan maps to scan_host_vulnerabilities", ns["extract_operational_tool_request"]("scan my system for vulnerabilities") == {"tool_name": "scan_host_vulnerabilities", "tool_args": {}})
+    check("suspicious activity maps to check_suspicious_activity", ns["extract_operational_tool_request"]("is anything suspicious on this system") == {"tool_name": "check_suspicious_activity", "tool_args": {}})
+    check("stop process maps to stop_process", ns["extract_operational_tool_request"]("stop suspicious process 4321") == {"tool_name": "stop_process", "tool_args": {"pid": 4321}})
+    check("inspect process maps to inspect_process", ns["extract_operational_tool_request"]("inspect process 4321") == {"tool_name": "inspect_process", "tool_args": {"pid": 4321}})
+    check("linux operator comma query splits into multiple parts", ns["detect_multiple_questions"]("show running processes, show listening ports, check ssh failures") == ["show running processes", "show listening ports", "check ssh failures"])
+    check("restart deployment clarification asks for deployment name", ns["extract_operational_clarification"]("restart my deployment") == "I can queue a deployment restart, but I need the deployment name. Example: restart deployment nginx.")
+    check("stop process clarification asks for pid", ns["extract_operational_clarification"]("stop suspicious process") == "I can queue a process stop action, but I need the PID. Example: stop suspicious process 4321.")
+    check("patch package clarification asks for package", ns["extract_operational_clarification"]("patch package") == "I can queue a package patch action, but I need the package name. Example: patch package openssl.")
 
     fake_db.queries = [
         {"query": "Remember this exactly: cluster=prod-west-2", "response": "Okay", "intent": "memory"},
@@ -455,6 +546,48 @@ def main():
         },
     )
     check("ava self models are deterministic", "qwen2.5:14b" in ava_self_models and "nomic-embed-text" in ava_self_models and "llava:13b" in ava_self_models)
+    ava_self_name = ns["_answer_ava_self_query"](
+        "what is your name",
+        about={
+            "version": "2.1.2",
+            "built_by": "Manoj, Delhi",
+            "runtime": "WSL2 Ubuntu",
+            "containers": {},
+            "models": {},
+            "knowledge_base": {},
+        },
+    )
+    check("ava self name is deterministic", "My name is AVA." in ava_self_name)
+
+    ava_authorship = ns["_answer_ava_self_query"](
+        "who built you",
+        about={
+            "version": "2.1.2",
+            "built_by": "Manoj, Delhi",
+            "runtime": "WSL2 Ubuntu",
+            "containers": {},
+            "models": {},
+            "knowledge_base": {},
+        },
+    )
+    check("ava authorship answer names Manoj", "Manoj" in ava_authorship)
+    check("ava authorship answer names Qwen", "Qwen" in ava_authorship)
+    check("ava authorship does not say Alibaba", "Alibaba" not in ava_authorship)
+
+    ava_safety = ns["_answer_ava_self_query"](
+        "are you safe to use",
+        about={
+            "version": "2.1.2",
+            "built_by": "Manoj, Delhi",
+            "runtime": "WSL2 Ubuntu",
+            "containers": {},
+            "models": {},
+            "knowledge_base": {},
+        },
+    )
+    check("ava safety answer mentions approval gating", "approval" in ava_safety.lower())
+    check("ava safety answer mentions destructive blocking", "rm -rf" in ava_safety)
+
     ava_self_kb = ns["_answer_ava_self_query"](
         "What is your knowledge base size?",
         about={
@@ -479,6 +612,10 @@ def main():
     architecture_diagram_resolved = ns["_resolve_architecture_response"]("Create a mermaid diagram of your Docker architecture")
     check("controlled architecture diagram is deterministic", architecture_diagram_resolved["response"].startswith("```mermaid"))
     check("controlled architecture diagram includes ava runtime", "ava-agent:5443" in architecture_diagram_resolved["response"])
+    lifecycle_diagram_resolved = ns["_resolve_architecture_response"]("create a mermaid diagram of kubernetes, docker, and devops lifecycle")
+    check("controlled lifecycle diagram is deterministic", lifecycle_diagram_resolved["response"].startswith("```mermaid"))
+    check("controlled lifecycle diagram includes kubernetes", "Kubernetes Cluster" in lifecycle_diagram_resolved["response"])
+    check("controlled lifecycle diagram includes docker", "Docker Image" in lifecycle_diagram_resolved["response"])
     follow_up_resolved = ns["_resolve_follow_up_response"]("How is it different from the previous thing I asked?")
     check("controlled follow_up response is deterministic", "latest answer summary" in follow_up_resolved["response"].lower())
     comparison_resolved = ns["_resolve_comparison_response"]("What is the difference between readiness probe and liveness probe?")

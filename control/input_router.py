@@ -4,6 +4,17 @@ from typing import Callable
 
 
 AVA_SELF_TOPIC_PATTERNS = {
+    "name": [
+        "what is your name", "what's your name", "who are you",
+        "your name", "are you ava", "what are you called",
+    ],
+    "authorship": [
+        "who built you", "who made you", "who created you", "who developed you",
+        "what are you made of",
+    ],
+    "safety": [
+        "are you safe to use", "are you safe", "is ava safe",
+    ],
     "containers": [
         "what containers", "your containers", "your docker", "your ports",
         "what ports", "services and ports", "what services", "your services",
