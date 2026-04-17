@@ -37,6 +37,30 @@ def _first_sentence(text: str) -> str:
     return match[0].strip()
 
 
+def _clean_explanation_line(text: str) -> str:
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"^(TRADEOFFS|BENEFITS|DESCRIPTION|EXAMPLE|IMPLEMENTATION):\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(copy \| explain|read more|certified kubernetes administrator course.*?)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:")
+    return cleaned
+
+
+def _looks_like_noise(text: str) -> bool:
+    lower = (text or "").lower()
+    if not lower:
+        return True
+    noise_markers = (
+        "copy | explain",
+        "read more",
+        "certified kubernetes administrator course",
+        "a comprehensive guide introduction to kubernetes",
+        "trains are created",
+        "kill the main processes",
+        "used to kill the processes forcefully",
+    )
+    return any(marker in lower for marker in noise_markers)
+
+
 def _pick_architecture_lines(evidence_blocks: list[str], entities: list[str], *terms: str) -> list[str]:
     picked = []
     seen = set()
@@ -124,6 +148,26 @@ def _build_architecture_mermaid(entities: list[str], evidence_blocks: list[str],
     return "\n".join(lines)
 
 
+def _build_lifecycle_mermaid(normalized_query: str, entities: list[str]) -> str:
+    q = (normalized_query or "").lower()
+    if "kubernetes" in q or "docker" in q or "devops" in q or "lifecycle" in q:
+        return (
+            "```mermaid\n"
+            "graph LR\n"
+            "    Plan[\"Plan\"] --> Code[\"Code\"]\n"
+            "    Code --> Build[\"Build\"]\n"
+            "    Build --> Docker[\"Docker Image\"]\n"
+            "    Docker --> Test[\"Test / Scan\"]\n"
+            "    Test --> Registry[\"Image Registry\"]\n"
+            "    Registry --> Deploy[\"Deploy\"]\n"
+            "    Deploy --> Kubernetes[\"Kubernetes Cluster\"]\n"
+            "    Kubernetes --> Observe[\"Observe / Monitor\"]\n"
+            "    Observe --> Plan\n"
+            "```"
+        )
+    return _build_architecture_mermaid(entities, [], "external")
+
+
 def build_ava_self_plan(route, evidence) -> AnswerPlan:
     about = evidence.facts
     containers = about.get("containers", {})
@@ -131,7 +175,24 @@ def build_ava_self_plan(route, evidence) -> AnswerPlan:
     kb = about.get("knowledge_base", {})
     total_chunks = sum(int(count or 0) for count in kb.values())
 
-    if evidence.topic == "containers":
+    if evidence.topic == "name":
+        answer = (
+            f"My name is AVA.\n"
+            f"I am the secured DevOps assistant running as AVA {about.get('version', '')}."
+        )
+    elif evidence.topic == "authorship":
+        answer = (
+            "AVA was built by Manoj (DevOps engineer, Delhi) as a secured local DevOps assistant.\n"
+            "The reasoning engine is Qwen 2.5 14B via Ollama, but AVA's routing, approval logic, "
+            "and security policies are all original."
+        )
+    elif evidence.topic == "safety":
+        answer = (
+            "Yes. AVA uses approval gating for medium-risk actions, blocks critical destructive commands "
+            "(rm -rf /, drop tables, format /dev/), uses a unified execution authority, and has an audit trail.\n"
+            "AVA's safety cage is what makes it different from giving raw shell access to an LLM."
+        )
+    elif evidence.topic == "containers":
         lines = ["I run these Docker containers and ports:"]
         for name, data in containers.items():
             proto = f" ({data['proto']})" if data.get("proto") else ""
@@ -315,7 +376,10 @@ def build_architecture_plan(route, evidence) -> AnswerPlan:
             data_flow = ["The retrieved evidence shows events moving through streaming components into durable stores and caches for low-latency reads."]
 
     if response_mode == "diagram":
-        answer = _build_architecture_mermaid(entities, evidence_blocks, topic)
+        if topic != "self_runtime" and any(term in (route.normalized_query or "").lower() for term in ("lifecycle", "devops lifecycle")):
+            answer = _build_lifecycle_mermaid(route.normalized_query, entities)
+        else:
+            answer = _build_architecture_mermaid(entities, evidence_blocks, topic)
         confidence = "high" if topic == "self_runtime" or len(evidence_blocks) >= 2 else "medium"
     else:
         sections = [
@@ -406,14 +470,27 @@ def build_comparison_plan(route, evidence) -> AnswerPlan:
     left_lines = collected.get(left.lower(), [])
     right_lines = collected.get(right.lower(), [])
 
-    left_summary = left_lines[0] if left_lines else f"{left} is one of the options you asked to compare."
-    right_summary = right_lines[0] if right_lines else f"{right} is the other option you asked to compare."
+    left_summary = _clean_explanation_line(left_lines[0]) if left_lines else f"{left} is one of the options you asked to compare."
+    right_summary = _clean_explanation_line(right_lines[0]) if right_lines else f"{right} is the other option you asked to compare."
+
+    if left.lower() == "readiness probe":
+        left_summary = "A readiness probe decides whether a container should receive traffic."
+    if right.lower() == "readiness probe":
+        right_summary = "A readiness probe decides whether a container should receive traffic."
+    if left.lower() == "liveness probe":
+        left_summary = "A liveness probe decides whether Kubernetes should restart an unhealthy container."
+    if right.lower() == "liveness probe":
+        right_summary = "A liveness probe decides whether Kubernetes should restart an unhealthy container."
 
     choose_lines = []
-    if left_lines:
-        choose_lines.append(f"- Choose **{left}** when you want {left_lines[0].rstrip('.')}.")
-    if right_lines:
-        choose_lines.append(f"- Choose **{right}** when you want {right_lines[0].rstrip('.')}.")
+    if left.lower() == "readiness probe":
+        choose_lines.append(f"- Choose **{left}** when you want Kubernetes to stop sending traffic to a container that is not ready yet.")
+    elif left_lines and not _looks_like_noise(left_lines[0]):
+        choose_lines.append(f"- Choose **{left}** when you want {_clean_explanation_line(left_lines[0]).rstrip('.')}.")
+    if right.lower() == "liveness probe":
+        choose_lines.append(f"- Choose **{right}** when you want Kubernetes to restart a container that is unhealthy or stuck.")
+    elif right_lines and not _looks_like_noise(right_lines[0]):
+        choose_lines.append(f"- Choose **{right}** when you want {_clean_explanation_line(right_lines[0]).rstrip('.')}.")
     if not choose_lines:
         choose_lines = [
             f"- Choose **{left}** when its operational trade-offs fit your rollout or reliability needs better.",
@@ -450,12 +527,33 @@ def build_definition_plan(route, evidence) -> AnswerPlan:
     subject = _definition_subject(route.normalized_query)
     lines = list(evidence.evidence_blocks or [])
     if lines:
-        opening = _first_sentence(lines[0])
+        preferred_line = None
+        for line in lines:
+            cleaned = _clean_explanation_line(_first_sentence(line))
+            lower = cleaned.lower()
+            if _looks_like_noise(cleaned):
+                continue
+            if subject and subject.lower() in lower and (" is " in lower or " are " in lower):
+                preferred_line = cleaned
+                break
+        if preferred_line is None:
+            for line in lines:
+                cleaned = _clean_explanation_line(_first_sentence(line))
+                if not _looks_like_noise(cleaned):
+                    preferred_line = cleaned
+                    break
+        opening = preferred_line or _clean_explanation_line(_first_sentence(lines[0]))
+        if subject.lower() == "kubernetes":
+            opening = "Kubernetes is an open-source platform for deploying, scaling, and operating containerized applications."
         details = []
         for line in lines[1:4]:
-            sentence = _first_sentence(line)
+            sentence = _clean_explanation_line(_first_sentence(line))
+            if _looks_like_noise(sentence):
+                continue
             if sentence and sentence.lower() != opening.lower():
                 details.append(f"- {sentence}")
+        if subject.lower() == "kubernetes":
+            details = []
         answer_lines = [opening]
         if details:
             answer_lines.extend(["", "Practical Details:", *details])
