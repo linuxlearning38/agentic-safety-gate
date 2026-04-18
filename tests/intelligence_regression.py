@@ -58,6 +58,8 @@ FUNCTIONS = {
     "split_multi_query",
     "extract_explicit_command_request",
     "looks_like_operational_request",
+    "_is_vague_diagnostic_query",
+    "_build_vague_diagnostic_clarification",
     "extract_operational_tool_request",
     "extract_operational_clarification",
     "detect_multiple_questions",
@@ -417,6 +419,17 @@ def main():
     check("general question not extracted as command", ns["extract_explicit_command_request"]("What is the capital of France?") is None)
     check("operational natural language detected", ns["looks_like_operational_request"]("show disk usage") is True)
     check("general knowledge not treated as operational", ns["looks_like_operational_request"]("show me the capital of France") is False)
+    check("vague diagnostic detected: find problems", ns["_is_vague_diagnostic_query"]("find problems") is True)
+    check("vague diagnostic detected: find issues", ns["_is_vague_diagnostic_query"]("find issues") is True)
+    check("vague diagnostic detected: something is wrong", ns["_is_vague_diagnostic_query"]("something is wrong") is True)
+    check("vague diagnostic detected: check stuff", ns["_is_vague_diagnostic_query"]("check stuff") is True)
+    check("specific suspicious check not treated as vague", ns["_is_vague_diagnostic_query"]("is anything suspicious on this system") is False)
+    check("specific system verify not treated as vague", ns["_is_vague_diagnostic_query"]("verify my system") is False)
+    check("knowledge query not treated as vague", ns["_is_vague_diagnostic_query"]("what is kubernetes") is False)
+    check("existing pod clarification not treated as vague", ns["_is_vague_diagnostic_query"]("restart my pod") is False)
+    check("raw command not treated as vague", ns["_is_vague_diagnostic_query"]("run date") is False)
+    check("destructive command not treated as vague", ns["_is_vague_diagnostic_query"]("rm -rf /") is False)
+    check("vague diagnostic clarification includes suspicious check", "'is anything suspicious on this system'" in ns["_build_vague_diagnostic_clarification"]())
     check("disk usage maps to check_disk", ns["extract_operational_tool_request"]("show disk usage") == {"tool_name": "check_disk", "tool_args": {}})
     check("verify system maps to verify_system", ns["extract_operational_tool_request"]("verify my system") == {"tool_name": "verify_system", "tool_args": {}})
     check("docker health maps to check_docker", ns["extract_operational_tool_request"]("check docker") == {"tool_name": "check_docker", "tool_args": {}})

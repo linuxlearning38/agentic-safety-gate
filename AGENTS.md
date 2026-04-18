@@ -143,8 +143,22 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
 
 ## Current Working State (Session Memory)
 - Timestamp:
-  - 2026-04-17 Asia/Calcutta (updated — identity leak fix)
+  - 2026-04-18 Asia/Calcutta
 - Latest changes made:
+  - Fixed vague diagnostic queries so AVA now clarifies instead of queuing meaningless approvals:
+    - `find problems`
+    - `find issues`
+    - `check stuff`
+    - `something is wrong`
+    - bare `diagnose` / `troubleshoot`
+  - Added `_is_vague_diagnostic_query(...)` and `_build_vague_diagnostic_clarification()` in `web_agent_v2.1_guardrail.py`
+  - Root cause for vague diagnostics: `find problems` and `find issues` were being caught by raw command extraction because `find` is a shell-command starter; clarification had to run BEFORE `extract_explicit_command_request(...)` for this intent family
+  - Added regression coverage for vague diagnostic detection and non-regression cases (`run date`, `rm -rf /`, `restart my pod`, `verify my system`, `what is kubernetes`)
+  - Rebuilt AVA and verified live from Linux-side `/ask` probes:
+    - vague diagnostics now return tool-choice clarification
+    - `restart my pod` still asks for a target
+    - `rm -rf /` still blocks
+    - `run date` still executes
   - Fixed destructive blocking ordering bug in `web_agent_v2.1_guardrail.py`:
     - Root cause: `_resolve_direct_action_query` called `extract_explicit_command_request` BEFORE `_is_single_destructive_request`. Both `echo` and `kill` are in `_RAW_COMMAND_STARTERS`, so "echo \"\" > /etc/passwd" and "kill -9 -1" were extracted as raw commands and routed to `execute_command_secure`. That function ran `analyze_command_security` which returned `approval_required` (credential_access threat for /etc/passwd → medium, unknown command for kill-9-1 → medium) — never critical-blocked.
     - Fix: swapped the two checks in `_resolve_direct_action_query` so `_is_single_destructive_request` runs first. If it matches, return blocked immediately — `execute_command_secure` and `security_layer` never see the query.
@@ -250,12 +264,19 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - Added regression coverage for the new Linux operator phrases
   - `AGENTS.md` updated to reflect current serving-contract state
 - Root causes investigated:
+  - Vague diagnostic intent without a concrete target had no first-class clarification path
+  - `find problems` / `find issues` leaked specifically because `find` is a raw-command starter and raw extraction was running before vague-diagnostic clarification
   - Linux operator routing was losing to controlled troubleshooting/knowledge branches because operational execution happened too late in `/ask`
   - Multi-question handling only built knowledge answers and did not execute operational tools for each sub-query
   - The runtime image lacked port-inspection binaries
   - Some Linux tools assumed a systemd host, but AVA currently runs inside a non-systemd container
   - `inspect_process` surfaced raw `ps` failure text instead of turning it into a user-facing diagnosis
 - Outcome verified:
+  - `find problems`, `find issues`, `check stuff`, and `something is wrong` now return clarification with suggested check paths instead of approval
+  - Existing behavior stayed intact for:
+    - `restart my pod` -> asks for deployment name
+    - `rm -rf /` -> blocked
+    - `run date` -> executes
   - `show listening ports` now executes successfully
   - `check failed services` now routes into the Linux operator path and returns an honest container/systemd limitation message
   - comma-separated Linux operator prompts now return `type: "multi"` with per-part command results
@@ -276,8 +297,11 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - Keep deterministic/self/security paths invisible and consistent for the user
   - Expand coverage without reintroducing stitched-together routing behavior
   - Shift AVA from “tool wrapper” toward operator intelligence by ranking findings, naming the top concern, and recommending the next best action
+  - Reduce meaningless approval prompts when the user intent is diagnostic but underspecified
 - Next steps:
   - Improve the weakest knowledge-answer cases
+  - Replace more pattern-heavy operational routing with a hybrid intent-classifier path instead of continuing phrase explosion
+  - Add cross-signal reasoning so AVA correlates multiple Linux/operator signals before choosing the top concern
   - Expand baseline/history-aware comparisons further to high-risk processes and service health over time (process ancestry, unusual CPU bursts)
   - Add richer service/process remediation guidance tied to actual findings
   - Add richer remediation actions from findings beyond package prompts, including stronger service/process follow-ups
