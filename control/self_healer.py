@@ -7,7 +7,7 @@ Decision ladder (heal method):
   confidence 0.6 – 0.85            → approval_queue + audit
   confidence < 0.6                 → audit only
 
-All executions go through execute_command_secure() so OPA validates
+All executions go through the unified secure executor so OPA validates
 every command before it runs.
 """
 
@@ -17,7 +17,8 @@ import subprocess
 from datetime import datetime, timezone
 
 from control import database as db
-from control.secure_executor import execute_command_secure
+from control.approval import add_request
+from control.secure_executor import execute_tool_safe
 
 logger = logging.getLogger("ava.self_healer")
 
@@ -379,7 +380,14 @@ class SelfHealer:
             action_taken = "queued_for_approval"
             exec_result  = f"Queued for approval — confidence={confidence:.2f} risk={risk_level}"
             try:
-                db.add_approval(command=cmd, risk_level=risk_level)
+                add_request(
+                    cmd,
+                    f"self_heal:{issue_type}",
+                    risk=(risk_level or "").lower(),
+                    mode="command",
+                    approval_key=cmd,
+                    metadata={"source": "self_healer", "issue_type": issue_type},
+                )
             except Exception as _e:
                 logger.warning(f"[SelfHealer] approval queue write failed: {_e}")
         else:
@@ -513,11 +521,15 @@ class SelfHealer:
         Returns a human-readable result string.
         """
         try:
-            result = execute_command_secure(cmd, query=f"self_heal:{context_label}")
+            result = execute_tool_safe(
+                "raw_command",
+                {"command": cmd},
+                query=f"self_heal:{context_label}",
+                source="healer",
+            )
             status = result.get("status")
-            if status == "executed":
-                out = result.get("output", {})
-                stdout = (out.get("stdout") or "").strip()
+            if status == "success":
+                stdout = (result.get("output") or "").strip()
                 return stdout[:400] if stdout else "(executed, no output)"
             elif status == "blocked":
                 return f"BLOCKED by OPA: {result.get('reason', 'policy violation')}"

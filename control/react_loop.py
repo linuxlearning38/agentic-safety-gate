@@ -24,6 +24,7 @@ from datetime import datetime
 
 import ollama
 
+from control.secure_executor import execute_tool_safe
 from control.tool_registry import registry as tool_registry
 
 logger = logging.getLogger(__name__)
@@ -280,8 +281,8 @@ class ReactLoop:
 
             logger.info(f"[ReAct] Action: {action}({action_input})")
 
-            # Execute tool via registry (shell=False enforced inside)
-            tool_result  = tool_registry.execute(action, action_input or {})
+            # Execute tool via unified executor so approvals/policy stay consistent.
+            tool_result  = execute_tool_safe(action, action_input or {}, query, source="react")
             observation  = self._format_observation(tool_result)
 
             step = ReActStep(
@@ -332,11 +333,15 @@ class ReactLoop:
         if status == "success":
             output = tool_result.get("output", "(no output)")
             return f"SUCCESS:\n{output}"
+        elif status == "approval_required":
+            approval_id = tool_result.get("approval_id", "unknown")
+            reason = tool_result.get("reason", "Approval required")
+            return f"APPROVAL_REQUIRED: {reason} (approval_id={approval_id})"
         elif status == "blocked":
-            return f"BLOCKED: {tool_result.get('error', 'High risk tool — approval required')}"
+            return f"BLOCKED: {tool_result.get('reason') or tool_result.get('error', 'Blocked by policy')}"
         elif status == "not_found":
             return f"ERROR: {tool_result.get('error', 'Tool not found')}"
-        elif status == "failure":
+        elif status in ("failure", "failed", "error"):
             error = tool_result.get("error", "unknown error")
             # kubectl not found is common in dev — make it informative
             if "not found" in error.lower() or "binary" in error.lower():

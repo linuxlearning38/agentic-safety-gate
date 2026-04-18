@@ -24,6 +24,7 @@ from typing import List, Dict, Optional, Callable
 from datetime import datetime
 
 from control.tool_registry import registry as tool_registry
+from control.secure_executor import execute_tool_safe
 
 logger = logging.getLogger(__name__)
 
@@ -381,29 +382,20 @@ def execute_graph(graph_name: str, query: str) -> GraphResult:
             "description": step.description,
         }
 
-        # Medium-risk steps that require approval — pause here
-        if step.require_approval:
-            tool = tool_registry.get_tool(step.tool_name)
-            if tool and tool.risk_level in ("medium", "high"):
-                from control.secure_executor import execute_tool_secure
-                approval_result = execute_tool_secure(step.tool_name, args, query)
-                if approval_result.get("status") == "approval_required":
-                    step_record["status"] = "approval_required"
-                    step_record["output"] = ""
-                    step_record["approval_id"] = approval_result.get("approval_id")
-                    result.steps_run.append(step_record)
-                    result.paused_at    = step.tool_name
-                    result.approval_id  = approval_result.get("approval_id")
-                    result.success      = False
-                    logger.info(f"[CommandGraph] Paused at step {i} — approval required")
-                    return result
-
-        # Execute via registry (shell=False enforced inside)
-        tool_result = tool_registry.execute(step.tool_name, args)
+        tool_result = execute_tool_safe(step.tool_name, args, query, source="graph")
         step_record["status"] = tool_result.get("status", "unknown")
         step_record["output"] = tool_result.get("output", "")
         step_record["error"]  = tool_result.get("error", "")
+        if tool_result.get("approval_id"):
+            step_record["approval_id"] = tool_result.get("approval_id")
         result.steps_run.append(step_record)
+
+        if tool_result.get("status") == "approval_required":
+            result.paused_at = step.tool_name
+            result.approval_id = tool_result.get("approval_id")
+            result.success = False
+            logger.info(f"[CommandGraph] Paused at step {i} — approval required")
+            return result
 
         logger.info(
             f"[CommandGraph] Step {i} '{step.tool_name}': {step_record['status']}"

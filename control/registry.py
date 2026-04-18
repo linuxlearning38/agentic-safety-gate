@@ -2,9 +2,9 @@
 # Command whitelist registry
 
 import json
-from pathlib import Path
+import shlex
 
-WHITELIST_FILE = "/home/manoj/ava-data/control_whitelist.json"
+from control.runtime_paths import get_runtime_path
 
 # Default approved commands
 APPROVED_COMMANDS = [
@@ -23,11 +23,25 @@ APPROVED_COMMANDS = [
     "date"
 ]
 
+
+def normalize_command_signature(cmd):
+    """Normalize command text for stable whitelist and approval matching."""
+    if not isinstance(cmd, str):
+        return ""
+    text = cmd.strip()
+    if not text:
+        return ""
+    try:
+        return shlex.join(shlex.split(text))
+    except Exception:
+        return " ".join(text.split())
+
 def load_whitelist():
     """Load whitelist from file"""
     try:
-        if Path(WHITELIST_FILE).exists():
-            with open(WHITELIST_FILE, "r") as f:
+        whitelist_file = get_runtime_path("WHITELIST_PATH", "control_whitelist.json")
+        if whitelist_file.exists():
+            with open(whitelist_file, "r") as f:
                 return json.load(f)
         else:
             # Create initial whitelist
@@ -38,7 +52,9 @@ def load_whitelist():
 
 def save_whitelist(commands):
     """Save whitelist to file"""
-    with open(WHITELIST_FILE, "w") as f:
+    whitelist_file = get_runtime_path("WHITELIST_PATH", "control_whitelist.json")
+    whitelist_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(whitelist_file, "w") as f:
         json.dump(commands, f, indent=2)
 
 def is_approved(cmd):
@@ -52,28 +68,35 @@ def is_approved(cmd):
       approved by "git status", but "git statusfoo" is not).
     """
     whitelist = load_whitelist()
-    if not cmd:
+    normalized_cmd = normalize_command_signature(cmd)
+    if not normalized_cmd:
         return False
     for allowed in whitelist:
-        allowed_tokens = allowed.split()
+        normalized_allowed = normalize_command_signature(allowed)
+        allowed_tokens = normalized_allowed.split()
         if not allowed_tokens:
             continue
         if len(allowed_tokens) == 1:
             # Single-token: must be an exact match
-            if cmd == allowed:
+            if normalized_cmd == normalized_allowed:
                 return True
         else:
             # Multi-token: exact match or cmd adds further args after a space
-            if cmd == allowed or cmd.startswith(allowed + " "):
+            if normalized_cmd == normalized_allowed or normalized_cmd.startswith(normalized_allowed + " "):
                 return True
     return False
 
 def add_to_whitelist(cmd):
     """Add command to whitelist"""
     whitelist = load_whitelist()
-    
-    if cmd not in whitelist:
-        whitelist.append(cmd)
+
+    normalized_cmd = normalize_command_signature(cmd)
+    if not normalized_cmd:
+        return False
+
+    normalized_existing = {normalize_command_signature(entry) for entry in whitelist}
+    if normalized_cmd not in normalized_existing:
+        whitelist.append(normalized_cmd)
         save_whitelist(whitelist)
         return True
     
@@ -82,7 +105,14 @@ def add_to_whitelist(cmd):
 def remove_from_whitelist(cmd):
     """Remove command from whitelist"""
     whitelist = load_whitelist()
-    
+
+    normalized_cmd = normalize_command_signature(cmd)
+    filtered = [entry for entry in whitelist if normalize_command_signature(entry) != normalized_cmd]
+
+    if len(filtered) != len(whitelist):
+        save_whitelist(filtered)
+        return True
+
     if cmd in whitelist:
         whitelist.remove(cmd)
         save_whitelist(whitelist)

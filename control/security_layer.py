@@ -6,6 +6,8 @@ from datetime import datetime
 import json
 from pathlib import Path
 
+from control.runtime_paths import get_runtime_path
+
 # ============= RISK CLASSIFICATION =============
 
 RISK_PATTERNS = {
@@ -183,7 +185,8 @@ def detect_threat_patterns(cmd):
 
 # ============= SECURITY AUDIT LOGGING =============
 
-SECURITY_LOG = "/mnt/i/ai-lab/security_audit.json"
+def _security_log():
+    return get_runtime_path("SECURITY_AUDIT_PATH", "security_audit.json")
 
 def security_audit_log(event_type, cmd, query, risk_analysis, threats, decision):
     """
@@ -203,8 +206,9 @@ def security_audit_log(event_type, cmd, query, risk_analysis, threats, decision)
     
     # Load existing log
     try:
-        if Path(SECURITY_LOG).exists():
-            with open(SECURITY_LOG, "r") as f:
+        security_log = _security_log()
+        if Path(security_log).exists():
+            with open(security_log, "r") as f:
                 logs = json.load(f)
         else:
             logs = []
@@ -214,7 +218,9 @@ def security_audit_log(event_type, cmd, query, risk_analysis, threats, decision)
     # Append and save
     logs.append(entry)
     
-    with open(SECURITY_LOG, "w") as f:
+    security_log = _security_log()
+    security_log.parent.mkdir(parents=True, exist_ok=True)
+    with open(security_log, "w") as f:
         json.dump(logs, f, indent=2)
     
     return entry
@@ -269,7 +275,7 @@ def get_recent_threat_summary(hours=24):
     Returns summary of security events
     """
     try:
-        with open(SECURITY_LOG, "r") as f:
+        with open(_security_log(), "r") as f:
             logs = json.load(f)
     except:
         return {"error": "No security log found"}

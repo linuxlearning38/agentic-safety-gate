@@ -12,7 +12,10 @@ FROM python:3.11-slim
 
 # Install runtime system deps:
 #   curl      → healthcheck + debugging
-#   trivy     → /scan/trivy endpoint (installed via official script)
+#   docker.io → docker CLI for mounted /var/run/docker.sock
+#   procps    → free/ps monitoring tools
+#   kubectl   → kubernetes CLI for pod/node operations
+#   trivy     → /scan/trivy endpoint
 #   lynis     → /scan/lynis endpoint
 #   ca-certs  → TLS verification for external calls
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,6 +24,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         gnupg \
         apt-transport-https \
+        docker.io \
+        iproute2 \
+        net-tools \
+        procps \
         lynis \
     && \
     # Trivy via official apt repo (more reliable than binary download)
@@ -30,6 +37,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         > /etc/apt/sources.list.d/trivy.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends trivy && \
+    KUBECTL_VERSION="$(curl -L -s https://dl.k8s.io/release/stable.txt)" && \
+    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" && \
+    chmod +x /usr/local/bin/kubectl && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Non-root user: ava
