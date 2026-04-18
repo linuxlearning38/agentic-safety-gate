@@ -95,6 +95,155 @@ def _select_primary_concern(candidates: List[Dict[str, Any]]) -> Optional[Dict[s
     return sorted(candidates, key=_score, reverse=True)[0]
 
 
+def _build_correlated_assessment(
+    *,
+    new_listeners: List[str],
+    auth_failure_delta: int,
+    auth_failure_count: int,
+    new_failed_services: List[str],
+    suspicious_listener_findings: List[str],
+    suspicious_process_findings: List[str],
+    unique_findings: List[str],
+) -> Optional[Dict[str, Any]]:
+    correlated_signals: List[str] = []
+    evidence: List[str] = []
+
+    if auth_failure_delta > 0:
+        correlated_signals.append("auth_failure_spike")
+        evidence.append(f"Authentication failures increased by +{auth_failure_delta} (current count: {auth_failure_count}).")
+    if new_listeners:
+        correlated_signals.append("new_listener")
+        evidence.append(f"New listener observed since baseline: {new_listeners[0]}")
+    if new_failed_services:
+        correlated_signals.append("service_drift")
+        evidence.append(f"New failed service since baseline: {new_failed_services[0]}")
+    if suspicious_listener_findings:
+        correlated_signals.append("suspicious_listener")
+        evidence.append(suspicious_listener_findings[0])
+    if suspicious_process_findings:
+        correlated_signals.append("suspicious_process")
+        evidence.append(suspicious_process_findings[0])
+
+    signal_set = set(correlated_signals)
+
+    if {"auth_failure_spike", "new_listener"} <= signal_set:
+        return {
+            "title": "Authentication pressure and new network exposure detected together",
+            "severity": "high",
+            "evidence": evidence[:3],
+            "next_action": "inspect process <pid>",
+            "confidence": "high",
+            "is_novel": True,
+            "signals": correlated_signals,
+            "summary": "A new listening endpoint appearing alongside rising authentication failures can indicate service exposure or attacker-driven foothold activity.",
+        }
+
+    if {"new_listener", "suspicious_process"} <= signal_set:
+        return {
+            "title": "New listener appears to be backed by unusual process activity",
+            "severity": "high",
+            "evidence": evidence[:3],
+            "next_action": "inspect process <pid>",
+            "confidence": "high",
+            "is_novel": True,
+            "signals": correlated_signals,
+            "summary": "An unexpected listener plus a process command worth review is stronger than either signal on its own.",
+        }
+
+    if {"auth_failure_spike", "service_drift"} <= signal_set:
+        return {
+            "title": "Service instability coincides with increased authentication failures",
+            "severity": "medium",
+            "evidence": evidence[:3],
+            "next_action": "inspect service <name>",
+            "confidence": "medium",
+            "is_novel": True,
+            "signals": correlated_signals,
+            "summary": "Rising auth failures alongside newly failed services can indicate misconfiguration, lockout pressure, or hostile probing affecting availability.",
+        }
+
+    if len(signal_set) >= 3:
+        return {
+            "title": "Multiple suspicious signals are aligned in the same snapshot",
+            "severity": "high",
+            "evidence": evidence[:3],
+            "next_action": "isolate the highest-risk process or service before applying broader remediation",
+            "confidence": "medium",
+            "is_novel": bool(new_listeners or new_failed_services or auth_failure_delta > 0),
+            "signals": correlated_signals,
+            "summary": "Several independent signals are pointing in the same direction, which raises confidence that this is more than background noise.",
+        }
+
+    if len(unique_findings) >= 2 and signal_set:
+        return {
+            "title": "More than one suspicious signal is present in the current snapshot",
+            "severity": "medium",
+            "evidence": evidence[:3],
+            "next_action": "inspect the highest-risk process or service first",
+            "confidence": "medium",
+            "is_novel": bool(new_listeners or new_failed_services or auth_failure_delta > 0),
+            "signals": correlated_signals,
+            "summary": "Multiple low-to-medium signals together deserve investigation even if none is conclusive on its own.",
+        }
+
+    return None
+
+
+def _build_host_risk_correlation(
+    *,
+    vuln_primary: Optional[Dict[str, Any]],
+    suspicious_primary: Optional[Dict[str, Any]],
+    suspicious_metadata: Dict[str, Any],
+    vuln_summary: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    critical_count = int(vuln_summary.get("CRITICAL", 0) or 0)
+    high_count = int(vuln_summary.get("HIGH", 0) or 0)
+    new_listeners = list(suspicious_metadata.get("new_listeners") or [])
+    auth_failure_delta = int(suspicious_metadata.get("auth_failure_delta", 0) or 0)
+    new_failed_services = list(suspicious_metadata.get("new_failed_services") or [])
+
+    if (critical_count > 0 or high_count > 0) and (new_listeners or auth_failure_delta > 0):
+        evidence = [
+            f"Runtime CVE summary: CRITICAL={critical_count}, HIGH={high_count}",
+        ]
+        if vuln_primary and vuln_primary.get("title"):
+            evidence.append(str(vuln_primary["title"]))
+        if new_listeners:
+            evidence.append(f"New listener observed: {new_listeners[0]}")
+        elif auth_failure_delta > 0:
+            evidence.append(f"Authentication failures increased by +{auth_failure_delta}")
+        return {
+            "title": "Patch exposure and runtime drift are both elevated",
+            "severity": "high" if critical_count > 0 else "medium",
+            "evidence": evidence[:3],
+            "next_action": vuln_primary.get("next_action") if vuln_primary else "scan my system for vulnerabilities",
+            "confidence": "high" if critical_count > 0 and new_listeners else "medium",
+            "is_novel": bool(new_listeners or auth_failure_delta > 0),
+            "signals": ["runtime_cves", "runtime_drift"],
+            "summary": "High-priority CVEs matter more when the host is also showing new exposure or suspicious drift.",
+        }
+
+    if (critical_count > 0 or high_count > 3) and new_failed_services:
+        evidence = [
+            f"Runtime CVE summary: CRITICAL={critical_count}, HIGH={high_count}",
+            f"New failed service: {new_failed_services[0]}",
+        ]
+        if suspicious_primary and suspicious_primary.get("title"):
+            evidence.append(str(suspicious_primary["title"]))
+        return {
+            "title": "Service instability is happening on a vulnerable runtime",
+            "severity": "medium",
+            "evidence": evidence[:3],
+            "next_action": f"inspect service {new_failed_services[0]}" if new_failed_services else "check failed services",
+            "confidence": "medium",
+            "is_novel": True,
+            "signals": ["runtime_cves", "service_drift"],
+            "summary": "New service failures on a vulnerable runtime deserve investigation before they compound into a wider incident.",
+        }
+
+    return None
+
+
 # ─── Safe subprocess helper ───────────────────────────────────────────────────
 
 def _run(args: List[str], timeout: int = 15) -> Dict:
@@ -743,6 +892,8 @@ def _scan_host_vulnerabilities(args: Dict) -> Dict:
 def _check_suspicious_activity(args: Dict) -> Dict:
     sections: List[str] = []
     findings: List[str] = []
+    suspicious_listener_findings: List[str] = []
+    suspicious_process_findings: List[str] = []
 
     auth = _check_auth_events({})
     auth_failure_count = 0
@@ -775,7 +926,8 @@ def _check_suspicious_activity(args: Dict) -> Dict:
     if ports.get("status") == "success":
         listening_output = ports.get('output', '')
         sections.append(f"[Listening Ports]\n{listening_output}")
-        findings.extend(_suspicious_listener_findings(listening_output))
+        suspicious_listener_findings = _suspicious_listener_findings(listening_output)
+        findings.extend(suspicious_listener_findings)
         current_listeners = _normalize_listener_baseline(listening_output)
     else:
         sections.append(f"[Listening Ports]\n{ports.get('error', 'port inspection failed')}")
@@ -784,7 +936,8 @@ def _check_suspicious_activity(args: Dict) -> Dict:
     if processes.get("status") == "success":
         process_output = processes.get('output', '')
         sections.append(f"[Top Processes]\n{process_output}")
-        findings.extend(_suspicious_process_findings(process_output))
+        suspicious_process_findings = _suspicious_process_findings(process_output)
+        findings.extend(suspicious_process_findings)
     else:
         sections.append(f"[Top Processes]\n{processes.get('error', 'process inspection failed')}")
 
@@ -826,6 +979,16 @@ def _check_suspicious_activity(args: Dict) -> Dict:
             unique_findings.append(finding)
             seen.add(finding)
 
+    correlated_assessment = _build_correlated_assessment(
+        new_listeners=new_listeners,
+        auth_failure_delta=auth_failure_delta,
+        auth_failure_count=auth_failure_count,
+        new_failed_services=new_failed_services,
+        suspicious_listener_findings=suspicious_listener_findings,
+        suspicious_process_findings=suspicious_process_findings,
+        unique_findings=unique_findings,
+    )
+
     suggestion_lines: List[str] = []
     if any("authentication failure" in item for item in unique_findings):
         suggestion_lines.append("- Review auth logs in detail and confirm whether the failures are expected administration attempts.")
@@ -845,6 +1008,15 @@ def _check_suspicious_activity(args: Dict) -> Dict:
         suggestion_lines.append("- No immediate remediation is suggested from the current signals.")
 
     concern_candidates: List[Dict[str, Any]] = []
+    if correlated_assessment:
+        concern_candidates.append(_concern_metadata(
+            title=correlated_assessment["title"],
+            severity=correlated_assessment["severity"],
+            evidence=correlated_assessment["evidence"],
+            next_action=correlated_assessment["next_action"],
+            confidence=correlated_assessment["confidence"],
+            is_novel=correlated_assessment["is_novel"],
+        ))
     if new_listeners:
         concern_candidates.append(_concern_metadata(
             title="New listening endpoint detected since the previous baseline",
@@ -899,14 +1071,27 @@ def _check_suspicious_activity(args: Dict) -> Dict:
     primary_concern = _select_primary_concern(concern_candidates)
 
     header = "Potential suspicious indicators detected." if unique_findings else "No strong suspicious indicators detected from auth logs, service state, ports, processes, and persistence points."
+    if correlated_assessment:
+        correlated_lines = [
+            f"- {correlated_assessment['title']}",
+            f"- Assessment: {correlated_assessment['summary']}",
+            *(f"- Evidence: {item}" for item in correlated_assessment.get("evidence", [])[:2]),
+            f"- Next action: {correlated_assessment['next_action']}",
+        ]
+        sections.insert(0, "[Correlated Assessment]\n" + "\n".join(correlated_lines))
     if primary_concern:
-        sections.insert(0, "[Primary Concern]\n" + "\n".join([
+        insert_at = 1 if correlated_assessment else 0
+        sections.insert(insert_at, "[Primary Concern]\n" + "\n".join([
             f"- {primary_concern['title']}",
             *(f"- Evidence: {item}" for item in primary_concern.get("evidence", [])[:2]),
             f"- Next action: {primary_concern['next_action']}",
         ]))
     if unique_findings:
-        insert_at = 1 if primary_concern else 0
+        insert_at = 0
+        if correlated_assessment:
+            insert_at += 1
+        if primary_concern:
+            insert_at += 1
         sections.insert(insert_at, "[Alerts]\n" + "\n".join(f"- {item}" for item in unique_findings[:12]))
     sections.append("[Suggested Next Steps]\n" + "\n".join(suggestion_lines))
 
@@ -917,12 +1102,131 @@ def _check_suspicious_activity(args: Dict) -> Dict:
             "inspection_type": "suspicious_activity",
             "alerts": unique_findings[:12],
             "suggested_actions": suggestion_lines,
+            "correlated_assessment": correlated_assessment,
             "primary_concern": primary_concern,
             "baseline_state": baseline_state,
             "new_listeners": new_listeners[:8],
             "auth_failure_count": auth_failure_count,
             "auth_failure_delta": auth_failure_delta,
             "new_failed_services": new_failed_services[:8],
+        },
+    )
+
+
+def _assess_host_risk(args: Dict) -> Dict:
+    suspicious = _check_suspicious_activity({})
+    vulnerabilities = _scan_host_vulnerabilities({})
+    updates = _check_updates({})
+
+    sections: List[str] = []
+    suggested_actions: List[str] = []
+    remediation_candidates: List[Dict[str, Any]] = []
+    concern_candidates: List[Dict[str, Any]] = []
+
+    suspicious_metadata = suspicious.get("metadata") or {}
+    vuln_metadata = vulnerabilities.get("metadata") or {}
+    suspicious_primary = suspicious_metadata.get("primary_concern")
+    vuln_primary = vuln_metadata.get("primary_concern")
+
+    if suspicious.get("status") == "success":
+        sections.append("[Suspicious Activity Summary]\n" + suspicious.get("output", ""))
+        if suspicious_primary:
+            concern_candidates.append(dict(suspicious_primary))
+        suggested_actions.extend(list(suspicious_metadata.get("suggested_actions") or []))
+    else:
+        sections.append("[Suspicious Activity Summary]\n" + suspicious.get("error", "suspicious activity check failed"))
+
+    if vulnerabilities.get("status") == "success":
+        sections.append("[Vulnerability Summary]\n" + vulnerabilities.get("output", ""))
+        if vuln_primary:
+            concern_candidates.append(dict(vuln_primary))
+        remediation_candidates.extend(list(vuln_metadata.get("remediation_candidates") or []))
+        broad_remediation = vuln_metadata.get("broad_remediation")
+        if broad_remediation and broad_remediation.get("prompt"):
+            remediation_candidates.append({
+                "package": "all security updates",
+                "action": broad_remediation.get("action", "install_updates"),
+                "prompt": broad_remediation["prompt"],
+                "command_intent": "apply broad package remediation through the local package manager",
+            })
+    else:
+        sections.append("[Vulnerability Summary]\n" + vulnerabilities.get("error", "vulnerability scan failed"))
+
+    if updates.get("status") == "success":
+        sections.append("[Package Update Summary]\n" + updates.get("output", ""))
+    else:
+        sections.append("[Package Update Summary]\n" + updates.get("error", "package update check failed"))
+
+    correlated_assessment = _build_host_risk_correlation(
+        vuln_primary=vuln_primary if isinstance(vuln_primary, dict) else None,
+        suspicious_primary=suspicious_primary if isinstance(suspicious_primary, dict) else None,
+        suspicious_metadata=suspicious_metadata,
+        vuln_summary=vuln_metadata.get("summary") or {},
+    )
+    if correlated_assessment:
+        concern_candidates.append(_concern_metadata(
+            title=correlated_assessment["title"],
+            severity=correlated_assessment["severity"],
+            evidence=correlated_assessment["evidence"],
+            next_action=correlated_assessment["next_action"],
+            confidence=correlated_assessment["confidence"],
+            is_novel=correlated_assessment["is_novel"],
+        ))
+
+    if not suggested_actions:
+        suggested_actions.append("- Review the highest-risk panel first before taking action.")
+    seen_actions = set()
+    deduped_actions: List[str] = []
+    for item in suggested_actions:
+        if item not in seen_actions:
+            deduped_actions.append(item)
+            seen_actions.add(item)
+
+    seen_prompts = set()
+    deduped_candidates: List[Dict[str, Any]] = []
+    for item in remediation_candidates:
+        prompt = str(item.get("prompt") or "").strip()
+        if not prompt or prompt in seen_prompts:
+            continue
+        deduped_candidates.append(item)
+        seen_prompts.add(prompt)
+
+    primary_concern = _select_primary_concern(concern_candidates)
+
+    if correlated_assessment:
+        sections.insert(0, "[Correlated Assessment]\n" + "\n".join([
+            f"- {correlated_assessment['title']}",
+            f"- Assessment: {correlated_assessment['summary']}",
+            *(f"- Evidence: {item}" for item in correlated_assessment.get("evidence", [])[:2]),
+            f"- Next action: {correlated_assessment['next_action']}",
+        ]))
+    if primary_concern:
+        insert_at = 1 if correlated_assessment else 0
+        sections.insert(insert_at, "[Primary Concern]\n" + "\n".join([
+            f"- {primary_concern['title']}",
+            *(f"- Evidence: {item}" for item in primary_concern.get("evidence", [])[:2]),
+            f"- Next action: {primary_concern['next_action']}",
+        ]))
+    sections.append("[Suggested Next Steps]\n" + "\n".join(deduped_actions))
+
+    return _metadata_result(
+        "Overall host risk assessment generated from runtime CVEs, suspicious activity, and package update posture.\n\n"
+        + "\n\n".join(section for section in sections if section).strip(),
+        "tool:assess_host_risk",
+        {
+            "inspection_type": "host_risk_assessment",
+            "correlated_assessment": correlated_assessment,
+            "primary_concern": primary_concern,
+            "suggested_actions": deduped_actions,
+            "remediation_candidates": deduped_candidates[:6],
+            "new_listeners": list(suspicious_metadata.get("new_listeners") or [])[:8],
+            "new_failed_services": list(suspicious_metadata.get("new_failed_services") or [])[:8],
+            "auth_failure_delta": int(suspicious_metadata.get("auth_failure_delta", 0) or 0),
+            "risk_summary": {
+                "runtime_cves": vuln_metadata.get("summary") or {},
+                "suspicious_primary": suspicious_primary,
+                "vulnerability_primary": vuln_primary,
+            },
         },
     )
 
@@ -1356,6 +1660,12 @@ class ToolRegistry:
             function=_check_suspicious_activity,
             risk_level="low",
             description="Inspect auth failures, failed services, ports, and top processes for suspicious signals",
+        )
+        self.register(
+            name="assess_host_risk",
+            function=_assess_host_risk,
+            risk_level="low",
+            description="Combine suspicious activity, runtime CVEs, and update posture into one host risk assessment",
         )
 
         # ── MEDIUM RISK — approval required ───────────────────────────────────

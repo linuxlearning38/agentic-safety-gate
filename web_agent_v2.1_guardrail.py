@@ -602,6 +602,27 @@ def _resolve_direct_action_query(query: str) -> dict | None:
             "confidence": "high",
         }
 
+    llm_operational = _classify_operational_intent_with_llm(query)
+    if llm_operational:
+        if llm_operational["decision"] == "clarification":
+            return {
+                "kind": "knowledge",
+                "response": llm_operational["clarification"],
+                "confidence": llm_operational["confidence"],
+            }
+
+        exec_result = execute_tool_safe(
+            llm_operational["tool_name"],
+            llm_operational["tool_args"],
+            query=query,
+            source="ask_operational_llm_fallback",
+        )
+        return {
+            "kind": "command",
+            "result": exec_result,
+            "response": _command_response_text(exec_result),
+        }
+
     return None
 
 
@@ -706,6 +727,174 @@ def _build_vague_diagnostic_clarification() -> str:
         "'show running processes' (process list)\n\n"
         "What kind of check would you like?"
     )
+
+
+def _extract_json_object(text: str) -> dict | None:
+    raw = _normalize_text(text).strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _should_try_operational_intent_classifier(query: str) -> bool:
+    q = _normalize_user_query(query).strip()
+    if not q:
+        return False
+
+    route = _route_query(q)
+    if route.intent in {
+        "ava_self",
+        "memory_store",
+        "memory_recall",
+        "architecture",
+        "follow_up",
+        "comparison",
+        "definition",
+    }:
+        return False
+
+    lower = q.lower()
+    if _is_learning_query(lower):
+        return False
+    if extract_explicit_command_request(q):
+        return False
+    if extract_operational_tool_request(q):
+        return False
+    if extract_operational_clarification(q):
+        return False
+    if _is_vague_diagnostic_query(q):
+        return False
+
+    ops_markers = (
+        "service", "services", "docker", "container", "containers", "host", "system",
+        "machine", "listener", "listeners", "ports", "process", "processes", "patch",
+        "patching", "updates", "update", "security", "auth", "ssh", "failed",
+        "failure", "failures", "suspicious", "vulnerab", "cve", "health", "healthy",
+        "inspect", "investigate", "check", "verify", "scan", "look for",
+    )
+    return any(marker in lower for marker in ops_markers)
+
+
+def _classify_operational_intent_with_llm(query: str) -> dict | None:
+    if not _should_try_operational_intent_classifier(query):
+        return None
+
+    system_prompt = (
+        "You are AVA's operational intent classifier. "
+        "Decide whether a natural-language infrastructure request should map to one existing operational tool, "
+        "ask for clarification, or return none. Never invent new tools. Return JSON only."
+    )
+    user_prompt = f"""
+Classify this query:
+{query}
+
+Allowed tools:
+- verify_system
+- assess_host_risk
+- check_suspicious_activity
+- check_failed_services
+- check_updates
+- scan_host_vulnerabilities
+- show_processes
+- show_listening_ports
+- check_auth_events
+- inspect_service
+
+Rules:
+- Return one JSON object only.
+- Schema:
+  {{"decision":"tool|clarification|none","tool_name":"","tool_args":{{}},"clarification":"","confidence":"low|medium|high"}}
+- Use decision="tool" only if the query clearly maps to exactly one allowed tool.
+- Use inspect_service only when a service name is present.
+- Use decision="clarification" if the user wants a service inspection but did not provide the service name.
+- Use decision="none" if this is not clearly an operational tool request.
+
+Examples:
+- "do I have any failed services" -> check_failed_services
+- "what should I investigate on this host" -> assess_host_risk
+- "look for suspicious activity" -> check_suspicious_activity
+- "check if my machine needs patching" -> check_updates
+- "can you inspect nginx service health" -> inspect_service with service="nginx"
+- "inspect my service" -> clarification
+""".strip()
+
+    try:
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            options={"num_ctx": 2048, "temperature": 0.0},
+        )
+    except Exception as e:
+        logger.warning(f"[IntentClassifier] LLM fallback failed: {e}")
+        return None
+
+    payload = _extract_json_object(response.get("message", {}).get("content", ""))
+    if not payload:
+        return None
+
+    decision = (payload.get("decision") or "none").strip().lower()
+    confidence = (payload.get("confidence") or "low").strip().lower()
+    if confidence not in {"low", "medium", "high"}:
+        confidence = "low"
+
+    if decision == "clarification":
+        clarification = _normalize_text(payload.get("clarification")).strip()
+        if clarification:
+            return {
+                "decision": "clarification",
+                "clarification": clarification,
+                "confidence": confidence,
+            }
+        return None
+
+    if decision != "tool":
+        return None
+
+    tool_name = _normalize_text(payload.get("tool_name")).strip()
+    tool_args = payload.get("tool_args") if isinstance(payload.get("tool_args"), dict) else {}
+    allowed_tools = {
+        "verify_system",
+        "assess_host_risk",
+        "check_suspicious_activity",
+        "check_failed_services",
+        "check_updates",
+        "scan_host_vulnerabilities",
+        "show_processes",
+        "show_listening_ports",
+        "check_auth_events",
+        "inspect_service",
+    }
+    if tool_name not in allowed_tools:
+        return None
+
+    if tool_name == "inspect_service":
+        service_name = _normalize_text(tool_args.get("service")).strip()
+        if not service_name:
+            return None
+        tool_args = {"service": service_name}
+
+    return {
+        "decision": "tool",
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "confidence": confidence,
+    }
 
 
 def extract_operational_tool_request(query: str) -> dict | None:
@@ -861,6 +1050,13 @@ def extract_operational_tool_request(query: str) -> dict | None:
         "show security updates", "check security updates", "what packages need updates",
     )):
         return {"tool_name": "check_updates", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
+        "assess host risk", "assess my host risk", "overall host risk",
+        "what should i investigate on this host", "what is the biggest risk on this system",
+        "summarize host risk", "show host risk",
+    )):
+        return {"tool_name": "assess_host_risk", "tool_args": {}}
 
     if any(phrase in lower for phrase in (
         "install security updates", "apply security updates", "patch my system",
@@ -1386,6 +1582,166 @@ def _record_query(query, response, intent, elapsed, sources_used=0, confidence=N
         )
     except Exception as _dbe:
         logger.warning(f"[DB] save_query failed: {_dbe}")
+
+
+def _resolve_controlled_query(query, *, controlled_route=None, prior_messages=None):
+    controlled_route = controlled_route or _route_query(query)
+
+    direct_action = _resolve_direct_action_query(query)
+    if direct_action:
+        if direct_action["kind"] == "command":
+            return {
+                "type": "command",
+                "intent": "command",
+                "response": direct_action["response"],
+                "result": _build_command_response(direct_action["result"]),
+                "raw_result": direct_action["result"],
+                "sources_used": 0,
+            }
+        return {
+            "type": "knowledge",
+            "intent": "knowledge",
+            "response": direct_action["response"],
+            "confidence": direct_action.get("confidence", "high"),
+            "sources_used": 0,
+        }
+
+    if controlled_route.intent == "troubleshooting":
+        resolved = _resolve_troubleshooting_response(query)
+        return {
+            "type": "knowledge",
+            "intent": "troubleshooting",
+            "response": resolved["response"],
+            "confidence": resolved["confidence"],
+            "sources_used": resolved["sources_used"],
+        }
+
+    if controlled_route.intent == "architecture":
+        resolved = _resolve_architecture_response(query)
+        return {
+            "type": "diagram" if resolved["response_mode"] == "diagram" else "knowledge",
+            "intent": "architecture",
+            "response": resolved["response"],
+            "confidence": resolved["confidence"],
+            "sources_used": resolved["sources_used"],
+        }
+
+    if controlled_route.intent == "follow_up":
+        resolved = _resolve_follow_up_response(query)
+        return {
+            "type": "knowledge",
+            "intent": "follow_up",
+            "response": resolved["response"],
+            "confidence": resolved["confidence"],
+            "sources_used": resolved["sources_used"],
+        }
+
+    if controlled_route.intent == "comparison":
+        resolved = _resolve_comparison_response(query)
+        return {
+            "type": "knowledge",
+            "intent": "comparison",
+            "response": resolved["response"],
+            "confidence": resolved["confidence"],
+            "sources_used": resolved["sources_used"],
+        }
+
+    if controlled_route.intent == "definition":
+        resolved = _resolve_definition_response(query)
+        return {
+            "type": "knowledge",
+            "intent": "definition",
+            "response": resolved["response"],
+            "confidence": resolved["confidence"],
+            "sources_used": resolved["sources_used"],
+        }
+
+    if _is_healing_query(query) or detect_query_intent(query) == "healing_incident":
+        response, healing_meta = _build_healing_response(query)
+        return {
+            "type": "healing",
+            "intent": "healing_incident",
+            "response": response,
+            "confidence": "high",
+            "sources_used": 0,
+            "healing": healing_meta,
+            "action_taken": healing_meta.get("action_taken"),
+        }
+
+    if is_greeting(query):
+        return {
+            "type": "knowledge",
+            "intent": "greeting",
+            "response": "Hello! I'm AVA, your local DevOps AI assistant. How can I help you today with infrastructure, containers, or cloud services?",
+            "sources_used": 0,
+        }
+
+    if controlled_route.intent == "ava_self":
+        return {
+            "type": "knowledge",
+            "intent": "ava_self",
+            "response": _resolve_ava_self_response(query),
+            "confidence": "high",
+            "sources_used": 0,
+        }
+
+    if _should_direct_unknown_to_llm(query, route=controlled_route) and not looks_like_operational_request(query):
+        resolved = _resolve_general_unknown_response(query, prior_messages=prior_messages, route=controlled_route)
+        return {
+            "type": "knowledge",
+            "intent": "general",
+            "response": resolved["response"],
+            "confidence": resolved["confidence"],
+            "sources_used": resolved["sources_used"],
+        }
+
+    return None
+
+
+def _resolve_grounded_knowledge_query(query, *, prior_messages=None):
+    query_intent = detect_query_intent(query)
+    context = query_knowledge_base(query, query_intent=query_intent)
+    confidence = score_context_confidence(context, query)
+    confidence = _apply_confidence_rules(confidence, context, query)
+    response = generate_response(query, context, confidence=confidence, prior_messages=prior_messages)
+    if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
+        response = _repair_definition_wrapper(response)
+
+    if context and len(context) < 2 and is_weak_response(response):
+        logger.info("[FAILSAFE] Weak response - retrying with extended retrieval...")
+        retry_chunks = hybrid_retriever.query(
+            query_text=query,
+            n_policies=6,
+            n_blogs=10,
+            blog_min_relevance=0.001,
+            format_for_llm=False
+        )
+        if retry_chunks:
+            retry_context = hybrid_retriever.assemble_context(
+                retry_chunks, max_articles=5, max_chunks_per_article=4
+            )
+            retry_confidence = score_context_confidence(retry_context, query)
+            retry_confidence = _apply_confidence_rules(retry_confidence, retry_context, query)
+            response = generate_response(query, retry_context, confidence=retry_confidence, prior_messages=prior_messages)
+            if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
+                response = _repair_definition_wrapper(response)
+            context = retry_context
+            confidence = retry_confidence
+            logger.info("[FAILSAFE] Retry complete")
+
+    if is_technical_query(query) and not is_weak_response(response):
+        update_memory_issue(query, response[:200])
+        logger.info("[MEMORY] Issue saved to ava_memory.json")
+
+    return {
+        "type": "knowledge",
+        "intent": "knowledge",
+        "response": response,
+        "confidence": confidence,
+        "sources_used": len(context),
+        "context": context,
+        "query_intent": query_intent,
+    }
 
 def _normalize_fact_key(label):
     return re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
@@ -2600,63 +2956,26 @@ def ask():
 
             for idx, q in enumerate(questions, 1):
                 logger.info(f"[{idx}/{len(questions)}] Processing: {q}")
-                q_context = []
-                q_direct = _resolve_direct_action_query(q)
-                if q_direct:
-                    if q_direct["kind"] == "command":
-                        combined_results.append({
-                            "number": idx,
-                            "question": q,
-                            "type": "command",
-                            "result": _build_command_response(q_direct["result"]),
-                        })
-                    else:
-                        combined_results.append({
-                            "number": idx,
-                            "question": q,
-                            "type": "knowledge",
-                            "response": q_direct["response"],
-                        })
-                    continue
-
                 q_route = _route_query(q)
-                if q_route.intent == "ava_self":
-                    q_response = _resolve_ava_self_response(q)
-                elif q_route.intent == "troubleshooting":
-                    q_resolved = _resolve_troubleshooting_response(q)
-                    q_response = q_resolved["response"]
-                    total_sources += q_resolved["sources_used"]
-                elif q_route.intent == "architecture":
-                    q_resolved = _resolve_architecture_response(q)
-                    q_response = q_resolved["response"]
-                    total_sources += q_resolved["sources_used"]
-                elif q_route.intent == "follow_up":
-                    q_resolved = _resolve_follow_up_response(q)
-                    q_response = q_resolved["response"]
-                    total_sources += q_resolved["sources_used"]
-                elif q_route.intent == "comparison":
-                    q_resolved = _resolve_comparison_response(q)
-                    q_response = q_resolved["response"]
-                    total_sources += q_resolved["sources_used"]
-                elif q_route.intent == "definition":
-                    q_resolved = _resolve_definition_response(q)
-                    q_response = q_resolved["response"]
-                    total_sources += q_resolved["sources_used"]
-                elif _should_direct_unknown_to_llm(q, route=q_route) and not looks_like_operational_request(q):
-                    q_resolved = _resolve_general_unknown_response(q, route=q_route)
-                    q_response = q_resolved["response"]
-                    total_sources += q_resolved["sources_used"]
-                else:
-                    q_context = query_knowledge_base(q, query_intent=detect_query_intent(q))
-                    total_sources += len(q_context)
-                    q_response = generate_response(q, q_context, confidence=score_context_confidence(q_context, q))
+                q_resolved = _resolve_controlled_query(q, controlled_route=q_route)
+                if not q_resolved:
+                    q_resolved = _resolve_grounded_knowledge_query(q)
 
-                combined_results.append({
-                    "number": idx,
-                    "question": q,
-                    "type": "knowledge",
-                    "response": q_response,
-                })
+                total_sources += q_resolved.get("sources_used", 0)
+                if q_resolved["type"] == "command":
+                    combined_results.append({
+                        "number": idx,
+                        "question": q,
+                        "type": "command",
+                        "result": q_resolved["result"],
+                    })
+                else:
+                    combined_results.append({
+                        "number": idx,
+                        "question": q,
+                        "type": q_resolved["type"],
+                        "response": q_resolved["response"],
+                    })
 
             elapsed = time.time() - start_time
             save_history({
@@ -2674,11 +2993,12 @@ def ask():
                 results=combined_results,
             ))
 
-        direct_action = _resolve_direct_action_query(query)
-        if direct_action:
+        prior_messages = _get_recent_prior_messages(n=2) if _should_direct_unknown_to_llm(query, route=controlled_route) and not looks_like_operational_request(query) else None
+        controlled_resolved = _resolve_controlled_query(query, controlled_route=controlled_route, prior_messages=prior_messages)
+        if controlled_resolved:
             elapsed = time.time() - start_time
-            if direct_action["kind"] == "command":
-                result = direct_action["result"]
+            if controlled_resolved["type"] == "command":
+                result = controlled_resolved["raw_result"]
                 save_history({
                     'timestamp': datetime.now().isoformat(),
                     'query': query,
@@ -2687,140 +3007,31 @@ def ask():
                     'time_taken': f"{elapsed:.2f}s"
                 })
                 return jsonify(_chat_payload(
-                    direct_action["response"],
+                    controlled_resolved["response"],
                     response_type='command',
                     time_taken=f"{elapsed:.2f}s",
-                    result=_build_command_response(result),
+                    result=controlled_resolved["result"],
                 ))
 
-            _record_query(query, direct_action["response"], "knowledge", elapsed, confidence=direct_action.get("confidence", "high"))
+            _record_query(
+                query,
+                controlled_resolved["response"],
+                controlled_resolved["intent"],
+                elapsed,
+                sources_used=controlled_resolved.get("sources_used", 0),
+                confidence=controlled_resolved.get("confidence"),
+            )
             return jsonify(_chat_payload(
-                direct_action["response"],
-                response_type='knowledge',
-                confidence=direct_action.get("confidence", "high"),
+                controlled_resolved["response"],
+                response_type=controlled_resolved["type"],
+                confidence=controlled_resolved.get("confidence"),
+                sources_used=controlled_resolved.get("sources_used", 0),
                 time_taken=f"{elapsed:.2f}s",
-            ))
-
-        if controlled_route.intent == "troubleshooting":
-            resolved = _resolve_troubleshooting_response(query)
-            response = resolved["response"]
-            elapsed = time.time() - start_time
-            _record_query(query, response, "troubleshooting", elapsed, sources_used=resolved["sources_used"], confidence=resolved["confidence"])
-            return jsonify(_chat_payload(
-                response,
-                response_type="knowledge",
-                confidence=resolved["confidence"],
-                sources_used=resolved["sources_used"],
-                time_taken=f"{elapsed:.2f}s",
-            ))
-
-        if controlled_route.intent == "architecture":
-            resolved = _resolve_architecture_response(query)
-            response = resolved["response"]
-            elapsed = time.time() - start_time
-            response_type = "diagram" if resolved["response_mode"] == "diagram" else "knowledge"
-            _record_query(query, response, "architecture", elapsed, sources_used=resolved["sources_used"], confidence=resolved["confidence"])
-            return jsonify(_chat_payload(
-                response,
-                response_type=response_type,
-                confidence=resolved["confidence"],
-                sources_used=resolved["sources_used"],
-                time_taken=f"{elapsed:.2f}s",
-            ))
-
-        if controlled_route.intent == "follow_up":
-            resolved = _resolve_follow_up_response(query)
-            response = resolved["response"]
-            elapsed = time.time() - start_time
-            _record_query(query, response, "follow_up", elapsed, sources_used=resolved["sources_used"], confidence=resolved["confidence"])
-            return jsonify(_chat_payload(
-                response,
-                response_type="knowledge",
-                confidence=resolved["confidence"],
-                sources_used=resolved["sources_used"],
-                time_taken=f"{elapsed:.2f}s",
-            ))
-
-        if controlled_route.intent == "comparison":
-            resolved = _resolve_comparison_response(query)
-            response = resolved["response"]
-            elapsed = time.time() - start_time
-            _record_query(query, response, "comparison", elapsed, sources_used=resolved["sources_used"], confidence=resolved["confidence"])
-            return jsonify(_chat_payload(
-                response,
-                response_type="knowledge",
-                confidence=resolved["confidence"],
-                sources_used=resolved["sources_used"],
-                time_taken=f"{elapsed:.2f}s",
-            ))
-
-        if controlled_route.intent == "definition":
-            resolved = _resolve_definition_response(query)
-            response = resolved["response"]
-            elapsed = time.time() - start_time
-            _record_query(query, response, "definition", elapsed, sources_used=resolved["sources_used"], confidence=resolved["confidence"])
-            return jsonify(_chat_payload(
-                response,
-                response_type="knowledge",
-                confidence=resolved["confidence"],
-                sources_used=resolved["sources_used"],
-                time_taken=f"{elapsed:.2f}s",
-            ))
-
-        if _is_healing_query(query) or detect_query_intent(query) == "healing_incident":
-            response, healing_meta = _build_healing_response(query)
-            elapsed = time.time() - start_time
-            _record_query(query, response, "healing_incident", elapsed, confidence="high")
-            return jsonify(_chat_payload(
-                response,
-                response_type="healing",
-                confidence="high",
-                time_taken=f"{elapsed:.2f}s",
-                healing=healing_meta,
-                action_taken=healing_meta.get("action_taken"),
-            ))
-        
-        # Handle greetings
-        if is_greeting(query):
-            response = "Hello! I'm AVA, your local DevOps AI assistant. How can I help you today with infrastructure, containers, or cloud services?"
-            elapsed = time.time() - start_time
-            
-            save_history({
-                'timestamp': datetime.now().isoformat(),
-                'query': query,
-                'type': 'greeting',
-                'time_taken': f"{elapsed:.2f}s"
-            })
-            
-            return jsonify(_chat_payload(
-                response,
-                response_type='knowledge',
-                time_taken=f"{elapsed:.2f}s"
-            ))
-
-        if controlled_route.intent == "ava_self":
-            response = _resolve_ava_self_response(query)
-            elapsed = time.time() - start_time
-            _record_query(query, response, "ava_self", elapsed, confidence="high")
-            return jsonify(_chat_payload(
-                response,
-                response_type="knowledge",
-                confidence="high",
-                time_taken=f"{elapsed:.2f}s",
-            ))
-
-        if _should_direct_unknown_to_llm(query, route=controlled_route) and not looks_like_operational_request(query):
-            prior_messages = _get_recent_prior_messages(n=2)
-            resolved = _resolve_general_unknown_response(query, prior_messages=prior_messages, route=controlled_route)
-            response = resolved["response"]
-            elapsed = time.time() - start_time
-            _record_query(query, response, "general", elapsed, confidence=resolved["confidence"])
-            return jsonify(_chat_payload(
-                response,
-                response_type="knowledge",
-                confidence=resolved["confidence"],
-                sources_used=resolved["sources_used"],
-                time_taken=f"{elapsed:.2f}s",
+                **{
+                    key: controlled_resolved[key]
+                    for key in ("healing", "action_taken")
+                    if key in controlled_resolved
+                }
             ))
         
         # ── Phase 4: Command Graph — deterministic diagnostics ──────────────
@@ -2966,53 +3177,18 @@ def ask():
             ))
         # ── End ReAct Loop ──────────────────────────────────────────────────
 
-        # Final fallback: knowledge/exact answer path only.
         logger.info("[*] Searching knowledge base...")
-        query_intent = detect_query_intent(query)
-        context = query_knowledge_base(query, query_intent=query_intent)
-        logger.info(f"[*] Found {len(context)} relevant chunks")
-
-        # Phase 4.5: Score context confidence before generating
-        confidence = score_context_confidence(context, query)
-        confidence = _apply_confidence_rules(confidence, context, query)
-        logger.info(f"[*] Context confidence: {confidence}")
-        logger.info(f"[*] Thinking with {LLM_MODEL}...")
-
-        # Phase 5B: load recent conversation history for multi-turn context
         prior_messages = _get_recent_prior_messages(n=3)
         if prior_messages:
             logger.info(f"[MultiTurn] Injecting {len(prior_messages) // 2} prior turns")
-
-        response = generate_response(query, context, confidence=confidence, prior_messages=prior_messages)
-        if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
-            response = _repair_definition_wrapper(response)
-
-        # Phase 3: Fail-safe retry
-        if context and len(context) < 2 and is_weak_response(response):
-            logger.info("[FAILSAFE] Weak response - retrying with extended retrieval...")
-            retry_chunks = hybrid_retriever.query(
-                query_text=query,
-                n_policies=6,
-                n_blogs=10,
-                blog_min_relevance=0.001,
-                format_for_llm=False
-            )
-            if retry_chunks:
-                retry_context = hybrid_retriever.assemble_context(
-                    retry_chunks, max_articles=5, max_chunks_per_article=4
-                )
-                retry_confidence = score_context_confidence(retry_context, query)
-                retry_confidence = _apply_confidence_rules(retry_confidence, retry_context, query)
-                response = generate_response(query, retry_context, confidence=retry_confidence, prior_messages=prior_messages)
-                if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
-                    response = _repair_definition_wrapper(response)
-                confidence = retry_confidence
-                logger.info("[FAILSAFE] Retry complete")
-
-        # Pending 3: Memory auto-update — persist resolved issues
-        if is_technical_query(query) and not is_weak_response(response):
-            update_memory_issue(query, response[:200])
-            logger.info("[MEMORY] Issue saved to ava_memory.json")
+        grounded_resolved = _resolve_grounded_knowledge_query(query, prior_messages=prior_messages)
+        response = grounded_resolved["response"]
+        confidence = grounded_resolved["confidence"]
+        context = grounded_resolved["context"]
+        query_intent = grounded_resolved["query_intent"]
+        logger.info(f"[*] Found {len(context)} relevant chunks")
+        logger.info(f"[*] Context confidence: {confidence}")
+        logger.info(f"[*] Thinking with {LLM_MODEL}...")
 
         # Phase 4.5: Update live stats counters
         STATS['query_count'] += 1
@@ -3023,32 +3199,7 @@ def ask():
 
         elapsed = time.time() - start_time
 
-        save_history({
-            'timestamp': datetime.now().isoformat(),
-            'query': query,
-            'type': 'knowledge',
-            'sources_used': len(context),
-            'time_taken': f"{elapsed:.2f}s",
-            'response_preview': response[:200] + '...' if len(response) > 200 else response
-        })
-
-        # Phase 5B: persist to SQLite for multi-turn retrieval
-        # Strip confidence prefix so it doesn't compound on future turns
-        try:
-            clean_response = response
-            for prefix in _CONFIDENCE_PREFIXES.values():
-                if clean_response.startswith(prefix):
-                    clean_response = clean_response[len(prefix):]
-                    break
-            db.save_query(
-                query=query,
-                response=clean_response,
-                confidence=confidence,
-                intent=query_intent,
-                sources_used=len(context),
-            )
-        except Exception as _dbe:
-            logger.warning(f"[DB] save_query failed: {_dbe}")
+        _record_query(query, response, "knowledge", elapsed, sources_used=len(context), confidence=confidence)
 
         return jsonify(_chat_payload(
             response,
@@ -5951,6 +6102,7 @@ HTML_TEMPLATE = r'''
             const newListeners = Array.isArray(metadata.new_listeners) ? metadata.new_listeners : [];
             const newFailedServices = Array.isArray(metadata.new_failed_services) ? metadata.new_failed_services : [];
             const authFailureDelta = Number(metadata.auth_failure_delta || 0);
+            const correlatedAssessment = metadata.correlated_assessment && typeof metadata.correlated_assessment === 'object' ? metadata.correlated_assessment : null;
             const primaryConcern = metadata.primary_concern && typeof metadata.primary_concern === 'object' ? metadata.primary_concern : null;
 
             const renderStringList = (title, items) => {
@@ -5989,6 +6141,35 @@ HTML_TEMPLATE = r'''
                 </div>`;
             };
 
+            const renderCorrelatedAssessment = (assessment) => {
+                if (!assessment || !assessment.title) return '';
+                const severity = escapeHtml(String(assessment.severity || 'unknown'));
+                const confidence = escapeHtml(String(assessment.confidence || 'medium'));
+                const evidence = Array.isArray(assessment.evidence) ? assessment.evidence.slice(0, 3) : [];
+                const nextAction = safeString(assessment.next_action || '');
+                const summary = safeString(assessment.summary || '');
+                const evidenceHtml = evidence.length
+                    ? `<ul class="findings-list">${evidence.map(item => `<li class="findings-item">${escapeHtml(String(item))}</li>`).join('')}</ul>`
+                    : '';
+                const actionButton = nextAction
+                    ? `<div class="findings-actions">
+                        <button class="findings-action-btn" data-prompt="${encodeURIComponent(nextAction)}" onclick="submitSuggestedPrompt(this)">Run next action</button>
+                    </div>`
+                    : '';
+                return `<div class="findings-panel primary-concern-panel">
+                    <div class="findings-label">Correlated assessment</div>
+                    <div class="findings-item-title">${escapeHtml(String(assessment.title))}</div>
+                    <div class="status-card-meta" style="margin: 10px 0 8px 0;">
+                        <span class="status-chip">Severity: ${severity}</span>
+                        <span class="status-chip">Confidence: ${confidence}</span>
+                    </div>
+                    ${summary ? `<div class="findings-item-copy" style="margin-bottom: 10px;">${escapeHtml(summary)}</div>` : ''}
+                    ${evidenceHtml}
+                    ${nextAction ? `<div class="findings-item-copy" style="margin-top: 10px;">Next action: ${escapeHtml(nextAction)}</div>` : ''}
+                    ${actionButton}
+                </div>`;
+            };
+
             const renderCandidateList = (title, items) => {
                 if (!items.length) return '';
                 const rows = items.map(item => {
@@ -6020,6 +6201,7 @@ HTML_TEMPLATE = r'''
 
             const renderMetadataPanels = () => {
                 const panels = [
+                    renderCorrelatedAssessment(correlatedAssessment),
                     renderPrimaryConcern(primaryConcern),
                     renderStringList('Alerts', alerts),
                     renderStringList('Suggested actions', suggestedActions),

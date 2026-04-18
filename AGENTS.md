@@ -145,6 +145,68 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
 - Timestamp:
   - 2026-04-18 Asia/Calcutta
 - Latest changes made:
+  - Refactored `/ask` so the main serving path now uses one canonical controlled-query resolver plus one canonical grounded-knowledge resolver instead of repeating similar routing logic in multiple places
+  - Added `_resolve_controlled_query(...)` in `web_agent_v2.1_guardrail.py` to unify:
+    - direct action execution
+    - troubleshooting
+    - architecture
+    - follow-up
+    - comparison
+    - definition
+    - healing
+    - greeting
+    - AVA self
+    - direct general-Qwen answers
+  - Added `_resolve_grounded_knowledge_query(...)` in `web_agent_v2.1_guardrail.py` to unify:
+    - KB retrieval
+    - confidence scoring
+    - failsafe retry
+    - memory update
+  - Multi-question handling now uses the same canonical resolver path as single-question handling for controlled and grounded responses
+  - Removed duplicate final-path persistence logic so the canonical query recorder owns that path instead of `/ask` doing it again
+  - Added a new low-risk `assess_host_risk` tool in `control/tool_registry.py`
+  - `assess_host_risk` combines:
+    - suspicious-activity assessment
+    - runtime vulnerability scan
+    - package update posture
+  - Added cross-domain host-risk correlation so AVA can connect runtime CVEs with drift signals such as:
+    - high-priority CVEs + new listeners/auth drift
+    - vulnerable runtime + new failed services
+  - Added deterministic routing for host-risk phrasing such as:
+    - `what should I investigate on this host`
+    - `what is the biggest risk on this system`
+    - `assess host risk`
+  - Extended the operational-intent classifier allowlist/examples to understand the host-risk path without giving the model routing ownership
+  - Added regression coverage for host-risk correlation and host-risk routing in `tests/intelligence_regression.py`
+  - Added cross-signal correlation in `control/tool_registry.py` for suspicious-activity analysis so AVA can combine aligned signals into one operator assessment instead of leaving the user to connect them manually
+  - Added a structured `correlated_assessment` object with:
+    - title
+    - severity
+    - evidence
+    - next action
+    - confidence
+    - signal list
+    - summary
+  - Correlated cases currently recognized:
+    - auth-failure increase + new listener
+    - new listener + suspicious process activity
+    - auth-failure increase + service drift
+    - broader multi-signal alignment in the same snapshot
+  - Added correlated-assessment rendering in `web_agent_v2.1_guardrail.py` so the Linux operator card can show that combined story directly in chat
+  - Added regression coverage for the new correlation helper in `tests/intelligence_regression.py`
+  - Added a narrow hybrid operational-intent fallback in `web_agent_v2.1_guardrail.py` so AVA can classify missed natural-language operational requests before they fall through to generic knowledge
+  - Constrained that fallback to an allowlist of existing tools only:
+    - `verify_system`
+    - `check_suspicious_activity`
+    - `check_failed_services`
+    - `check_updates`
+    - `scan_host_vulnerabilities`
+    - `show_processes`
+    - `show_listening_ports`
+    - `check_auth_events`
+    - `inspect_service`
+  - Added JSON extraction and gating helpers so the classifier only runs when deterministic self/memory/architecture/comparison/definition, explicit command, deterministic operational extraction, and vague-diagnostic clarification all miss first
+  - Added regression coverage for the hybrid classifier path in `tests/intelligence_regression.py`
   - Fixed vague diagnostic queries so AVA now clarifies instead of queuing meaningless approvals:
     - `find problems`
     - `find issues`
@@ -264,6 +326,19 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - Added regression coverage for the new Linux operator phrases
   - `AGENTS.md` updated to reflect current serving-contract state
 - Root causes investigated:
+  - The main `/ask` route still had duplicated execution/response logic for single-question and multi-question handling
+  - Controlled responses and grounded-knowledge fallback were being resolved in parallel but separately, which made the serving contract harder to trust and harder to extend
+  - There was also duplicate persistence behavior in the final knowledge path
+  - Before deeper host/knowledge/remediation work, the core contract needed one canonical resolution path so new capabilities stop multiplying branch complexity
+  - Correlation existed only inside suspicious-activity analysis, so AVA still treated CVEs and runtime drift as separate stories
+  - That meant the assistant could say “you have high CVEs” and separately “you have suspicious drift,” but not “this vulnerable runtime is also showing exposure changes, so this is the thing to investigate first”
+  - A broader host-risk judgment layer was needed, but it needed to remain explicit and low-risk instead of silently making every suspicious check more expensive
+  - Suspicious-activity output was still mostly a bag of findings plus a ranked concern, which meant AVA could detect signals but not explain when multiple signals reinforced each other
+  - That left too much operator work on the user: AVA surfaced auth drift, listeners, and service changes separately, but not the combined meaning of those signals
+  - To make AVA worth existing, the system needed a correlation layer on top of tool outputs rather than more isolated tools or more phrasing rules
+  - Deterministic operational routing improved safety, but phrase coverage was still growing linearly and left a gap for natural-language operational requests that were neither explicit commands nor known hardcoded phrasings
+  - When those requests missed deterministic extraction, they fell through to generic knowledge behavior even though the user intent was operational
+  - The correct serving-contract fix was not more patterns; it was a narrow fallback that lets AVA choose from a fixed tool set without giving the model ownership of routing truth or security policy
   - Vague diagnostic intent without a concrete target had no first-class clarification path
   - `find problems` / `find issues` leaked specifically because `find` is a raw-command starter and raw extraction was running before vague-diagnostic clarification
   - Linux operator routing was losing to controlled troubleshooting/knowledge branches because operational execution happened too late in `/ask`
@@ -272,6 +347,37 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - Some Linux tools assumed a systemd host, but AVA currently runs inside a non-systemd container
   - `inspect_process` surfaced raw `ps` failure text instead of turning it into a user-facing diagnosis
 - Outcome verified:
+  - Live `/ask` behavior still works after the structural unification:
+    - `show running processes, show listening ports, check ssh failures` -> `type: "multi"` with 3 results
+    - `look for suspicious activity` -> command path
+    - `what should I investigate on this host` -> `tool:assess_host_risk`
+    - `what is kubernetes` -> knowledge path
+  - Regression suite remains green with 207 checks after the unification refactor
+  - `py_compile` passed and AVA rebuilt successfully after the refactor
+  - `what should I investigate on this host` now routes to `tool:assess_host_risk`
+  - That response includes both:
+    - `primary_concern`
+    - `correlated_assessment`
+  - Live response now explicitly says:
+    - `Patch exposure and runtime drift are both elevated`
+  - `what is kubernetes` still stays on the knowledge path after the host-risk addition
+  - Regression suite now passes with 207 checks after host-risk coverage was added
+  - Synthetic correlation verification now produces a structured combined assessment:
+    - auth-failure spike + new listener -> `Authentication pressure and new network exposure detected together`
+    - that correlated assessment also becomes the primary concern when it outranks single-signal findings
+  - Chat cards can now render `Correlated assessment` alongside `Primary concern`
+  - Regression suite now passes with 204 checks after adding correlation coverage
+  - Live AVA smoke checks still behave correctly after rebuild:
+    - `is anything suspicious on this system` -> command path
+    - `look for suspicious activity` -> command path
+    - `what is kubernetes` -> knowledge path
+  - Live hybrid-fallback queries now route correctly:
+    - `look for suspicious activity` -> executes `check_suspicious_activity`
+    - `check if my machine needs patching` -> executes `check_updates`
+    - `can you inspect nginx service health` -> executes `inspect_service:nginx`
+    - `inspect my service` -> clarification instead of approval/knowledge drift
+    - `what is kubernetes` -> remains knowledge, not operational
+  - Regression suite now passes with 202 checks after adding hybrid-classifier coverage
   - `find problems`, `find issues`, `check stuff`, and `something is wrong` now return clarification with suggested check paths instead of approval
   - Existing behavior stayed intact for:
     - `restart my pod` -> asks for deployment name
@@ -296,12 +402,16 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - Preserve one strict serving contract where AVA chooses the answer mode before any response is produced
   - Keep deterministic/self/security paths invisible and consistent for the user
   - Expand coverage without reintroducing stitched-together routing behavior
-  - Shift AVA from “tool wrapper” toward operator intelligence by ranking findings, naming the top concern, and recommending the next best action
-  - Reduce meaningless approval prompts when the user intent is diagnostic but underspecified
+  - Keep new capabilities flowing through the canonical controlled-query and grounded-knowledge resolvers
+  - Shift AVA from “tool wrapper” toward operator intelligence by ranking findings, correlating aligned signals across domains, naming the top concern, and recommending the next best action
+  - Reduce meaningless approval prompts when the user intent is diagnostic or operational but underspecified
+  - Keep model reasoning constrained to classification/correlation tasks instead of letting it own execution truth
 - Next steps:
   - Improve the weakest knowledge-answer cases
-  - Replace more pattern-heavy operational routing with a hybrid intent-classifier path instead of continuing phrase explosion
-  - Add cross-signal reasoning so AVA correlates multiple Linux/operator signals before choosing the top concern
+  - Expand the hybrid classifier carefully to additional high-value operational phrasings without replacing deterministic safety/identity routes
+  - Expand host-risk reasoning further into process/service inspection outputs so AVA can escalate from “top risk” to “likely root cause path”
+  - Normalize result schema further across command, knowledge, multi, and analysis-heavy paths so UI rendering does not depend on path-specific assumptions
+  - Tighten approval/state handling around the remaining non-canonical branches such as command graph and ReAct if they continue to coexist
   - Expand baseline/history-aware comparisons further to high-risk processes and service health over time (process ancestry, unusual CPU bursts)
   - Add richer service/process remediation guidance tied to actual findings
   - Add richer remediation actions from findings beyond package prompts, including stronger service/process follow-ups
