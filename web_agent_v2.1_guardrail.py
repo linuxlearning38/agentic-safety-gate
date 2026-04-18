@@ -557,6 +557,15 @@ def _resolve_direct_action_query(query: str) -> dict | None:
             "response": _command_response_text(blocked_result),
         }
 
+    # Vague diagnostics like "find problems" must clarify before raw command
+    # extraction, otherwise "find" is treated as a shell command starter.
+    if _is_vague_diagnostic_query(query):
+        return {
+            "kind": "knowledge",
+            "response": _build_vague_diagnostic_clarification(),
+            "confidence": "high",
+        }
+
     explicit_command = extract_explicit_command_request(query)
     if explicit_command:
         result = execute_tool_safe(
@@ -654,6 +663,49 @@ def looks_like_operational_request(query: str) -> bool:
         return False
 
     return any(term in q for term in target_terms)
+
+
+def _is_vague_diagnostic_query(query: str) -> bool:
+    q = _normalize_user_query(query).strip().lower()
+    if not q:
+        return False
+
+    if extract_operational_tool_request(q):
+        return False
+    if extract_operational_clarification(q):
+        return False
+    if q.startswith(_LEARNING_PREFIXES):
+        return False
+
+    exact_matches = {
+        "find problems",
+        "find issues",
+        "find bugs",
+        "find something",
+        "check stuff",
+        "check things",
+        "something is wrong",
+        "something broke",
+        "look for issues",
+        "diagnose",
+        "troubleshoot",
+    }
+    if q in exact_matches:
+        return True
+
+    return q in {"what is wrong", "what's wrong"} or q.startswith("what is wrong ") or q.startswith("what's wrong ")
+
+
+def _build_vague_diagnostic_clarification() -> str:
+    return (
+        "I can check for problems in several ways. Try one of these:\n\n"
+        "'is anything suspicious on this system' (security check)\n"
+        "'verify my system' (health check: disk, memory, docker, containers)\n"
+        "'check failed services' (failed services check)\n"
+        "'scan my system for vulnerabilities' (CVE check)\n"
+        "'show running processes' (process list)\n\n"
+        "What kind of check would you like?"
+    )
 
 
 def extract_operational_tool_request(query: str) -> dict | None:
