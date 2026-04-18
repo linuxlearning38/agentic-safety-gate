@@ -2,6 +2,7 @@ import ast
 import importlib.util
 import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -60,6 +61,9 @@ FUNCTIONS = {
     "looks_like_operational_request",
     "_is_vague_diagnostic_query",
     "_build_vague_diagnostic_clarification",
+    "_extract_json_object",
+    "_should_try_operational_intent_classifier",
+    "_classify_operational_intent_with_llm",
     "extract_operational_tool_request",
     "extract_operational_clarification",
     "detect_multiple_questions",
@@ -181,6 +185,23 @@ class FakeHybridRetriever:
 class FakeOllama:
     def chat(self, model, messages, options=None):
         prompt = messages[-1]["content"].lower()
+        if "ava's operational intent classifier" in messages[0]["content"].lower():
+            classifier_query = prompt.split("allowed tools:", 1)[0]
+            if "do i have any failed services" in classifier_query:
+                answer = '{"decision":"tool","tool_name":"check_failed_services","tool_args":{},"clarification":"","confidence":"high"}'
+            elif "what should i investigate on this host" in classifier_query:
+                answer = '{"decision":"tool","tool_name":"assess_host_risk","tool_args":{},"clarification":"","confidence":"high"}'
+            elif "look for suspicious activity" in classifier_query:
+                answer = '{"decision":"tool","tool_name":"check_suspicious_activity","tool_args":{},"clarification":"","confidence":"high"}'
+            elif "check if my machine needs patching" in classifier_query:
+                answer = '{"decision":"tool","tool_name":"check_updates","tool_args":{},"clarification":"","confidence":"medium"}'
+            elif "can you inspect nginx service health" in classifier_query:
+                answer = '{"decision":"tool","tool_name":"inspect_service","tool_args":{"service":"nginx"},"clarification":"","confidence":"high"}'
+            elif "inspect my service" in classifier_query:
+                answer = '{"decision":"clarification","tool_name":"","tool_args":{},"clarification":"I can inspect a service, but I need the service name. Example: inspect service nginx.","confidence":"high"}'
+            else:
+                answer = '{"decision":"none","tool_name":"","tool_args":{},"clarification":"","confidence":"low"}'
+            return {"message": {"content": answer}}
         if "capital of france" in prompt:
             answer = "Paris is the capital of France."
         elif "2+2" in prompt:
@@ -286,7 +307,15 @@ def check(name, condition):
 
 
 def main():
+    sys.path.insert(0, str(SOURCE.parent))
     ns = load_helpers()
+    tool_registry_spec = importlib.util.spec_from_file_location(
+        "ava_tool_registry",
+        SOURCE.parent / "control" / "tool_registry.py",
+    )
+    tool_registry = importlib.util.module_from_spec(tool_registry_spec)
+    assert tool_registry_spec and tool_registry_spec.loader
+    tool_registry_spec.loader.exec_module(tool_registry)
     fake_db = ns["db"]
     memory_key = ns["_MEMORY_FACT_KEY"]
 
@@ -430,6 +459,39 @@ def main():
     check("raw command not treated as vague", ns["_is_vague_diagnostic_query"]("run date") is False)
     check("destructive command not treated as vague", ns["_is_vague_diagnostic_query"]("rm -rf /") is False)
     check("vague diagnostic clarification includes suspicious check", "'is anything suspicious on this system'" in ns["_build_vague_diagnostic_clarification"]())
+    check("hybrid classifier gate matches suspicious phrasing", ns["_should_try_operational_intent_classifier"]("look for suspicious activity") is True)
+    check("hybrid classifier gate rejects ava self", ns["_should_try_operational_intent_classifier"]("who built you") is False)
+    classifier_suspicious = ns["_classify_operational_intent_with_llm"]("look for suspicious activity")
+    check("hybrid classifier maps suspicious activity", classifier_suspicious["tool_name"] == "check_suspicious_activity")
+    classifier_patching = ns["_classify_operational_intent_with_llm"]("check if my machine needs patching")
+    check("hybrid classifier maps patching to updates", classifier_patching["tool_name"] == "check_updates")
+    classifier_service = ns["_classify_operational_intent_with_llm"]("can you inspect nginx service health")
+    check("hybrid classifier maps named service inspection", classifier_service["tool_name"] == "inspect_service" and classifier_service["tool_args"]["service"] == "nginx")
+    classifier_clarification = ns["_classify_operational_intent_with_llm"]("inspect my service")
+    check("hybrid classifier asks for service clarification", classifier_clarification["decision"] == "clarification" and "service name" in classifier_clarification["clarification"].lower())
+    check("hybrid classifier ignores general knowledge", ns["_classify_operational_intent_with_llm"]("what is kubernetes") is None)
+    correlated = tool_registry._build_correlated_assessment(
+        new_listeners=["0.0.0.0:4444 users:(('python',pid=321,fd=5))"],
+        auth_failure_delta=8,
+        auth_failure_count=11,
+        new_failed_services=[],
+        suspicious_listener_findings=["Unusual listening port: 0.0.0.0:4444 users:(('python',pid=321,fd=5))"],
+        suspicious_process_findings=["Process command worth review: root 321 95.0 python /tmp/dropper.py"],
+        unique_findings=[
+            "Authentication failure count increased by 8 since last baseline",
+            "New listening endpoint since last baseline: 0.0.0.0:4444",
+        ],
+    )
+    check("correlated assessment detects auth plus listener story", correlated["title"] == "Authentication pressure and new network exposure detected together")
+    check("correlated assessment preserves next action", correlated["next_action"] == "inspect process <pid>")
+    host_risk = tool_registry._build_host_risk_correlation(
+        vuln_primary={"title": "Top runtime CVE: CVE-123 in openssl", "next_action": "patch package openssl"},
+        suspicious_primary={"title": "New listening endpoint detected since the previous baseline"},
+        suspicious_metadata={"new_listeners": ["0.0.0.0:4444"], "auth_failure_delta": 4, "new_failed_services": []},
+        vuln_summary={"CRITICAL": 1, "HIGH": 3},
+    )
+    check("host risk correlation detects CVE plus drift story", host_risk["title"] == "Patch exposure and runtime drift are both elevated")
+    check("host risk correlation points to patch action", host_risk["next_action"] == "patch package openssl")
     check("disk usage maps to check_disk", ns["extract_operational_tool_request"]("show disk usage") == {"tool_name": "check_disk", "tool_args": {}})
     check("verify system maps to verify_system", ns["extract_operational_tool_request"]("verify my system") == {"tool_name": "verify_system", "tool_args": {}})
     check("docker health maps to check_docker", ns["extract_operational_tool_request"]("check docker") == {"tool_name": "check_docker", "tool_args": {}})
@@ -450,6 +512,7 @@ def main():
     check("inspect service maps to inspect_service", ns["extract_operational_tool_request"]("inspect service nginx") == {"tool_name": "inspect_service", "tool_args": {"service": "nginx"}})
     check("persistence points map to check_persistence_points", ns["extract_operational_tool_request"]("check persistence points") == {"tool_name": "check_persistence_points", "tool_args": {}})
     check("security updates map to check_updates", ns["extract_operational_tool_request"]("show security updates") == {"tool_name": "check_updates", "tool_args": {}})
+    check("host risk phrases map to assess_host_risk", ns["extract_operational_tool_request"]("what should I investigate on this host") == {"tool_name": "assess_host_risk", "tool_args": {}})
     check("failed services map to check_failed_services", ns["extract_operational_tool_request"]("check failed services") == {"tool_name": "check_failed_services", "tool_args": {}})
     check("install updates maps to install_updates", ns["extract_operational_tool_request"]("install security updates") == {"tool_name": "install_updates", "tool_args": {}})
     check("patch package maps to patch_package", ns["extract_operational_tool_request"]("patch package openssl") == {"tool_name": "patch_package", "tool_args": {"package": "openssl"}})
