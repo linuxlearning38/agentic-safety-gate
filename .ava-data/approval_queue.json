@@ -1,0 +1,28 @@
+[
+  {
+    "id": "b3d67ab1",
+    "timestamp": "2026-04-13T18:05:56.954191",
+    "command": "docker restart ava-agent",
+    "query": "restart docker service",
+    "status": "pending",
+    "risk": "high",
+    "mode": "command",
+    "approval_key": "docker restart ava-agent",
+    "metadata": {
+      "decision": "high_risk_command_pending_approval"
+    }
+  },
+  {
+    "id": "13c964b9",
+    "timestamp": "2026-04-13T18:14:03.237711",
+    "command": "tool:restart_service({'service': 'docker'})",
+    "query": "restart docker service",
+    "status": "pending",
+    "risk": "medium",
+    "mode": "tool",
+    "approval_key": "tool:restart_service",
+    "metadata": {
+      "decision": "medium_risk_tool_pending_approval"
+    }
+  }
+]

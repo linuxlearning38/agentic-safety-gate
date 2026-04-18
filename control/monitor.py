@@ -16,6 +16,8 @@ import subprocess
 import threading
 import time
 
+from control.docker_runtime import get_non_running_containers
+
 logger = logging.getLogger("ava.monitor")
 
 _INTERVAL_SEC = 60
@@ -27,25 +29,15 @@ _lock         = threading.Lock()
 
 def _check_containers() -> list[dict]:
     """Return list of {name, status} for any non-running containers."""
-    issues = []
     try:
-        result = subprocess.run(
-            ["docker", "ps", "-a", "--format", "{{.Names}}\t{{.Status}}"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            shell=False,
-        )
-        for line in result.stdout.strip().splitlines():
-            parts = line.split("\t", 1)
-            if len(parts) != 2:
-                continue
-            name, status = parts
-            if not status.lower().startswith("up"):
-                issues.append({"name": name, "status": status})
+        issues, err = get_non_running_containers()
+        if err:
+            logger.warning(f"[Monitor] docker inspect failed: {err}")
+            return []
+        return issues
     except Exception as e:
-        logger.warning(f"[Monitor] docker ps failed: {e}")
-    return issues
+        logger.warning(f"[Monitor] docker inspect failed: {e}")
+        return []
 
 
 def _check_disk() -> dict | None:

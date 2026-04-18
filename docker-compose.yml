@@ -49,6 +49,7 @@ services:
       dockerfile: Dockerfile
     image: ava-agent:latest
     container_name: ava-agent
+    user: "0:0"
     ports:
       - "5443:5443"
 

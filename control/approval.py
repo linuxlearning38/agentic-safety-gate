@@ -3,16 +3,21 @@
 
 import json
 import uuid
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timedelta
 
-QUEUE_FILE = "/mnt/i/ai-lab/approval_queue.json"
+from control.registry import normalize_command_signature
+from control.runtime_paths import get_runtime_path
+
+
+def _queue_file():
+    return get_runtime_path("APPROVAL_QUEUE_PATH", "approval_queue.json")
 
 def load_queue():
     """Load approval queue from file"""
     try:
-        if Path(QUEUE_FILE).exists():
-            with open(QUEUE_FILE, "r") as f:
+        queue_file = _queue_file()
+        if queue_file.exists():
+            with open(queue_file, "r") as f:
                 return json.load(f)
         else:
             return []
@@ -21,10 +26,12 @@ def load_queue():
 
 def save_queue(queue):
     """Save approval queue to file"""
-    with open(QUEUE_FILE, "w") as f:
+    queue_file = _queue_file()
+    queue_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(queue_file, "w") as f:
         json.dump(queue, f, indent=2)
 
-def add_request(cmd, query):
+def add_request(cmd, query, *, risk=None, mode=None, approval_key=None, metadata=None):
     """Add command to approval queue"""
     queue = load_queue()
     
@@ -33,7 +40,11 @@ def add_request(cmd, query):
         "timestamp": datetime.now().isoformat(),
         "command": cmd,
         "query": query,
-        "status": "pending"
+        "status": "pending",
+        "risk": risk,
+        "mode": mode,
+        "approval_key": normalize_command_signature(approval_key or cmd),
+        "metadata": metadata or {},
     }
     
     queue.append(entry)
@@ -63,10 +74,24 @@ def update_status(entry_id, status):
     save_queue(queue)
     return True
 
+
+def check_recent_approval(approval_key: str, minutes: int = 10):
+    """Check whether an approval key was approved recently."""
+    normalized_key = normalize_command_signature(approval_key)
+    queue = load_queue()
+    cutoff = datetime.now() - timedelta(minutes=minutes)
+    for entry in queue:
+        entry_key = normalize_command_signature(entry.get("approval_key") or entry.get("command"))
+        if (
+            entry_key == normalized_key
+            and entry.get("status") == "approved"
+            and datetime.fromisoformat(entry["timestamp"]) > cutoff
+        ):
+            return True, entry["id"]
+    return False, None
+
 def clear_old_entries(days=7):
     """Remove entries older than specified days"""
-    from datetime import timedelta
-    
     queue = load_queue()
     cutoff = datetime.now() - timedelta(days=days)
     
