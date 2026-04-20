@@ -276,16 +276,18 @@ def build_troubleshooting_plan(route, evidence) -> AnswerPlan:
     topic = evidence.topic or route.topic or "generic"
     canned_answers = {
         "oomkilled": (
-            "**Root Cause:** Kubernetes marks a container as `OOMKilled` when it exceeds its memory limit and the kernel terminates it to protect node stability.\n"
-            "**Fix:** Raise the pod memory limit if it is too low, reduce the application's memory use, and compare actual peak usage against the current request and limit.\n"
-            "**Why this works:** `OOMKilled` is a memory-pressure termination, so the durable fix is aligning the workload's memory behavior with Kubernetes limits.\n"
-            "**Watch out for:** Restarts can hide the symptom temporarily. Check for memory leaks, bursty traffic, large in-memory caches, or JVM heap settings before only increasing limits."
+            "**Confirm symptom:** Verify the last container state says `OOMKilled`, capture restart count, memory limit, request, node memory pressure, and the time window of the kill.\n"
+            "**Inspect evidence:** Compare peak memory usage with the configured limit, check recent deploy/config changes, traffic spikes, heap/cache growth, and whether other pods on the node were under pressure.\n"
+            "**Likely cause:** The workload exceeded its memory cgroup limit, but the reason may be undersized limits, a leak, abnormal traffic, JVM/runtime heap settings, or node pressure.\n"
+            "**Low-risk fix:** Right-size request/limit only after evidence supports it, reduce memory-heavy config, tune heap/cache settings, or roll back the recent change if memory rose after deploy.\n"
+            "**Unsafe shortcuts to avoid:** Do not blindly restart the pod or only raise limits without checking usage; that can hide leaks, shift pressure to the node, and cause repeat incidents."
         ),
         "crashloopbackoff": (
-            "**Root Cause:** `CrashLoopBackOff` means the container keeps starting, failing, and being restarted, so Kubernetes backs off between restart attempts.\n"
-            "**Fix:** Check the container logs, last termination reason, image entrypoint, env vars, config mounts, and readiness or liveness probe settings. Common causes are bad startup commands, missing config, and application crashes.\n"
-            "**Why this works:** `CrashLoopBackOff` is a restart pattern, not the root problem itself. The real fix comes from the failing process or probe.\n"
-            "**Watch out for:** If probes are too aggressive, Kubernetes can restart an otherwise healthy app before it finishes booting."
+            "**Confirm symptom:** Verify the pod is repeatedly restarting, note the restart count, last termination reason, exit code, events, and whether the failure began after a rollout.\n"
+            "**Inspect evidence:** Check current and previous container logs, pod events, entrypoint/command, env vars, ConfigMap/Secret mounts, image tag, dependency reachability, and probe timing.\n"
+            "**Likely cause:** `CrashLoopBackOff` is a restart pattern, not the root cause; common causes are app startup failure, missing config, bad image/entrypoint, permission errors, dependency failure, or aggressive probes.\n"
+            "**Low-risk fix:** Fix the failing startup condition first, roll back the recent bad release if evidence points there, correct missing config/secret mounts, or relax probe timing only when startup duration is the issue.\n"
+            "**Unsafe shortcuts to avoid:** Do not delete/recreate pods as the fix; it hides evidence. Do not disable probes permanently or restart workloads repeatedly without reading previous logs."
         ),
         "imagepullbackoff": (
             "**Root Cause:** `ImagePullBackOff` means Kubernetes could not pull the container image and is backing off before retrying.\n"
@@ -300,16 +302,32 @@ def build_troubleshooting_plan(route, evidence) -> AnswerPlan:
             "**Watch out for:** Low cluster capacity can make `Pending` look intermittent. Check quotas and autoscaler behavior before changing only the pod spec."
         ),
         "pod_network": (
-            "**Root Cause:** Pod network failures usually come from CNI health, NetworkPolicy rules, DNS, Service selectors/endpoints, node routing, or an application binding to the wrong interface.\n"
-            "**Fix:** Check the Pod IP, Service endpoints, DNS lookup from another Pod, NetworkPolicy denies, CNI plugin health, node routes, and recent cluster networking changes.\n"
-            "**Why this works:** Pod-to-Pod and Pod-to-Service traffic crosses several layers, so checking each hop isolates whether the failure is policy, DNS, routing, or workload readiness.\n"
-            "**Watch out for:** Restarting the Pod can hide a network-policy or CNI problem. Confirm the traffic path before changing the workload."
+            "**Confirm symptom:** Identify whether the failure is Pod-to-Pod, Pod-to-Service, Service-to-Pod, DNS lookup, ingress, or egress traffic.\n"
+            "**Inspect evidence:** Check Pod IPs, Service selectors/endpoints, readiness state, DNS lookup from another pod, NetworkPolicy allows/denies, CNI plugin health, node routes, and recent network changes.\n"
+            "**Likely cause:** Pod network failures usually come from endpoint mismatch, readiness exclusion, DNS/CoreDNS problems, NetworkPolicy, CNI/node routing, or the app listening on the wrong interface.\n"
+            "**Low-risk fix:** Correct selectors/endpoints, restore readiness, adjust NetworkPolicy narrowly, fix DNS/CNI health, or roll back the recent network change after confirming the failing hop.\n"
+            "**Unsafe shortcuts to avoid:** Do not restart random pods or open broad network policy access before isolating the hop; that can mask the real failure or weaken security."
+        ),
+        "dns_failure": (
+            "**Confirm symptom:** Verify whether only one service name fails, all cluster DNS fails, or external DNS fails from pods.\n"
+            "**Inspect evidence:** Compare direct IP connectivity with DNS lookup, check service/endpoints, namespace/search path, CoreDNS pod health, CoreDNS logs, recent ConfigMap changes, and node DNS reachability.\n"
+            "**Likely cause:** Kubernetes DNS failures usually come from missing endpoints, wrong service/namespace name, CoreDNS outage/config drift, NetworkPolicy blocking DNS, or upstream resolver problems.\n"
+            "**Low-risk fix:** Fix the service/endpoints or query name first, then repair CoreDNS/config/network policy only after evidence shows DNS infrastructure is the failing layer.\n"
+            "**Unsafe shortcuts to avoid:** Do not blindly restart CoreDNS or change cluster DNS settings before proving the failure is DNS-wide; many DNS symptoms are actually endpoint or namespace mistakes."
+        ),
+        "tls_certificate": (
+            "**Confirm symptom:** Capture the exact TLS error, affected host/SNI, certificate subject/SAN, issuer, expiry, and whether the failure occurs at ingress, service mesh, client, or upstream.\n"
+            "**Inspect evidence:** Check certificate chain, hostname match, expiry window, Kubernetes TLS secret contents, ingress/controller events, cert-manager status, trust bundle, and recent rotation changes.\n"
+            "**Likely cause:** TLS failures usually come from expired certificates, hostname/SAN mismatch, incomplete chain, stale Kubernetes secret, wrong ingress reference, or clients missing the issuing CA.\n"
+            "**Low-risk fix:** Renew or rotate the certificate through the normal issuer path, update the referenced TLS secret, fix hostname/SAN mismatch, or restore the correct CA bundle; verify with a non-destructive handshake check.\n"
+            "**Unsafe shortcuts to avoid:** Do not disable TLS verification, publish private keys, or replace ingress secrets blindly without confirming the chain and rollback path."
         ),
         "service_down": (
-            "**Root Cause:** A service being down usually means traffic is not reaching a healthy backend because the pods, endpoints, ingress, load balancer, or network path are unhealthy or misconfigured.\n"
-            "**Fix:** Check service endpoints, pod readiness, ingress or load balancer health, DNS resolution, recent deploy changes, and network policies.\n"
-            "**Why this works:** A service is only available when the traffic path and the backing workloads are both healthy, so verifying that chain isolates the actual failure point.\n"
-            "**Watch out for:** A quick pod restart can mask the issue. Also check rollout history and dependency failures before declaring the service recovered."
+            "**Confirm symptom:** Identify the failing URL/service, affected users, error code, timeout behavior, and whether the failure is internal, ingress, or external.\n"
+            "**Inspect evidence:** Check service endpoints, pod readiness, ingress/load balancer health, DNS resolution, recent deployments, dependency health, and NetworkPolicy.\n"
+            "**Likely cause:** Traffic is usually not reaching a healthy backend because pods, endpoints, ingress, load balancer, DNS, dependencies, or the network path are unhealthy or misconfigured.\n"
+            "**Low-risk fix:** Restore healthy endpoints, roll back the bad release, fix ingress/DNS/dependency configuration, or narrow the failing network rule after confirming the broken hop.\n"
+            "**Unsafe shortcuts to avoid:** Do not keep restarting pods as recovery proof; verify endpoint health and request success after the change."
         ),
         "generic": (
             "**Root Cause:** This looks like an infrastructure or application failure that needs the failing component, error signal, and recent change context identified before choosing a durable fix.\n"

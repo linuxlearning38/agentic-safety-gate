@@ -2826,12 +2826,12 @@ def _build_weak_evidence_fallback(query, query_intent, confidence, context):
 _COMMON_GROUNDING_TERMS = {
     "architecture", "application", "applications", "cluster", "clusters",
     "container", "containers", "deployment", "deployments", "docker",
-    "crashloopbackoff", "describe", "explain", "failing", "failure", "failures",
-    "health", "ingress", "kubernetes", "liveness", "oomkilled",
+    "certificate", "coredns", "crashloopbackoff", "describe", "explain", "failing", "failure", "failures",
+    "health", "ingress", "investigate", "issue", "issues", "kubernetes", "liveness", "oomkilled",
     "mitigation", "network", "networking", "namespace", "namespaces",
     "operator", "orchestration", "pattern", "patterns", "platform",
-    "practical", "readiness", "remediation", "request", "requests",
-    "service", "services", "system", "systems", "terraform", "traffic",
+    "practical", "readiness", "remediation", "request", "requests", "safely",
+    "service", "services", "system", "systems", "terraform", "tls", "traffic",
     "troubleshoot", "troubleshooting", "workload", "workloads",
 }
 
