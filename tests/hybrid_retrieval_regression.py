@@ -87,6 +87,9 @@ def main():
         ["zuul", "kafka", "cassandra", "evcache"],
     )
     check("architecture bonus prefers relationship-rich pattern chunks", pattern_bonus > blog_bonus)
+    check("definition source priority prefers policies over blogs", retriever._source_priority_bonus("definition", "policies") > retriever._source_priority_bonus("definition", "blogs"))
+    check("troubleshooting source priority prefers fixes", retriever._source_priority_bonus("troubleshooting", "fixes") > retriever._source_priority_bonus("troubleshooting", "policies"))
+    check("architecture source priority prefers patterns", retriever._source_priority_bonus("architecture", "patterns") > retriever._source_priority_bonus("architecture", "blogs"))
     ava_internal_chunk = DummyChunk(
         content="PATTERN: AVA Request Pipeline\nDESCRIPTION: How a query flows through AVA from HTTP request to response",
         source_collection="patterns",

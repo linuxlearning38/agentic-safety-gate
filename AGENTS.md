@@ -158,6 +158,18 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
       - `What is machine learning?` still routes to direct general Qwen
       - `What is Kubernetes?` still returns seeded grounded definition
       - full live serving-contract suite passed 100/100
+  - Completed Fix #6.2 source selection and ranking:
+    - Added intent-aware source weighting in `knowledge_updater/hybrid_retrieval.py`
+    - Definitions now prefer policies/patterns over blogs after seeded definitions
+    - Troubleshooting now prefers fixes first, then policies
+    - Architecture now prefers patterns first, with blogs only as supporting context
+    - Added source-ordering in `control/evidence_selector.py` so controlled evidence respects the same source roles
+    - Added regression coverage for source priority, troubleshooting evidence order, definition policy-over-blog selection, and architecture pattern-over-blog selection
+    - Rebuilt AVA and verified live spot checks:
+      - `What is Kubernetes?` stays high-confidence seeded/grounded definition
+      - `My nginx pod is CrashLoopBackOff` stays high-confidence troubleshooting
+      - `Explain Netflix architecture with Zuul, Kafka, Cassandra, EVCache` stays high-confidence architecture
+      - `What is machine learning?` still routes to direct general Qwen
   - Completed first Fix #6 RAG/knowledge-quality hardening for core DevOps definitions:
     - Added deterministic seeded definition blocks for core DevOps terms in `web_agent_v2.1_guardrail.py`
     - Current seeded terms: Kubernetes, Docker, Terraform, Helm, Linux, Pod, Deployment, Kubernetes Service, ConfigMap, Ingress, readiness probe, liveness probe, OOMKilled, CrashLoopBackOff, namespace, PVC, Dockerfile, kubeconfig

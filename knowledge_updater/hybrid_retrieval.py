@@ -254,6 +254,41 @@ class HybridRetriever:
             bonus += 20
         return bonus
 
+    def _source_priority_bonus(self, query_intent: str, source_collection: str) -> int:
+        """Intent-aware source weighting.
+
+        Policies/patterns/fixes/blogs are not equally authoritative for every
+        question type. This adjusts distance before final relevance sorting so
+        blogs can support answers without becoming the primary source of truth.
+        """
+        priorities = {
+            "definition": {
+                "policies": 36,
+                "patterns": 18,
+                "fixes": 8,
+                "blogs": -12,
+            },
+            "troubleshooting": {
+                "fixes": 40,
+                "policies": 28,
+                "patterns": 10,
+                "blogs": -16,
+            },
+            "architecture": {
+                "patterns": 42,
+                "policies": 18,
+                "fixes": 10,
+                "blogs": -6,
+            },
+            "comparison": {
+                "policies": 30,
+                "patterns": 16,
+                "fixes": 8,
+                "blogs": -10,
+            },
+        }
+        return priorities.get(query_intent, {}).get(source_collection, 0)
+
     def _is_ava_scoped_query(self, query_text: str) -> bool:
         q = query_text.lower()
         ava_markers = (
@@ -395,6 +430,13 @@ class HybridRetriever:
                 bonus = self._architecture_bonus(chunk, core_terms)
                 if bonus:
                     chunk.distance = max(0, chunk.distance - bonus)
+
+        for chunk in policy_chunks + blog_chunks + fixes_chunks + patterns_chunks:
+            source_bonus = self._source_priority_bonus(query_intent, chunk.source_collection)
+            if source_bonus > 0:
+                chunk.distance = max(0, chunk.distance - source_bonus)
+            elif source_bonus < 0:
+                chunk.distance += abs(source_bonus)
 
         for chunk in blog_chunks:
             keyword_hits = sum(1 for w in query_words if w in chunk.content.lower())

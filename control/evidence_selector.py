@@ -67,8 +67,14 @@ def _definition_line_score(line: str, target_entities: list[str], source_collect
     score = 0
     if source_collection == "seeded_definitions":
         score += 20
+    if source_collection == "policies":
+        score += 10
     if source_collection == "patterns":
         score += 8
+    if source_collection == "fixes":
+        score += 3
+    if source_collection == "blogs":
+        score -= 6
     if any(lower.startswith(prefix) for prefix in ("description:", "a ", "an ", "the ")):
         score += 4
     if " is a " in lower or " is an " in lower or " are " in lower:
@@ -82,6 +88,31 @@ def _definition_line_score(line: str, target_entities: list[str], source_collect
     if "you can read more" in lower or "copy | explain" in lower:
         score -= 8
     return score
+
+
+def _source_rank(intent: str, source_collection: str) -> int:
+    ranks = {
+        "troubleshooting": {
+            "fixes": 0,
+            "policies": 1,
+            "patterns": 2,
+            "blogs": 3,
+        },
+        "architecture": {
+            "patterns": 0,
+            "policies": 1,
+            "fixes": 2,
+            "blogs": 3,
+        },
+        "definition": {
+            "seeded_definitions": 0,
+            "policies": 1,
+            "patterns": 2,
+            "fixes": 3,
+            "blogs": 4,
+        },
+    }
+    return ranks.get(intent, {}).get(source_collection, 99)
 
 
 def _pattern_definition_lines(text: str) -> list[str]:
@@ -219,6 +250,8 @@ def select_troubleshooting_evidence(route, retrieved_chunks: list) -> EvidencePa
         if source_collection not in {"policies", "fixes"}:
             continue
         filtered_chunks.append(chunk)
+    filtered_chunks.sort(key=lambda chunk: _source_rank("troubleshooting", getattr(chunk, "source_collection", "")))
+    for chunk in filtered_chunks:
         evidence_blocks.append(getattr(chunk, "content", ""))
 
     facts = {
@@ -266,7 +299,8 @@ def select_architecture_evidence(route, retrieved_chunks: list, about: dict | No
             entity_hits = sum(1 for entity in route_entities if entity.lower() in lower)
             relation_hits = sum(1 for term in ARCHITECTURE_RELATION_TERMS if term in lower)
             if entity_hits >= 2 or (entity_hits >= 1 and relation_hits >= 1) or (not route_entities and relation_hits >= 2) or (len(route_entities) <= 1 and relation_hits >= 3):
-                scored_lines.append((score, line, source_collection))
+                source_bonus = max(0, 4 - _source_rank("architecture", source_collection))
+                scored_lines.append((score + source_bonus, line, source_collection))
 
     scored_lines.sort(key=lambda item: (-item[0], len(item[1])))
     evidence_blocks = []
