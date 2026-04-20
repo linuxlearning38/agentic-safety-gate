@@ -992,6 +992,13 @@ def extract_operational_tool_request(query: str) -> dict | None:
         return {"tool_name": "check_memory", "tool_args": {}}
 
     if any(phrase in lower for phrase in (
+        "check host telemetry", "show host telemetry", "host telemetry",
+        "show real host facts", "check real host facts", "read host facts",
+        "show host facts",
+    )):
+        return {"tool_name": "check_host_telemetry", "tool_args": {}}
+
+    if any(phrase in lower for phrase in (
         "verify my system", "check my system", "verify system", "system check",
         "check system health", "system health", "what's wrong with my system",
         "what is wrong with my system", "diagnose my system", "inspect my system",
