@@ -420,6 +420,220 @@ def check(name, condition):
     print(f"[PASS] {name}")
 
 
+# ── Fix #6.6: Deep-topic retrieval regression tests ──────────────────────────
+# These prove that the Fix #6.5 deep-incident knowledge pack behaves correctly
+# and that AVA falls back honestly when deep-topic evidence is weak or absent.
+
+
+def test_fix66_redis_runbook_resolves(ns):
+    check(
+        "fix66: redis latency phrasing routes to redis_incident",
+        ns["_route_query"]("how do I troubleshoot Redis latency issues").topic == "redis_incident",
+    )
+    check(
+        "fix66: redis connection phrasing routes to redis_incident",
+        ns["_route_query"]("Redis connection is failing").topic == "redis_incident",
+    )
+    redis = ns["_resolve_troubleshooting_response"]("how do I troubleshoot Redis latency issues")
+    check(
+        "fix66: redis runbook is staged",
+        redis is not None and all(marker in redis["response"] for marker in ["Confirm symptom", "Inspect evidence", "Likely cause", "Low-risk fix", "Unsafe shortcuts"]),
+    )
+    check(
+        "fix66: redis runbook is not low-confidence",
+        redis is not None and redis["confidence"] != "low",
+    )
+    check(
+        "fix66: redis runbook contains redis-specific content",
+        redis is not None and any(term in redis["response"].lower() for term in ["slowlog", "memory", "connection", "evict", "blocked"]),
+    )
+
+
+def test_fix66_postgres_runbook_resolves(ns):
+    check(
+        "fix66: postgres connection phrasing routes to postgres_incident",
+        ns["_route_query"]("Postgres connection is failing").topic == "postgres_incident",
+    )
+    check(
+        "fix66: postgresql lock phrasing routes to postgres_incident",
+        ns["_route_query"]("PostgreSQL lock wait is growing").topic == "postgres_incident",
+    )
+    postgres = ns["_resolve_troubleshooting_response"]("troubleshoot Postgres replication issues")
+    check(
+        "fix66: postgres runbook is staged",
+        postgres is not None and all(marker in postgres["response"] for marker in ["Confirm symptom", "Inspect evidence", "Likely cause", "Low-risk fix", "Unsafe shortcuts"]),
+    )
+    check(
+        "fix66: postgres runbook contains postgres-specific content",
+        postgres is not None and any(term in postgres["response"].lower() for term in ["lock", "query", "connection", "wal", "replication", "pg_stat"]),
+    )
+
+
+def test_fix66_terraform_drift_runbook_resolves(ns):
+    check(
+        "fix66: terraform state drift phrasing routes to terraform_drift",
+        ns["_route_query"]("Terraform state drift between environments").topic == "terraform_drift",
+    )
+    check(
+        "fix66: drifted resources phrasing routes to terraform_drift",
+        ns["_route_query"]("I have drifted resources in Terraform").topic == "terraform_drift",
+    )
+    terraform = ns["_resolve_troubleshooting_response"]("terraform drift remediation steps")
+    check(
+        "fix66: terraform drift runbook is staged",
+        terraform is not None and all(marker in terraform["response"] for marker in ["Confirm symptom", "Inspect evidence", "Likely cause", "Low-risk fix", "Unsafe shortcuts"]),
+    )
+    check(
+        "fix66: terraform drift runbook mentions plan and state",
+        terraform is not None and "plan" in terraform["response"].lower() and "state" in terraform["response"].lower(),
+    )
+
+
+def test_fix66_servicemesh_runbook_resolves(ns):
+    check(
+        "fix66: istio traffic phrasing routes to service_mesh_traffic",
+        ns["_route_query"]("Istio traffic routing is broken").topic == "service_mesh_traffic",
+    )
+    check(
+        "fix66: sidecar injection phrasing routes to service_mesh_traffic",
+        ns["_route_query"]("my service mesh sidecar injection is failing").topic == "service_mesh_traffic",
+    )
+    mesh = ns["_resolve_troubleshooting_response"]("istio traffic troubleshooting")
+    check(
+        "fix66: service mesh runbook is staged",
+        mesh is not None and all(marker in mesh["response"] for marker in ["Confirm symptom", "Inspect evidence", "Likely cause", "Low-risk fix", "Unsafe shortcuts"]),
+    )
+    check(
+        "fix66: service mesh runbook contains mesh-specific content",
+        mesh is not None and any(term in mesh["response"].lower() for term in ["envoy", "istio", "sidecar", "mtls", "virtualservice", "destination"]),
+    )
+
+
+def test_fix66_cicd_failure_runbook_resolves(ns):
+    check(
+        "fix66: pipeline failure phrasing routes to cicd_failure",
+        ns["_route_query"]("my CI/CD pipeline failure is blocking deployment").topic == "cicd_failure",
+    )
+    check(
+        "fix66: build failed phrasing routes to cicd_failure",
+        ns["_route_query"]("the build failed in my deployment pipeline").topic == "cicd_failure",
+    )
+    cicd = ns["_resolve_troubleshooting_response"]("cicd pipeline failure troubleshooting")
+    check(
+        "fix66: cicd runbook is staged",
+        cicd is not None and all(marker in cicd["response"] for marker in ["Confirm symptom", "Inspect evidence", "Likely cause", "Low-risk fix", "Unsafe shortcuts"]),
+    )
+    check(
+        "fix66: cicd runbook contains pipeline-specific content",
+        cicd is not None and any(term in cicd["response"].lower() for term in ["pipeline", "build", "test", "deploy", "scan", "artifact"]),
+    )
+
+
+def test_fix66_unsupported_deep_topic_falls_back_honestly(ns):
+    cassandra = ns["_resolve_troubleshooting_response"]("how do I fix Cassandra tombstone issues?")
+    check(
+        "fix66: cassandra tombstone (unsupported topic) returns honest fallback",
+        cassandra["response"].startswith(ns["_WEAK_EVIDENCE_FALLBACK"]),
+    )
+    check(
+        "fix66: cassandra tombstone fallback is low-confidence",
+        cassandra["confidence"] == "low",
+    )
+    check(
+        "fix66: cassandra fallback does not contain fabricated runbook header",
+        "**Confirm symptom:**" not in cassandra["response"],
+    )
+    mysql_route = ns["_route_query"]("how do I debug MySQL replication lag?")
+    check(
+        "fix66: mysql replication routes to generic (no fabricated deep-topic runbook)",
+        mysql_route.topic == "generic",
+    )
+    mysql = ns["_resolve_troubleshooting_response"]("how do I debug MySQL replication lag?")
+    check(
+        "fix66: mysql response does not start with fabricated staged runbook header",
+        mysql is not None and not mysql["response"].startswith("**Confirm symptom:**"),
+    )
+
+
+def test_fix66_deep_topic_source_ranking_preserved(ns):
+    redis_route = ns["_route_query"]("Redis latency is spiking")
+    redis_evidence = ns["select_troubleshooting_evidence"](
+        redis_route,
+        [
+            FakeChunk("Fix: run SLOWLOG GET to identify the slowest Redis commands.", "fixes"),
+            FakeChunk("Fix: check Redis memory usage and eviction policy.", "fixes"),
+            FakeChunk("Blog: a team shared their Redis tuning experience.", "blogs"),
+        ],
+    )
+    check(
+        "fix66: redis troubleshooting ranks fixes before blogs",
+        redis_evidence.facts["sources"] and redis_evidence.facts["sources"][0] == "fixes",
+    )
+    check(
+        "fix66: redis troubleshooting evidence excludes blog-only sources from top position",
+        redis_evidence.facts["sources"] == ["fixes"] or "blogs" not in redis_evidence.facts["sources"][:1],
+    )
+    cicd_route = ns["_route_query"]("my CI/CD pipeline failure is blocking deployment")
+    cicd_evidence = ns["select_troubleshooting_evidence"](
+        cicd_route,
+        [
+            FakeChunk("Fix: inspect the failed step log before retrying.", "fixes"),
+            FakeChunk("Policy: never skip security scans to unblock a pipeline.", "policies"),
+            FakeChunk("Blog: a team's CI/CD horror story.", "blogs"),
+        ],
+    )
+    check(
+        "fix66: cicd troubleshooting ranks fixes first",
+        cicd_evidence.facts["sources"] and cicd_evidence.facts["sources"][0] == "fixes",
+    )
+    check(
+        "fix66: cicd troubleshooting keeps policies before blogs",
+        "blogs" not in cicd_evidence.facts["sources"][:2] or cicd_evidence.facts["sources"].index("fixes") < cicd_evidence.facts["sources"].index("blogs"),
+    )
+
+
+def test_fix66_no_destructive_suggestions_in_runbooks(ns):
+    redis = ns["_resolve_troubleshooting_response"]("how do I troubleshoot Redis latency issues")["response"].lower()
+    postgres = ns["_resolve_troubleshooting_response"]("troubleshoot Postgres replication issues")["response"].lower()
+    terraform = ns["_resolve_troubleshooting_response"]("terraform drift remediation steps")["response"].lower()
+    mesh = ns["_resolve_troubleshooting_response"]("istio traffic troubleshooting")["response"].lower()
+    cicd = ns["_resolve_troubleshooting_response"]("cicd pipeline failure troubleshooting")["response"].lower()
+
+    check(
+        "fix66: redis runbook carries do-not-run-flushall safety warning",
+        "do not run flushall" in redis,
+    )
+    check(
+        "fix66: redis runbook does not suggest FLUSHDB",
+        "flushdb" not in redis,
+    )
+    check(
+        "fix66: postgres runbook does not suggest DROP DATABASE",
+        "drop database" not in postgres,
+    )
+    check(
+        "fix66: postgres runbook guards data loss with do-not warning",
+        "do not drop or truncate" in postgres,
+    )
+    check(
+        "fix66: terraform runbook does not emit rm -rf",
+        "rm -rf" not in terraform,
+    )
+    check(
+        "fix66: cicd runbook carries do-not-disable-tests safety warning",
+        "do not disable tests" in cicd or "disable tests" not in cicd,
+    )
+    check(
+        "fix66: service mesh runbook carries do-not-disable-mtls warning",
+        "do not disable mtls globally" in mesh,
+    )
+    all_runbooks = redis + postgres + terraform + mesh + cicd
+    check(
+        "fix66: no deep-incident runbook emits raw destructive shell commands",
+        all(cmd not in all_runbooks for cmd in ["rm -rf", "kubectl delete --all", "drop table", "format /dev/", "chmod -r 777"]),
+    )
+
+
 def main():
     sys.path.insert(0, str(SOURCE.parent))
     ns = load_helpers()
@@ -1240,6 +1454,16 @@ def main():
     check("safe: what is kubernetes not blocked",        not destr("what is kubernetes"))
     check("safe: check disk not blocked",                not destr("check disk"))
     check("safe: show running containers not blocked",   not destr("show running containers"))
+
+    # ── Fix #6.6: Deep-topic retrieval regression tests ──────────────────────
+    test_fix66_redis_runbook_resolves(ns)
+    test_fix66_postgres_runbook_resolves(ns)
+    test_fix66_terraform_drift_runbook_resolves(ns)
+    test_fix66_servicemesh_runbook_resolves(ns)
+    test_fix66_cicd_failure_runbook_resolves(ns)
+    test_fix66_unsupported_deep_topic_falls_back_honestly(ns)
+    test_fix66_deep_topic_source_ranking_preserved(ns)
+    test_fix66_no_destructive_suggestions_in_runbooks(ns)
 
     print("\nIntelligence regression tests passed.")
 

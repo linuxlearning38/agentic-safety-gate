@@ -139,6 +139,36 @@ def main():
     )
     check("assemble_context strips section labels", "SUMMARY:" not in assembled[0] and "REQUEST FLOW:" not in assembled[0])
 
+    # ── Fix #6.6: Deep-topic source ranking at the retriever level ───────────
+    check(
+        "fix66: redis latency troubleshoot query detects troubleshooting intent",
+        retriever._detect_query_intent("how do I troubleshoot Redis latency issues") == "troubleshooting",
+    )
+    check(
+        "fix66: postgres connection not working detects troubleshooting intent",
+        retriever._detect_query_intent("my Postgres connection is not working") == "troubleshooting",
+    )
+    check(
+        "fix66: cicd pipeline debug query detects troubleshooting intent",
+        retriever._detect_query_intent("how do I debug a CI/CD pipeline failure") == "troubleshooting",
+    )
+    check(
+        "fix66: istio traffic broken detects troubleshooting intent",
+        retriever._detect_query_intent("Istio traffic routing is broken") == "troubleshooting",
+    )
+    check(
+        "fix66: terraform drift fix query detects troubleshooting intent",
+        retriever._detect_query_intent("how do I fix Terraform state drift") == "troubleshooting",
+    )
+    check(
+        "fix66: deep incident troubleshooting ranks fixes over blogs in retriever",
+        retriever._source_priority_bonus("troubleshooting", "fixes") > retriever._source_priority_bonus("troubleshooting", "blogs"),
+    )
+    check(
+        "fix66: deep incident troubleshooting ranks fixes over policies in retriever",
+        retriever._source_priority_bonus("troubleshooting", "fixes") > retriever._source_priority_bonus("troubleshooting", "policies"),
+    )
+
     print("\nHybrid retrieval regression tests passed.")
 
 

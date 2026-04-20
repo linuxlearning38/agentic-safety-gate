@@ -145,7 +145,25 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
 - Timestamp:
   - 2026-04-19 Asia/Calcutta
   - 2026-04-20 Asia/Calcutta
+  - 2026-04-20 Asia/Calcutta (Fix #6.6)
 - Latest changes made:
+  - Completed Fix #6.6 deep-topic retrieval regression tests (test-only, no serving change):
+    - Added 8 named test functions to `tests/intelligence_regression.py` providing explicit regression coverage for Fix #6.5 deep-incident knowledge pack:
+      - `test_fix66_redis_runbook_resolves`: routing variants + staged response + safety check
+      - `test_fix66_postgres_runbook_resolves`: routing variants + staged response + content check
+      - `test_fix66_terraform_drift_runbook_resolves`: routing variants + staged response + state/plan terms
+      - `test_fix66_servicemesh_runbook_resolves`: routing variants + staged response + mesh-specific content
+      - `test_fix66_cicd_failure_runbook_resolves`: routing variants + staged response + pipeline-specific content
+      - `test_fix66_unsupported_deep_topic_falls_back_honestly`: Cassandra tombstone returns weak-evidence fallback; MySQL replication routes to generic (no fabricated runbook)
+      - `test_fix66_deep_topic_source_ranking_preserved`: Redis and CI/CD troubleshooting evidence prefers fixes over blogs
+      - `test_fix66_no_destructive_suggestions_in_runbooks`: all 5 runbooks carry safety warnings and no raw destructive shell commands
+    - Added 7 new checks to `tests/hybrid_retrieval_regression.py`:
+      - Retriever-level troubleshooting intent detection for Redis, Postgres, CI/CD, Istio, and Terraform deep-topic phrasings
+      - Explicit source priority: fixes > blogs and fixes > policies for troubleshooting intent
+    - Key regression insight documented: Cassandra tombstone (has 7+ char unsupported terms) triggers weak-evidence fallback; MySQL replication (all terms are common grounding terms) routes to generic troubleshooting — both are honest, correct behaviors
+    - Key implementation note: test phrases must use terms present in `_COMMON_GROUNDING_TERMS` when calling `_resolve_troubleshooting_response` directly, since the FakeHybridRetriever returns empty controlled context and unsupported-specific-term detection fires on unknown 7+ char terms with empty context
+    - Tests: 305+9=314 → 343+16=359 (38 new intelligence checks, 7 new retrieval checks)
+    - Fix #6.6 is the verification layer for Fix #6.5 — no knowledge content added, no serving behavior changed
   - Completed Fix #6.1 honest weak-evidence fallback:
     - Added `_WEAK_EVIDENCE_FALLBACK` and grounded evidence gates in `web_agent_v2.1_guardrail.py`
     - Low-confidence grounded DevOps/RAG answers now return: `I do not have enough grounded evidence to answer this confidently.`
