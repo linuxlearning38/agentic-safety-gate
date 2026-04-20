@@ -1014,6 +1014,34 @@ def main():
     unknown_troubleshooting = ns["_resolve_troubleshooting_response"]("How do I safely fix zarglebop failure in container networking?")
     check("troubleshooting with unsupported specific term falls back", unknown_troubleshooting["response"].startswith(ns["_WEAK_EVIDENCE_FALLBACK"]))
     check("troubleshooting fallback reports low confidence", unknown_troubleshooting["confidence"] == "low")
+    troubleshooting_route = ns["_route_query"]("My service is down")
+    troubleshooting_evidence = ns["select_troubleshooting_evidence"](
+        troubleshooting_route,
+        [
+            FakeChunk("Policy: service-down incidents require endpoint inspection.", "policies"),
+            FakeChunk("Fix: inspect endpoints, readiness, ingress, and DNS first.", "fixes"),
+            FakeChunk("Blog: personal outage story.", "blogs"),
+        ],
+    )
+    check("troubleshooting evidence prefers fixes first", troubleshooting_evidence.facts["sources"] == ["fixes", "policies"])
+    definition_route = ns["_route_query"]("What is a WidgetProbe?")
+    definition_evidence = ns["select_definition_evidence"](
+        definition_route,
+        [
+            FakeChunk("A WidgetProbe is a noisy blog description copied from an outage story.", "blogs"),
+            FakeChunk("A WidgetProbe is a policy-defined health check used by operators.", "policies"),
+        ],
+    )
+    check("definition evidence prefers policy over blog", definition_evidence.evidence_blocks and "policy-defined" in definition_evidence.evidence_blocks[0])
+    architecture_route = ns["_route_query"]("Explain widget gateway architecture")
+    architecture_evidence = ns["select_architecture_evidence"](
+        architecture_route,
+        [
+            FakeChunk("Widget gateway routes requests to backend services and streams events to a queue.", "patterns"),
+            FakeChunk("Widget gateway routes requests with one operator's blog-specific implementation detail.", "blogs"),
+        ],
+    )
+    check("architecture evidence prefers patterns over blogs", architecture_evidence.facts["sources"] and architecture_evidence.facts["sources"][0] == "patterns")
     original_query_kb = ns.get("query_knowledge_base")
     original_generate = ns.get("generate_response")
     original_update_memory = ns.get("update_memory_issue")
