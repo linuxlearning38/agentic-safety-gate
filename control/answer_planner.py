@@ -119,6 +119,15 @@ def _build_architecture_mermaid(entities: list[str], evidence_blocks: list[str],
     if "zuul" in lower_entities:
         edges.append(("Client", lower_entities["zuul"]))
         edges.append((lower_entities["zuul"], "Backend Services"))
+    if "kubernetes" in lower_entities:
+        edges.extend([
+            ("Client", "Ingress / Gateway"),
+            ("Ingress / Gateway", "Kubernetes Service"),
+            ("Kubernetes Service", "Pods"),
+            ("Deployment", "ReplicaSet"),
+            ("ReplicaSet", "Pods"),
+            ("Pods", "Container"),
+        ])
     if "kafka" in lower_entities:
         edges.append(("Backend Services", lower_entities["kafka"]))
     if "samza" in lower_entities and "kafka" in lower_entities:
@@ -289,6 +298,12 @@ def build_troubleshooting_plan(route, evidence) -> AnswerPlan:
             "**Fix:** Check scheduler events, resource requests, node availability, PVC binding, taints, tolerations, and admission policy failures.\n"
             "**Why this works:** `Pending` is usually a placement or dependency problem, so the durable fix comes from the scheduler events and missing prerequisite.\n"
             "**Watch out for:** Low cluster capacity can make `Pending` look intermittent. Check quotas and autoscaler behavior before changing only the pod spec."
+        ),
+        "pod_network": (
+            "**Root Cause:** Pod network failures usually come from CNI health, NetworkPolicy rules, DNS, Service selectors/endpoints, node routing, or an application binding to the wrong interface.\n"
+            "**Fix:** Check the Pod IP, Service endpoints, DNS lookup from another Pod, NetworkPolicy denies, CNI plugin health, node routes, and recent cluster networking changes.\n"
+            "**Why this works:** Pod-to-Pod and Pod-to-Service traffic crosses several layers, so checking each hop isolates whether the failure is policy, DNS, routing, or workload readiness.\n"
+            "**Watch out for:** Restarting the Pod can hide a network-policy or CNI problem. Confirm the traffic path before changing the workload."
         ),
         "service_down": (
             "**Root Cause:** A service being down usually means traffic is not reaching a healthy backend because the pods, endpoints, ingress, load balancer, or network path are unhealthy or misconfigured.\n"
@@ -543,8 +558,6 @@ def build_definition_plan(route, evidence) -> AnswerPlan:
                     preferred_line = cleaned
                     break
         opening = preferred_line or _clean_explanation_line(_first_sentence(lines[0]))
-        if subject.lower() == "kubernetes":
-            opening = "Kubernetes is an open-source platform for deploying, scaling, and operating containerized applications."
         details = []
         for line in lines[1:4]:
             sentence = _clean_explanation_line(_first_sentence(line))
@@ -552,8 +565,6 @@ def build_definition_plan(route, evidence) -> AnswerPlan:
                 continue
             if sentence and sentence.lower() != opening.lower():
                 details.append(f"- {sentence}")
-        if subject.lower() == "kubernetes":
-            details = []
         answer_lines = [opening]
         if details:
             answer_lines.extend(["", "Practical Details:", *details])

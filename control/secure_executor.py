@@ -18,6 +18,25 @@ from control.security_layer import (
 from control.tool_registry import registry as tool_registry
 
 
+def _normalize_source_label(source: str) -> str:
+    normalized = (source or "unknown").strip().lower()
+    mapping = {
+        "ask_command": "direct_raw_command",
+        "ask_operational": "operational_route_deterministic",
+        "ask_operational_llm_fallback": "operational_route_bounded_classifier",
+        "tools_route": "direct_tool_route",
+    }
+    return mapping.get(normalized, normalized or "unknown")
+
+
+def _annotate_route_metadata(metadata: dict | None, source: str) -> dict:
+    route_source = _normalize_source_label(source)
+    enriched = dict(metadata or {})
+    enriched["source"] = route_source
+    enriched["route_source"] = route_source
+    return enriched
+
+
 def _normalize_result(
     *,
     status: str,
@@ -249,16 +268,14 @@ def execute_tool_safe(tool_name: str, tool_args: dict, query: str, source: str =
                 mode="command",
                 error="Missing raw command payload",
                 reason="Missing raw command payload",
-                metadata={"source": source},
+                metadata=_annotate_route_metadata({}, source),
             )
         result = execute_command_secure(cmd.strip(), query)
-        result.setdefault("metadata", {})
-        result["metadata"]["source"] = source
+        result["metadata"] = _annotate_route_metadata(result.get("metadata"), source)
         return result
 
     result = execute_tool_secure(tool_name, tool_args or {}, query)
-    result.setdefault("metadata", {})
-    result["metadata"]["source"] = source
+    result["metadata"] = _annotate_route_metadata(result.get("metadata"), source)
     return result
 
 

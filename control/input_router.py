@@ -55,6 +55,7 @@ TROUBLESHOOTING_TOPIC_PATTERNS = {
     "crashloopbackoff": ["crashloopbackoff", "crashloop"],
     "imagepullbackoff": ["imagepullbackoff", "image pull backoff", "image pull error"],
     "pending": [" pending", "containercreating", "container creating"],
+    "pod_network": ["pod network", "pod networking", "network policy", "cni"],
     "service_down": ["service is down", "service down", "unreachable", "can't connect", "cannot connect", "timeout"],
     "generic": ["error", "failed", "failing", "not working", "broken", "troubleshoot", "debug", "fix", "issue", "problem"],
 }
@@ -69,6 +70,9 @@ FOLLOW_UP_MARKERS = (
     "previous thing i said", "what did i just say", "what did i just ask",
     "different from the previous", "different from what i asked",
     "what we discussed", "compare that with",
+    "do that", "do it", "run that", "run it", "apply that", "apply it",
+    "fix it", "what should i do next", "what is the next step",
+    "run the next step", "continue with that",
 )
 
 COMPARISON_MARKERS = (
@@ -84,7 +88,7 @@ STRONG_DEVOPS_MARKERS = (
     "oomkilled", "crashloopbackoff", "crashloop", "imagepullbackoff", "imagepull",
     "ingress", "pvc", "istio", "grafana", "prometheus", "vault", "opa", "kubectl",
     "dockerfile", "kubeconfig", "pod", "namespace", "deployment", "daemonset",
-    "statefulset", "replicaset", "cronjob", "readiness", "liveness", "probe",
+    "statefulset", "replicaset", "cronjob", "readiness", "liveness", "probe", "linux",
 )
 
 WEAK_DEVOPS_MARKERS = (
@@ -308,16 +312,6 @@ def route_query(
             reason=f"matched ava_self topic '{ava_self_topic}'",
         )
 
-    if is_action_style_query(normalized_query):
-        return IntentRoute(
-            raw_query=raw_query,
-            normalized_query=normalized_query,
-            intent=None,
-            confidence="medium",
-            entities=entities,
-            reason="action-style request bypasses general_qwen routing",
-        )
-
     if is_follow_up_query(normalized_query):
         return IntentRoute(
             raw_query=raw_query,
@@ -327,6 +321,16 @@ def route_query(
             entities=entities,
             topic="follow_up",
             reason="matched controlled follow-up request",
+        )
+
+    if is_action_style_query(normalized_query):
+        return IntentRoute(
+            raw_query=raw_query,
+            normalized_query=normalized_query,
+            intent=None,
+            confidence="medium",
+            entities=entities,
+            reason="action-style request bypasses general_qwen routing",
         )
 
     troubleshooting_topic = classify_troubleshooting_topic(normalized_query)

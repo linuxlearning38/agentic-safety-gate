@@ -13,13 +13,22 @@ import shlex
 import re
 import shutil
 import os
+import json
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Any, List, Optional, Tuple
 from datetime import datetime
 
+try:
+    import ollama
+except Exception:
+    ollama = None
+
 from control.docker_runtime import inspect_docker, list_containers
 from control.vuln_scanner import scan_trivy, check_tools as check_vuln_tools
 from control import database as db
+
+
+LLM_MODEL = os.getenv("AVA_LLM_MODEL", "qwen2.5:14b")
 
 
 # ─── Return type ──────────────────────────────────────────────────────────────
@@ -54,6 +63,21 @@ def _metadata_result(output: str, command_repr: str, metadata: Dict[str, Any]) -
     }
 
 
+def _with_control_metadata(
+    metadata: Dict[str, Any],
+    *,
+    runtime_scope: str = "container_runtime",
+    assessment_mode: str = "deterministic",
+    compliance_note: Optional[str] = None,
+) -> Dict[str, Any]:
+    enriched = dict(metadata)
+    enriched["runtime_scope"] = runtime_scope
+    enriched["assessment_mode"] = assessment_mode
+    if compliance_note:
+        enriched["compliance_note"] = compliance_note
+    return enriched
+
+
 def _concern_metadata(
     title: str,
     severity: str,
@@ -70,6 +94,482 @@ def _concern_metadata(
         "confidence": confidence,
         "is_novel": is_novel,
     }
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if escape:
+            escape = False
+            continue
+        if char == "\\" and in_string:
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    payload = json.loads(text[start:index + 1])
+                except Exception:
+                    return None
+                return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _normalize_reasoned_next_action(action: Any, allowed_actions: List[str]) -> Optional[str]:
+    candidate = str(action or "").strip()
+    if not candidate:
+        return None
+    if candidate in allowed_actions:
+        return candidate
+    allowed_prefixes = [
+        "inspect process ",
+        "inspect service ",
+        "patch package ",
+        "stop suspicious process ",
+        "restart service ",
+    ]
+    if any(candidate.startswith(prefix) for prefix in allowed_prefixes):
+        return candidate
+    return None
+
+
+def _validate_reasoned_assessment(payload: Dict[str, Any], allowed_actions: List[str]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    title = str(payload.get("title") or "").strip()
+    summary = str(payload.get("summary") or "").strip()
+    severity = str(payload.get("severity") or "").strip().lower()
+    confidence = str(payload.get("confidence") or "").strip().lower()
+    next_action = _normalize_reasoned_next_action(payload.get("next_action"), allowed_actions)
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
+    evidence = [str(item).strip() for item in evidence if str(item).strip()][:3]
+    if not title or not summary or not evidence or not next_action:
+        return None
+    if severity not in {"low", "medium", "high", "critical"}:
+        return None
+    if confidence not in {"low", "medium", "high"}:
+        confidence = "medium"
+    is_novel = bool(payload.get("is_novel"))
+    signals = payload.get("signals") if isinstance(payload.get("signals"), list) else []
+    signals = [str(item).strip() for item in signals if str(item).strip()][:6]
+    return {
+        "title": title,
+        "severity": severity,
+        "evidence": evidence,
+        "next_action": next_action,
+        "confidence": confidence,
+        "is_novel": is_novel,
+        "signals": signals,
+        "summary": summary,
+    }
+
+
+def _validate_reasoned_plan(payload: Dict[str, Any], allowed_actions: List[str]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    step = _normalize_reasoned_next_action(payload.get("step"), allowed_actions)
+    rationale = str(payload.get("rationale") or "").strip()
+    priority = str(payload.get("priority") or "").strip().lower()
+    expected_signal = str(payload.get("expected_signal") or "").strip()
+    if not step or not rationale or not expected_signal:
+        return None
+    if priority not in {"low", "medium", "high"}:
+        priority = "medium"
+    return {
+        "step": step,
+        "rationale": rationale,
+        "priority": priority,
+        "expected_signal": expected_signal,
+    }
+
+
+def _validate_remediation_plan(payload: Dict[str, Any], allowed_actions: List[str]) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+    action = _normalize_reasoned_next_action(payload.get("action"), allowed_actions)
+    rationale = str(payload.get("rationale") or "").strip()
+    risk = str(payload.get("risk") or "").strip().lower()
+    precondition = str(payload.get("precondition") or "").strip()
+    rollback = str(payload.get("rollback") or "").strip()
+    if not action or not rationale:
+        return None
+    if risk not in {"low", "medium", "high"}:
+        risk = "medium"
+    if not precondition:
+        precondition = "Confirm the live finding is still present before applying remediation."
+    if not rollback:
+        rollback = "Review command output and revert with the relevant package/service rollback procedure if the change causes impact."
+    return {
+        "action": action,
+        "rationale": rationale,
+        "risk": risk,
+        "approval_required": True,
+        "precondition": precondition,
+        "rollback": rollback,
+    }
+
+
+def _extract_candidate_pids(facts: List[str]) -> List[int]:
+    pids: List[int] = []
+    seen = set()
+    for fact in facts:
+        for match in re.findall(r"pid(?:=|\s)(\d+)", str(fact), flags=re.IGNORECASE):
+            try:
+                pid = int(match)
+            except Exception:
+                continue
+            if pid > 0 and pid not in seen:
+                seen.add(pid)
+                pids.append(pid)
+    return pids
+
+
+def _deterministic_diagnostic_plan_for_step(
+    *,
+    step: str,
+    facts: List[str],
+    objective: str,
+    priority: str = "medium",
+) -> Optional[Dict[str, Any]]:
+    step = str(step or "").strip()
+    if not step:
+        return None
+    if priority not in {"low", "medium", "high"}:
+        priority = "medium"
+
+    if step.startswith("inspect process "):
+        return {
+            "step": step,
+            "rationale": "A process-specific inspection is the safest next step before remediation because it verifies the owner, command path, and runtime context of the observed signal.",
+            "priority": "high",
+            "expected_signal": "Whether the process is expected AVA/container runtime activity or an unexpected executable that needs follow-up.",
+        }
+    if step == "scan my system for vulnerabilities":
+        return {
+            "step": step,
+            "rationale": "The current host-risk picture includes vulnerability exposure, so confirming package-level CVE surface and fixability is the highest-yield diagnostic step.",
+            "priority": "high" if "host-risk" in objective.lower() else priority,
+            "expected_signal": "Which vulnerable packages are highest priority and whether targeted fixes are available.",
+        }
+    if step == "check ssh failures":
+        return {
+            "step": step,
+            "rationale": "Authentication pressure should be validated at the log level before taking action against services, processes, or network access.",
+            "priority": "high",
+            "expected_signal": "Whether failures come from repeated hostile sources, expected admin activity, or a misconfiguration.",
+        }
+    if step == "check failed services":
+        return {
+            "step": step,
+            "rationale": "Service drift is already part of the observed signal set, so failed-unit inspection is the safest way to identify impact before remediation.",
+            "priority": priority,
+            "expected_signal": "Which service is failing and whether the failure is persistent, transient, or environment-limited.",
+        }
+    if step.startswith("inspect service "):
+        return {
+            "step": step,
+            "rationale": "A named service inspection narrows the next step to one explicit target instead of applying broad remediation.",
+            "priority": priority,
+            "expected_signal": "Whether the named service is healthy, failing, or unavailable in the current runtime scope.",
+        }
+    return None
+
+
+def _filter_diagnostic_actions(
+    *,
+    allowed_actions: List[str],
+    facts: List[str],
+    runtime_scope: str,
+) -> List[str]:
+    filtered = list(allowed_actions)
+    fact_blob = "\n".join(str(item) for item in facts).lower()
+    systemd_unavailable = "systemd_unavailable" in fact_blob or "systemd is not running" in fact_blob or "systemd is not available" in fact_blob
+    if systemd_unavailable or runtime_scope.endswith("_limited"):
+        filtered = [item for item in filtered if item not in {"check failed services", "inspect service <name>"}]
+    return filtered
+
+
+def _fallback_diagnostic_plan(
+    *,
+    facts: List[str],
+    allowed_actions: List[str],
+    objective: str,
+) -> Optional[Dict[str, Any]]:
+    facts_blob = "\n".join(str(item) for item in facts).lower()
+    candidate_pids = _extract_candidate_pids(facts)
+    first_pid = candidate_pids[0] if candidate_pids else None
+    inspect_process_step = f"inspect process {first_pid}" if first_pid else "inspect process <pid>"
+
+    if any(marker in facts_blob for marker in ("new listener", "listening endpoint", "unusual listening port")) and any(
+        item == "inspect process <pid>" or item.startswith("inspect process ") for item in allowed_actions
+    ):
+        return _deterministic_diagnostic_plan_for_step(
+            step=inspect_process_step,
+            facts=facts,
+            objective=objective,
+            priority="high",
+        )
+
+    if "runtime cve summary" in facts_blob and "scan my system for vulnerabilities" in allowed_actions:
+        return _deterministic_diagnostic_plan_for_step(
+            step="scan my system for vulnerabilities",
+            facts=facts,
+            objective=objective,
+            priority="high",
+        )
+
+    if "authentication failures increased" in facts_blob and "check ssh failures" in allowed_actions:
+        return _deterministic_diagnostic_plan_for_step(
+            step="check ssh failures",
+            facts=facts,
+            objective=objective,
+            priority="high",
+        )
+
+    if "new failed service" in facts_blob and "check failed services" in allowed_actions:
+        return _deterministic_diagnostic_plan_for_step(
+            step="check failed services",
+            facts=facts,
+            objective=objective,
+            priority="medium",
+        )
+
+    if objective.lower().startswith("choose the single best next diagnostic step for host-risk") and "scan my system for vulnerabilities" in allowed_actions:
+        return _deterministic_diagnostic_plan_for_step(
+            step="scan my system for vulnerabilities",
+            facts=facts,
+            objective=objective,
+            priority="medium",
+        )
+
+    return None
+
+
+def _reason_over_live_signals(
+    *,
+    objective: str,
+    query_hint: str,
+    facts: List[str],
+    allowed_actions: List[str],
+) -> Optional[Dict[str, Any]]:
+    facts = [str(item).strip() for item in facts if str(item).strip()][:12]
+    if len(facts) < 2:
+        return None
+    system_prompt = (
+        "You are AVA's bounded investigation reasoner. "
+        "You may summarize and prioritize live host signals, but you must stay within the supplied evidence and next-action allowlist. "
+        "Never invent tools, commands, or facts. Return JSON only."
+    )
+    user_prompt = (
+        f"Objective: {objective}\n"
+        f"User intent: {query_hint}\n\n"
+        "Observed facts:\n"
+        + "\n".join(f"- {item}" for item in facts)
+        + "\n\nAllowed next actions:\n"
+        + "\n".join(f"- {item}" for item in allowed_actions)
+        + "\n\nReturn exactly one JSON object with schema:\n"
+        '{"title":"","severity":"low|medium|high|critical","evidence":[""],"next_action":"","confidence":"low|medium|high","summary":"","signals":[""],"is_novel":true}\n'
+        "Rules:\n"
+        "- Use only the observed facts.\n"
+        "- Choose one next_action from the allowlist exactly, unless a placeholder already appears there.\n"
+        "- Keep title concrete and operator-focused.\n"
+        "- Evidence must be a subset of the observed facts.\n"
+        "- If signals do not support a meaningful combined assessment, return {}."
+    )
+    try:
+        if ollama is None:
+            return None
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            options={"num_ctx": 4096, "temperature": 0.0},
+        )
+    except Exception:
+        return _fallback_diagnostic_plan(facts=facts, allowed_actions=filtered_actions, objective=objective)
+    payload = _extract_json_object(response.get("message", {}).get("content", ""))
+    if not payload:
+        return None
+    return _validate_reasoned_assessment(payload, allowed_actions)
+
+
+def _plan_next_diagnostic_step(
+    *,
+    objective: str,
+    facts: List[str],
+    allowed_actions: List[str],
+    runtime_scope: str = "container_runtime",
+) -> Optional[Dict[str, Any]]:
+    facts = [str(item).strip() for item in facts if str(item).strip()][:12]
+    if not facts:
+        return None
+    filtered_actions = _filter_diagnostic_actions(
+        allowed_actions=allowed_actions,
+        facts=facts,
+        runtime_scope=runtime_scope,
+    )
+    if not filtered_actions:
+        return None
+    system_prompt = (
+        "You are AVA's bounded diagnostic planner. "
+        "Choose exactly one next diagnostic step from the supplied allowlist. "
+        "Do not invent tools, commands, or facts. Return JSON only."
+    )
+    user_prompt = (
+        f"Objective: {objective}\n\n"
+        "Observed facts:\n"
+        + "\n".join(f"- {item}" for item in facts)
+        + "\n\nAllowed next diagnostic steps:\n"
+        + "\n".join(f"- {item}" for item in filtered_actions)
+        + "\n\nReturn exactly one JSON object with schema:\n"
+        '{"step":"","rationale":"","priority":"low|medium|high","expected_signal":""}\n'
+        "Rules:\n"
+        "- Pick only one step from the allowlist exactly, unless a placeholder action is already in the allowlist.\n"
+        "- Rationale must refer only to the observed facts.\n"
+        "- expected_signal should say what the operator expects to confirm or rule out.\n"
+        "- If no step is justified, return {}."
+    )
+    try:
+        if ollama is None:
+            return _fallback_diagnostic_plan(facts=facts, allowed_actions=filtered_actions, objective=objective)
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            options={"num_ctx": 4096, "temperature": 0.0},
+        )
+    except Exception:
+        return _fallback_diagnostic_plan(facts=facts, allowed_actions=filtered_actions, objective=objective)
+    payload = _extract_json_object(response.get("message", {}).get("content", ""))
+    if not payload:
+        return _fallback_diagnostic_plan(facts=facts, allowed_actions=filtered_actions, objective=objective)
+    validated = _validate_reasoned_plan(payload, filtered_actions)
+    if validated:
+        controlled_plan = _deterministic_diagnostic_plan_for_step(
+            step=validated["step"],
+            facts=facts,
+            objective=objective,
+            priority=validated.get("priority", "medium"),
+        )
+        return controlled_plan or validated
+    return _fallback_diagnostic_plan(facts=facts, allowed_actions=filtered_actions, objective=objective)
+
+
+def _fallback_remediation_plan(
+    *,
+    facts: List[str],
+    allowed_actions: List[str],
+) -> Optional[Dict[str, Any]]:
+    for action in allowed_actions:
+        if action.startswith("patch package "):
+            return _deterministic_remediation_plan_for_action(action, facts)
+    if "install security updates" in allowed_actions:
+        return _deterministic_remediation_plan_for_action("install security updates", facts)
+    return None
+
+
+def _deterministic_remediation_plan_for_action(action: str, facts: List[str]) -> Optional[Dict[str, Any]]:
+    facts_blob = "\n".join(str(item) for item in facts).lower()
+    if action.startswith("patch package "):
+        package = action.replace("patch package ", "", 1).strip()
+        if not package:
+            return None
+        return {
+            "action": action,
+            "rationale": f"Package-level remediation is available for {package}, so targeted patching is safer than broad changes.",
+            "risk": "medium",
+            "approval_required": True,
+            "precondition": "Re-run the vulnerability scan or package check to confirm the package is still affected.",
+            "rollback": "Use package manager history or reinstall the previous package version if the targeted patch causes impact.",
+        }
+    if action == "install security updates":
+        fix_caveat = "no fix available" in facts_blob
+        rationale = "Broad security updates are the only allowlisted remediation path from the current runtime facts."
+        precondition = "Confirm package repositories are healthy and review the pending update set before approval."
+        if fix_caveat:
+            rationale = "The top CVE currently reports no fixed version, but broad security updates may still reduce adjacent package exposure."
+            precondition = "Confirm this action may not fix the top CVE when no fixed version is available."
+        return {
+            "action": "install security updates",
+            "rationale": rationale,
+            "risk": "medium",
+            "approval_required": True,
+            "precondition": precondition,
+            "rollback": "Review package manager history and roll back impacted packages only if the update causes service impact.",
+        }
+    return None
+
+
+def _plan_safe_remediation(
+    *,
+    objective: str,
+    facts: List[str],
+    allowed_actions: List[str],
+) -> Optional[Dict[str, Any]]:
+    facts = [str(item).strip() for item in facts if str(item).strip()][:12]
+    allowed_actions = [str(item).strip() for item in allowed_actions if str(item).strip()]
+    if not facts or not allowed_actions:
+        return None
+    system_prompt = (
+        "You are AVA's bounded remediation planner. "
+        "Choose at most one safe remediation action from the supplied allowlist. "
+        "Do not invent shell commands, tools, package names, or facts. Return JSON only."
+    )
+    user_prompt = (
+        f"Objective: {objective}\n\n"
+        "Observed facts:\n"
+        + "\n".join(f"- {item}" for item in facts)
+        + "\n\nAllowed remediation actions:\n"
+        + "\n".join(f"- {item}" for item in allowed_actions)
+        + "\n\nReturn exactly one JSON object with schema:\n"
+        '{"action":"","rationale":"","risk":"low|medium|high","approval_required":true,"precondition":"","rollback":""}\n'
+        "Rules:\n"
+        "- Pick only one action from the allowlist exactly.\n"
+        "- Any remediation action must require approval.\n"
+        "- Rationale, precondition, and rollback must refer only to observed facts and normal operational caution.\n"
+        "- If remediation is premature or unsupported, return {}."
+    )
+    try:
+        if ollama is None:
+            return _fallback_remediation_plan(facts=facts, allowed_actions=allowed_actions)
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            options={"num_ctx": 4096, "temperature": 0.0},
+        )
+    except Exception:
+        return _fallback_remediation_plan(facts=facts, allowed_actions=allowed_actions)
+    payload = _extract_json_object(response.get("message", {}).get("content", ""))
+    if not payload:
+        return _fallback_remediation_plan(facts=facts, allowed_actions=allowed_actions)
+    validated = _validate_remediation_plan(payload, allowed_actions)
+    if validated:
+        controlled_plan = _deterministic_remediation_plan_for_action(validated["action"], facts)
+        return controlled_plan or validated
+    return _fallback_remediation_plan(facts=facts, allowed_actions=allowed_actions)
 
 
 def _select_primary_concern(candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -504,11 +1004,11 @@ def _inspect_process(args: Dict) -> Dict:
     return _metadata_result(
         "\n\n".join(detail_sections).strip(),
         f"inspect_process:{pid}",
-        {
+        _with_control_metadata({
             "inspection_type": "process",
             "pid": pid,
             "suggested_actions": remediation,
-        },
+        }, runtime_scope="container_runtime_observed"),
     )
 
 
@@ -538,12 +1038,12 @@ def _check_failed_services(args: Dict) -> Dict:
         return _metadata_result(
             _systemd_unavailable_message("Failed service inspection"),
             "systemctl --failed",
-            {
+            _with_control_metadata({
                 "inspection_type": "failed_services",
                 "failed_service_count": 0,
                 "failed_services": [],
                 "environment_note": "systemd_unavailable",
-            },
+            }, runtime_scope="container_runtime_limited", compliance_note="Service-state truth is limited because AVA is running without host systemd context."),
         )
     result = _run(["systemctl", "--failed", "--no-pager", "--no-legend"])
     if result.get("status") != "success":
@@ -553,20 +1053,20 @@ def _check_failed_services(args: Dict) -> Dict:
         return _metadata_result(
             "No failed systemd units detected.",
             result.get("command_repr", "systemctl --failed"),
-            {
+            _with_control_metadata({
                 "inspection_type": "failed_services",
                 "failed_service_count": 0,
                 "failed_services": [],
-            },
+            }, runtime_scope="container_runtime_observed"),
         )
     return _metadata_result(
         output,
         result.get("command_repr", "systemctl --failed"),
-        {
+        _with_control_metadata({
             "inspection_type": "failed_services",
             "failed_service_count": len(_extract_failed_service_names(output)),
             "failed_services": _extract_failed_service_names(output),
-        },
+        }, runtime_scope="container_runtime_observed"),
     )
 
 
@@ -584,12 +1084,12 @@ def _inspect_service(args: Dict) -> Dict:
         return _metadata_result(
             "\n\n".join(sections).strip(),
             f"inspect_service:{service}",
-            {
+            _with_control_metadata({
                 "inspection_type": "service",
                 "service": service,
                 "suggested_actions": remediation,
                 "environment_note": "systemd_unavailable",
-            },
+            }, runtime_scope="container_runtime_limited", compliance_note="Service inspection is limited because AVA is inspecting a container runtime without host systemd."),
         )
     status = _run(["systemctl", "status", service, "--no-pager"])
     if status.get("status") == "success":
@@ -611,11 +1111,11 @@ def _inspect_service(args: Dict) -> Dict:
     return _metadata_result(
         "\n\n".join(section for section in sections if section).strip(),
         f"inspect_service:{service}",
-        {
+        _with_control_metadata({
             "inspection_type": "service",
             "service": service,
             "suggested_actions": remediation,
-        },
+        }, runtime_scope="container_runtime_observed"),
     )
 
 
@@ -875,7 +1375,7 @@ def _scan_host_vulnerabilities(args: Dict) -> Dict:
     return _metadata_result(
         "\n".join(lines).strip(),
         "trivy filesystem /",
-        {
+        _with_control_metadata({
             "inspection_type": "vulnerability_scan",
             "summary": summary,
             "top_findings": findings,
@@ -885,7 +1385,7 @@ def _scan_host_vulnerabilities(args: Dict) -> Dict:
                 "action": "install_updates",
                 "prompt": "install security updates",
             },
-        },
+        }, runtime_scope="container_runtime_filesystem", compliance_note="CVE findings are based on the runtime filesystem AVA can inspect here, not an external host or fleet."),
     )
 
 
@@ -908,9 +1408,11 @@ def _check_suspicious_activity(args: Dict) -> Dict:
 
     failed_services = _check_failed_services({})
     failed_service_names: List[str] = []
+    failed_services_environment_note = ""
     if failed_services.get("status") == "success":
         failed_output = failed_services.get("output", "")
         failed_services_metadata = failed_services.get("metadata") or {}
+        failed_services_environment_note = str(failed_services_metadata.get("environment_note") or "").strip()
         failed_service_names = list((failed_services.get("metadata") or {}).get("failed_services", _extract_failed_service_names(failed_output)) or [])
         sections.append(f"[Failed Services]\n{failed_output}")
         if (
@@ -979,15 +1481,59 @@ def _check_suspicious_activity(args: Dict) -> Dict:
             unique_findings.append(finding)
             seen.add(finding)
 
-    correlated_assessment = _build_correlated_assessment(
-        new_listeners=new_listeners,
-        auth_failure_delta=auth_failure_delta,
-        auth_failure_count=auth_failure_count,
-        new_failed_services=new_failed_services,
-        suspicious_listener_findings=suspicious_listener_findings,
-        suspicious_process_findings=suspicious_process_findings,
-        unique_findings=unique_findings,
+    suspicious_reasoning_facts: List[str] = []
+    if auth_failure_delta > 0:
+        suspicious_reasoning_facts.append(f"Authentication failures increased by +{auth_failure_delta} since baseline (current count: {auth_failure_count}).")
+    elif auth_failure_count > 0:
+        suspicious_reasoning_facts.append(f"Authentication failures observed in current snapshot: {auth_failure_count}.")
+    suspicious_reasoning_facts.extend([f"New listener observed: {item}" for item in new_listeners[:3]])
+    suspicious_reasoning_facts.extend([f"New failed service observed: {item}" for item in new_failed_services[:3]])
+    if failed_services_environment_note:
+        suspicious_reasoning_facts.append(f"Failed services environment note: {failed_services_environment_note}")
+    suspicious_reasoning_facts.extend(suspicious_listener_findings[:2])
+    suspicious_reasoning_facts.extend(suspicious_process_findings[:2])
+    suspicious_reasoning_facts.extend(unique_findings[:4])
+
+    should_reason_suspicious = (
+        (auth_failure_delta > 0 and bool(new_listeners))
+        or (bool(new_listeners) and bool(suspicious_process_findings))
+        or (auth_failure_delta > 0 and bool(new_failed_services))
+        or sum([
+            1 if auth_failure_delta > 0 else 0,
+            1 if bool(new_listeners) else 0,
+            1 if bool(new_failed_services) else 0,
+            1 if bool(suspicious_process_findings) else 0,
+        ]) >= 3
     )
+    correlated_assessment = None
+    suspicious_assessment_mode = "deterministic"
+    if should_reason_suspicious:
+        llm_assessment = _reason_over_live_signals(
+            objective="Identify the strongest combined suspicious-activity story from live host signals.",
+            query_hint="is anything suspicious on this system",
+            facts=suspicious_reasoning_facts,
+            allowed_actions=[
+                "inspect process <pid>",
+                "inspect service <name>",
+                "check ssh failures",
+                "check failed services",
+            ],
+        )
+        if llm_assessment:
+            correlated_assessment = llm_assessment
+            suspicious_assessment_mode = "bounded_reasoner"
+        else:
+            correlated_assessment = _build_correlated_assessment(
+            new_listeners=new_listeners,
+            auth_failure_delta=auth_failure_delta,
+            auth_failure_count=auth_failure_count,
+            new_failed_services=new_failed_services,
+            suspicious_listener_findings=suspicious_listener_findings,
+            suspicious_process_findings=suspicious_process_findings,
+            unique_findings=unique_findings,
+        )
+            if correlated_assessment:
+                suspicious_assessment_mode = "bounded_reasoner_fallback"
 
     suggestion_lines: List[str] = []
     if any("authentication failure" in item for item in unique_findings):
@@ -1006,6 +1552,21 @@ def _check_suspicious_activity(args: Dict) -> Dict:
         suggestion_lines.append("- Investigate newly failed services first; inspect service <name> gives the fastest next step.")
     if not suggestion_lines:
         suggestion_lines.append("- No immediate remediation is suggested from the current signals.")
+
+    investigation_plan = None
+    if unique_findings or correlated_assessment:
+        investigation_plan = _plan_next_diagnostic_step(
+            objective="Choose the single best next diagnostic step for suspicious-activity investigation.",
+            facts=(correlated_assessment.get("evidence", []) if correlated_assessment else []) + unique_findings[:6],
+            allowed_actions=[
+                "inspect process <pid>",
+                "inspect service <name>",
+                "check ssh failures",
+                "check failed services",
+                "check persistence points",
+            ],
+            runtime_scope="container_runtime_limited" if failed_services_environment_note == "systemd_unavailable" else "container_runtime_observed",
+        )
 
     concern_candidates: List[Dict[str, Any]] = []
     if correlated_assessment:
@@ -1093,12 +1654,18 @@ def _check_suspicious_activity(args: Dict) -> Dict:
         if primary_concern:
             insert_at += 1
         sections.insert(insert_at, "[Alerts]\n" + "\n".join(f"- {item}" for item in unique_findings[:12]))
+    if investigation_plan:
+        sections.append("[Next Diagnostic Step]\n" + "\n".join([
+            f"- Step: {investigation_plan['step']}",
+            f"- Why: {investigation_plan['rationale']}",
+            f"- Expect to confirm: {investigation_plan['expected_signal']}",
+        ]))
     sections.append("[Suggested Next Steps]\n" + "\n".join(suggestion_lines))
 
     return _metadata_result(
         header + "\n\n" + "\n\n".join(section for section in sections if section).strip(),
         "tool:check_suspicious_activity",
-        {
+        _with_control_metadata({
             "inspection_type": "suspicious_activity",
             "alerts": unique_findings[:12],
             "suggested_actions": suggestion_lines,
@@ -1109,7 +1676,9 @@ def _check_suspicious_activity(args: Dict) -> Dict:
             "auth_failure_count": auth_failure_count,
             "auth_failure_delta": auth_failure_delta,
             "new_failed_services": new_failed_services[:8],
-        },
+            "failed_services_environment_note": failed_services_environment_note,
+            "investigation_plan": investigation_plan,
+        }, runtime_scope="container_runtime_observed", assessment_mode=suspicious_assessment_mode, compliance_note="Suspicious-activity findings are limited to the runtime AVA can directly observe in this environment."),
     )
 
 
@@ -1157,12 +1726,60 @@ def _assess_host_risk(args: Dict) -> Dict:
     else:
         sections.append("[Package Update Summary]\n" + updates.get("error", "package update check failed"))
 
-    correlated_assessment = _build_host_risk_correlation(
-        vuln_primary=vuln_primary if isinstance(vuln_primary, dict) else None,
-        suspicious_primary=suspicious_primary if isinstance(suspicious_primary, dict) else None,
-        suspicious_metadata=suspicious_metadata,
-        vuln_summary=vuln_metadata.get("summary") or {},
+    host_risk_reasoning_facts: List[str] = []
+    vuln_summary = vuln_metadata.get("summary") or {}
+    critical_count = int(vuln_summary.get("CRITICAL", 0) or 0)
+    high_count = int(vuln_summary.get("HIGH", 0) or 0)
+    if critical_count > 0 or high_count > 0:
+        host_risk_reasoning_facts.append(f"Runtime CVE summary: CRITICAL={critical_count}, HIGH={high_count}.")
+    if isinstance(vuln_primary, dict) and vuln_primary.get("title"):
+        host_risk_reasoning_facts.append(f"Top vulnerability concern: {vuln_primary['title']}")
+    if isinstance(suspicious_primary, dict) and suspicious_primary.get("title"):
+        host_risk_reasoning_facts.append(f"Top suspicious concern: {suspicious_primary['title']}")
+    host_risk_reasoning_facts.extend([f"New listener observed: {item}" for item in list(suspicious_metadata.get("new_listeners") or [])[:3]])
+    auth_failure_delta = int(suspicious_metadata.get("auth_failure_delta", 0) or 0)
+    if auth_failure_delta > 0:
+        host_risk_reasoning_facts.append(f"Authentication failures increased by +{auth_failure_delta} since baseline.")
+    host_risk_reasoning_facts.extend([f"New failed service observed: {item}" for item in list(suspicious_metadata.get("new_failed_services") or [])[:3]])
+    failed_services_environment_note = str(suspicious_metadata.get("failed_services_environment_note") or "").strip()
+    if failed_services_environment_note:
+        host_risk_reasoning_facts.append(f"Failed services environment note: {failed_services_environment_note}")
+
+    should_reason_host_risk = (
+        (critical_count > 0 or high_count > 0)
+        and (
+            bool(suspicious_metadata.get("new_listeners"))
+            or auth_failure_delta > 0
+            or bool(suspicious_metadata.get("new_failed_services"))
+        )
     )
+    correlated_assessment = None
+    host_risk_assessment_mode = "deterministic"
+    if should_reason_host_risk:
+        llm_assessment = _reason_over_live_signals(
+            objective="Assess overall host risk by combining vulnerability posture with suspicious runtime drift.",
+            query_hint="what should I investigate on this host",
+            facts=host_risk_reasoning_facts,
+            allowed_actions=[
+                "patch package <name>",
+                "scan my system for vulnerabilities",
+                "inspect process <pid>",
+                "inspect service <name>",
+                "check failed services",
+            ],
+        )
+        if llm_assessment:
+            correlated_assessment = llm_assessment
+            host_risk_assessment_mode = "bounded_reasoner"
+        else:
+            correlated_assessment = _build_host_risk_correlation(
+            vuln_primary=vuln_primary if isinstance(vuln_primary, dict) else None,
+            suspicious_primary=suspicious_primary if isinstance(suspicious_primary, dict) else None,
+            suspicious_metadata=suspicious_metadata,
+            vuln_summary=vuln_summary,
+        )
+            if correlated_assessment:
+                host_risk_assessment_mode = "bounded_reasoner_fallback"
     if correlated_assessment:
         concern_candidates.append(_concern_metadata(
             title=correlated_assessment["title"],
@@ -1192,6 +1809,34 @@ def _assess_host_risk(args: Dict) -> Dict:
         seen_prompts.add(prompt)
 
     primary_concern = _select_primary_concern(concern_candidates)
+    host_investigation_plan = _plan_next_diagnostic_step(
+        objective="Choose the single best next diagnostic step for host-risk investigation.",
+        facts=(correlated_assessment.get("evidence", []) if correlated_assessment else [])
+        + (primary_concern.get("evidence", []) if isinstance(primary_concern, dict) else [])
+        + host_risk_reasoning_facts[:6],
+        allowed_actions=[
+            "scan my system for vulnerabilities",
+            "check failed services",
+            "inspect process <pid>",
+            "inspect service <name>",
+            "check ssh failures",
+        ],
+        runtime_scope="container_runtime_limited" if failed_services_environment_note == "systemd_unavailable" else "container_runtime_mixed",
+    )
+    remediation_actions = [str(item.get("prompt") or "").strip() for item in deduped_candidates if str(item.get("prompt") or "").strip()]
+    remediation_facts = (
+        (primary_concern.get("evidence", []) if isinstance(primary_concern, dict) else [])
+        + host_risk_reasoning_facts[:6]
+        + [
+            f"Remediation candidate available: {item.get('prompt')} ({item.get('command_intent', item.get('action', ''))})"
+            for item in deduped_candidates[:4]
+        ]
+    )
+    remediation_plan = _plan_safe_remediation(
+        objective="Choose the safest remediation path for the current host-risk assessment without bypassing AVA approval.",
+        facts=remediation_facts,
+        allowed_actions=remediation_actions,
+    )
 
     if correlated_assessment:
         sections.insert(0, "[Correlated Assessment]\n" + "\n".join([
@@ -1207,18 +1852,36 @@ def _assess_host_risk(args: Dict) -> Dict:
             *(f"- Evidence: {item}" for item in primary_concern.get("evidence", [])[:2]),
             f"- Next action: {primary_concern['next_action']}",
         ]))
+    if host_investigation_plan:
+        sections.append("[Next Diagnostic Step]\n" + "\n".join([
+            f"- Step: {host_investigation_plan['step']}",
+            f"- Why: {host_investigation_plan['rationale']}",
+            f"- Expect to confirm: {host_investigation_plan['expected_signal']}",
+        ]))
+    if remediation_plan:
+        approval_note = "required" if remediation_plan.get("approval_required") else "not required"
+        sections.append("[Safest Remediation Path]\n" + "\n".join([
+            f"- Action: {remediation_plan['action']}",
+            f"- Why: {remediation_plan['rationale']}",
+            f"- Risk: {remediation_plan['risk']}",
+            f"- Approval: {approval_note}",
+            f"- Precondition: {remediation_plan['precondition']}",
+            f"- Rollback: {remediation_plan['rollback']}",
+        ]))
     sections.append("[Suggested Next Steps]\n" + "\n".join(deduped_actions))
 
     return _metadata_result(
         "Overall host risk assessment generated from runtime CVEs, suspicious activity, and package update posture.\n\n"
         + "\n\n".join(section for section in sections if section).strip(),
         "tool:assess_host_risk",
-        {
+        _with_control_metadata({
             "inspection_type": "host_risk_assessment",
             "correlated_assessment": correlated_assessment,
             "primary_concern": primary_concern,
             "suggested_actions": deduped_actions,
             "remediation_candidates": deduped_candidates[:6],
+            "remediation_plan": remediation_plan,
+            "investigation_plan": host_investigation_plan,
             "new_listeners": list(suspicious_metadata.get("new_listeners") or [])[:8],
             "new_failed_services": list(suspicious_metadata.get("new_failed_services") or [])[:8],
             "auth_failure_delta": int(suspicious_metadata.get("auth_failure_delta", 0) or 0),
@@ -1227,7 +1890,7 @@ def _assess_host_risk(args: Dict) -> Dict:
                 "suspicious_primary": suspicious_primary,
                 "vulnerability_primary": vuln_primary,
             },
-        },
+        }, runtime_scope="container_runtime_mixed", assessment_mode=host_risk_assessment_mode, compliance_note="Host-risk output is derived from container-visible runtime facts plus runtime filesystem CVE scanning, not full host telemetry."),
     )
 
 

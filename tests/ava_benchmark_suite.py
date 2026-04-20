@@ -22,8 +22,12 @@ FUNCTIONS = {
     "_retrieve_comparison_chunks",
     "_retrieve_definition_chunks",
     "_resolve_follow_up_response",
+    "_resolve_operational_follow_up_response",
     "_resolve_comparison_response",
     "_resolve_definition_response",
+    "_get_recent_operational_turns",
+    "_extract_follow_up_action",
+    "_extract_action_after_label",
     "_retrieve_troubleshooting_chunks",
     "_resolve_troubleshooting_response",
     "_is_healing_query",
@@ -45,6 +49,8 @@ FUNCTIONS = {
     "_answer_ava_self_query",
     "_should_direct_unknown_to_llm",
     "_resolve_general_unknown_response",
+    "_core_definition_terms",
+    "_seed_definition_chunks",
     "detect_query_intent",
 }
 
@@ -53,6 +59,13 @@ CONSTANTS = {
     "_ENTITY_STOP_WORDS",
     "_INFRA_COMPONENTS",
     "_KNOWN_DIAGRAM_TECH",
+    "_FOLLOW_UP_EXECUTION_MARKERS",
+    "_FOLLOW_UP_NEXT_STEP_MARKERS",
+    "_CORE_DEVOPS_DEFINITION_BLOCKS",
+}
+
+CLASSES = {
+    "_SeedKnowledgeChunk",
 }
 
 
@@ -202,6 +215,8 @@ def load_helpers():
             targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
             if any(name in CONSTANTS for name in targets):
                 segments.append(ast.get_source_segment(src, node))
+        elif isinstance(node, ast.ClassDef) and node.name in CLASSES:
+            segments.append(ast.get_source_segment(src, node))
         elif isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS:
             segments.append(ast.get_source_segment(src, node))
     exec("\n\n".join(segments), namespace)
