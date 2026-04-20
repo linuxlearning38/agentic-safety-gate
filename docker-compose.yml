@@ -72,6 +72,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=128m
 
@@ -94,11 +95,22 @@ services:
       FLASK_ENV:           production
       LLM_WARMUP_ENABLED:  "false"
       AVA_MONITOR_ENABLED: "false"
+      AVA_ROOT_READ_ONLY:  "true"
       WEBHOOK_SECRET:      ${WEBHOOK_SECRET:-}
       DB_PATH:             /data/ava.db
       AVA_DATA_DIR:        /data
+      APPROVAL_QUEUE_PATH: /data/approval_queue.json
+      EXECUTION_LOG_PATH:  /data/execution_log.json
+      SECURITY_AUDIT_PATH: /data/security_audit.json
+      SECURITY_AUDIT_LOG:  /data/security_audit.json
+      WHITELIST_PATH:      /data/control_whitelist.json
+      AVA_REPORTS_DIR:     /data/ava_reports
       HOME:                /tmp
       TRIVY_CACHE_DIR:     /tmp/trivy-cache
+      LYNIS_REPORT_PATH:   /tmp/lynis-report.dat
+      LYNIS_LOG_PATH:      /tmp/lynis.log
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPYCACHEPREFIX: /tmp/pycache
       RATELIMIT_STORAGE_URI: redis://redis:6379/0
       DOCKER_HOST:         http://docker-socket-proxy:2375
 

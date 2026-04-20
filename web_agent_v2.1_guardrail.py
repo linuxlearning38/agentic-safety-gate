@@ -4186,6 +4186,11 @@ def security_posture_route():
                 "detail": docker_host or "DOCKER_HOST not set; Docker runtime will fall back to local socket rules.",
             },
             {
+                "name": "Container root filesystem is read-only",
+                "status": "pass" if os.getenv("AVA_ROOT_READ_ONLY", "false").lower() == "true" else "warn",
+                "detail": "read-only root with writable /data and /tmp boundaries" if os.getenv("AVA_ROOT_READ_ONLY", "false").lower() == "true" else "not confirmed by runtime environment",
+            },
+            {
                 "name": "Autonomous monitor is opt-in",
                 "status": "pass" if not monitor_enabled else "warn",
                 "detail": "disabled" if not monitor_enabled else "enabled",
@@ -4211,12 +4216,13 @@ def security_posture_route():
                 "history": os.getenv("HISTORY_FILE", ""),
                 "data_dir": os.getenv("AVA_DATA_DIR", ""),
                 "trivy_cache": os.getenv("TRIVY_CACHE_DIR", ""),
+                "reports": os.getenv("AVA_REPORTS_DIR", ""),
+                "security_audit": os.getenv("SECURITY_AUDIT_PATH", os.getenv("SECURITY_AUDIT_LOG", "")),
             },
             "controls": controls,
             "remaining_gaps": [
                 "No mTLS or signed command protocol for future remote agents yet.",
                 "Audit log integrity is not tamper-resistant yet.",
-                "Container root filesystem is not read-only yet; this was attempted but needs a dedicated compatibility pass.",
                 "OPA is present, but not every action is policy-decided through OPA yet.",
             ],
             "recommended_next_ui_actions": [

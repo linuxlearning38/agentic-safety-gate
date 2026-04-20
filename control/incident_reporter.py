@@ -4,13 +4,13 @@ Incident Report Generator — Day 7, Phase 4
 
 Generates a structured JSON report for every tool execution, graph run,
 ReAct loop, and approved command. Reports are written to:
-    /mnt/i/ai-lab/reports/YYYY-MM-DD/
+    AVA_REPORTS_DIR/YYYY-MM-DD/
 
 Report filename:
     HH-MM-SS_<type>_<short_id>.json
 
 Index file:
-    /mnt/i/ai-lab/reports/index.json  (rolling, last 500 entries)
+    AVA_REPORTS_DIR/index.json  (rolling, last 500 entries)
 """
 
 import os
@@ -22,7 +22,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-REPORTS_DIR = "/mnt/i/ai-lab/reports"
+REPORTS_DIR = os.getenv("AVA_REPORTS_DIR", "/data/reports" if os.path.isdir("/data") else "/home/manoj/ava-data/reports")
 INDEX_FILE  = os.path.join(REPORTS_DIR, "index.json")
 INDEX_MAX   = 500
 

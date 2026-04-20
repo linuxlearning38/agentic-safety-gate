@@ -104,6 +104,7 @@ def main() -> int:
             "no-new-privileges:true" in compose
             and "cap_drop:" in compose
             and "- ALL" in compose
+            and "read_only: true" in compose
             and "/tmp:rw,noexec,nosuid" in compose,
         ),
         check(
@@ -112,6 +113,23 @@ def main() -> int:
             and "DB_PATH:             /data/ava.db" in compose
             and "HISTORY_FILE:        /data/query_history.json" in compose
             and "AVA_DATA_DIR:        /data" in compose,
+        ),
+        check(
+            "all mutable runtime artifacts are redirected away from read-only root",
+            "APPROVAL_QUEUE_PATH: /data/approval_queue.json" in compose
+            and "EXECUTION_LOG_PATH:  /data/execution_log.json" in compose
+            and "SECURITY_AUDIT_PATH: /data/security_audit.json" in compose
+            and "SECURITY_AUDIT_LOG:  /data/security_audit.json" in compose
+            and "WHITELIST_PATH:      /data/control_whitelist.json" in compose
+            and "AVA_REPORTS_DIR:     /data/ava_reports" in compose
+            and "LYNIS_LOG_PATH:      /tmp/lynis.log" in compose
+            and "PYTHONDONTWRITEBYTECODE: \"1\"" in compose,
+        ),
+        check(
+            "security posture reports read-only root as a runtime control",
+            '"Container root filesystem is read-only"' in app
+            and '"AVA_ROOT_READ_ONLY", "false"' in app
+            and "AVA_ROOT_READ_ONLY:  \"true\"" in compose,
         ),
         check(
             "autonomous monitor/healer is opt-in for zero-trust mode",
