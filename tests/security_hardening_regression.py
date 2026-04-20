@@ -132,6 +132,12 @@ def main() -> int:
             and "AVA_ROOT_READ_ONLY:  \"true\"" in compose,
         ),
         check(
+            "audit log integrity is exposed and tamper-evident",
+            "verify_audit_log_integrity" in app
+            and '"Audit log integrity is tamper-evident"' in app
+            and "'audit_integrity': verify_audit_log_integrity(audit_log)" in app,
+        ),
+        check(
             "autonomous monitor/healer is opt-in for zero-trust mode",
             'AVA_MONITOR_ENABLED", "false"' in app
             and 'AVA_MONITOR_ENABLED: "false"' in compose,

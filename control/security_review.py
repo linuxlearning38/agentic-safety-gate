@@ -9,8 +9,10 @@ import os
 from datetime import datetime, timedelta
 from control.approval import get_pending, update_status, load_queue
 from control.registry import add_to_whitelist
+from control.runtime_paths import get_runtime_path
+from control.security_layer import verify_audit_log_integrity
 
-AUDIT_LOG_PATH = "/mnt/i/ai-lab/security_audit.json"
+AUDIT_LOG_PATH = str(get_runtime_path("SECURITY_AUDIT_PATH", "security_audit.json"))
 
 def load_audit_log():
     """Load audit log"""
@@ -109,6 +111,10 @@ def show_dashboard():
     print(f"Approved: {stats['approved']}")
     print(f"Threats Detected: {stats['threats_detected']}")
     print(f"High Risk Commands: {stats['high_risk']}")
+    integrity = verify_audit_log_integrity()
+    print(f"Audit Integrity: {'OK' if integrity.get('ok') else 'FAILED'}")
+    if integrity.get("unsealed_entries"):
+        print(f"Legacy Unsealed Entries: {integrity['unsealed_entries']}")
     
     if stats['threat_types']:
         print("\nThreat Types Detected:")
@@ -261,10 +267,14 @@ def main():
     elif command == 'stats':
         hours = int(sys.argv[2]) if len(sys.argv) > 2 else 24
         stats = get_security_stats(hours)
+        stats["integrity"] = verify_audit_log_integrity()
         
         print(f"\nSecurity Statistics (Last {hours} hours):")
         print(json.dumps(stats, indent=2))
         print()
+
+    elif command == 'verify-integrity':
+        print(json.dumps(verify_audit_log_integrity(), indent=2))
     
     else:
         print(f"Unknown command: {command}")

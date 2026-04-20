@@ -4191,6 +4191,11 @@ def security_posture_route():
                 "detail": "read-only root with writable /data and /tmp boundaries" if os.getenv("AVA_ROOT_READ_ONLY", "false").lower() == "true" else "not confirmed by runtime environment",
             },
             {
+                "name": "Audit log integrity is tamper-evident",
+                "status": "pass",
+                "detail": "New audit entries are hash-chained; set AUDIT_INTEGRITY_KEY for dedicated HMAC sealing.",
+            },
+            {
                 "name": "Autonomous monitor is opt-in",
                 "status": "pass" if not monitor_enabled else "warn",
                 "detail": "disabled" if not monitor_enabled else "enabled",
@@ -4222,7 +4227,7 @@ def security_posture_route():
             "controls": controls,
             "remaining_gaps": [
                 "No mTLS or signed command protocol for future remote agents yet.",
-                "Audit log integrity is not tamper-resistant yet.",
+                "Audit storage is tamper-evident, not append-only; filesystem compromise can still delete the log.",
                 "OPA is present, but not every action is policy-decided through OPA yet.",
             ],
             "recommended_next_ui_actions": [
@@ -4268,6 +4273,7 @@ def get_security_stats_route():
     """Get security statistics for dashboard"""
     try:
         from control.approval import get_pending
+        from control.security_layer import verify_audit_log_integrity
         from datetime import timedelta
         
         # Load audit log
@@ -4291,7 +4297,8 @@ def get_security_stats_route():
             'blocked': len([e for e in recent if e['event_type'] == 'blocked']),
             'pending': len(get_pending()),
             'high_risk': len([e for e in recent if e.get('risk_analysis', {}).get('risk') in ['high', 'critical']]),
-            'threats_detected': sum(len(e.get('threats', [])) for e in recent)
+            'threats_detected': sum(len(e.get('threats', [])) for e in recent),
+            'audit_integrity': verify_audit_log_integrity(audit_log),
         }
         
         return jsonify(stats)
