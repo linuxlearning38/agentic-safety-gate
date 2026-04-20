@@ -157,6 +157,122 @@ def _build_architecture_mermaid(entities: list[str], evidence_blocks: list[str],
     return "\n".join(lines)
 
 
+def _known_architecture_flow_key(normalized_query: str, entities: list[str]) -> str | None:
+    q = (normalized_query or "").lower()
+    entity_text = " ".join(entity.lower() for entity in entities or [])
+    combined = f"{q} {entity_text}"
+    if "ingress" in combined and ("kubernetes" in combined or "k8s" in combined or "request flow" in q):
+        return "kubernetes_ingress"
+    if any(term in combined for term in ("ci/cd", "cicd", "jenkins", "pipeline")) and any(
+        term in q for term in ("flow", "architecture", "diagram", "pipeline")
+    ):
+        return "cicd_pipeline"
+    if "terraform" in combined and any(term in combined for term in ("plan", "apply", "state", "drift", "flow", "diagram")):
+        return "terraform_workflow"
+    return None
+
+
+def _known_architecture_text(flow_key: str) -> str:
+    templates = {
+        "kubernetes_ingress": (
+            "**Components and Roles:**\n"
+            "- **Client/DNS:** Resolves the public hostname and sends HTTP or HTTPS traffic toward the cluster edge.\n"
+            "- **Ingress Controller:** Watches Ingress objects and programs the real proxy or load balancer behavior.\n"
+            "- **Ingress:** Holds host/path/TLS routing rules that map external requests to a Kubernetes Service.\n"
+            "- **Service:** Selects backend Pods by label and exposes stable cluster networking for those Pods.\n"
+            "- **Pods and Readiness:** Only ready Pods should receive traffic through Service endpoints.\n\n"
+            "**Request Flow:**\n"
+            "- Client DNS resolution points traffic to the load balancer or ingress controller.\n"
+            "- The ingress controller evaluates the Ingress host/path/TLS rule and forwards the request to the target Service.\n"
+            "- The Service sends traffic only to ready Pod endpoints; the response returns over the same path.\n\n"
+            "**Data Flow:**\n"
+            "- The HTTP request body flows from client to ingress controller, then to Service, then to a selected Pod.\n"
+            "- Kubernetes endpoint readiness controls which Pods are eligible for live traffic.\n\n"
+            "**Failure Points:**\n"
+            "- DNS record, TLS certificate/secret, ingress class, controller health, host/path rule, Service selector, endpoints, readiness probes, or application port.\n\n"
+            "**Operational Checks:**\n"
+            "- Check DNS, Ingress status/events, controller logs, Service selectors/endpoints, Pod readiness, and recent rollout changes before changing traffic rules."
+        ),
+        "cicd_pipeline": (
+            "**Components and Roles:**\n"
+            "- **Git Repository:** Source of truth for application and infrastructure changes.\n"
+            "- **CI Runner:** Executes build, unit tests, integration tests, and security checks from a clean job environment.\n"
+            "- **Build Artifact/Image:** Immutable output that should be versioned by digest or release identifier.\n"
+            "- **Security Scan:** Checks dependencies, container image, IaC, and secrets before release.\n"
+            "- **Registry:** Stores the approved artifact or image used by deployment.\n"
+            "- **Deployment Controller:** Rolls the artifact into the target runtime and observes health.\n\n"
+            "**Request Flow:**\n"
+            "- Commit or merge triggers CI, CI builds the artifact, tests and scans it, pushes it to the registry, then deploys through the release controller.\n\n"
+            "**Data Flow:**\n"
+            "- Source code becomes a build artifact; metadata, test results, scan results, image digest, and deployment status move through the pipeline as release evidence.\n\n"
+            "**Failure Points:**\n"
+            "- Broken build, flaky tests, failed scan, registry authentication, mutable tags, deployment health checks, missing rollback, or observability gaps.\n\n"
+            "**Operational Checks:**\n"
+            "- Verify pipeline logs, test reports, scan output, artifact digest, deployment events, health probes, and rollback path before promoting the release."
+        ),
+        "terraform_workflow": (
+            "**Components and Roles:**\n"
+            "- **Terraform Configuration:** Desired infrastructure state written as code.\n"
+            "- **Providers:** Plugins that talk to cloud or platform APIs.\n"
+            "- **State Backend:** Tracks real resources Terraform manages and should be locked during updates.\n"
+            "- **Plan:** Shows proposed create/update/delete operations before execution.\n"
+            "- **Apply:** Executes the reviewed plan and updates state after successful changes.\n"
+            "- **Drift Detection:** Compares declared state, recorded state, and real infrastructure behavior.\n\n"
+            "**Request Flow:**\n"
+            "- Operator runs init/validate, creates a plan, reviews the diff and policy checks, approves apply, then verifies the resulting infrastructure.\n\n"
+            "**Data Flow:**\n"
+            "- Configuration and variables feed the plan; provider API reads produce the diff; apply writes changes and records the new resource state.\n\n"
+            "**Failure Points:**\n"
+            "- Provider authentication, backend lock failure, stale state, destructive plan, policy violation, manual drift, or partial apply.\n\n"
+            "**Operational Checks:**\n"
+            "- Review plan output, state lock, backend health, drift report, provider permissions, and rollback/import strategy before applying infrastructure changes."
+        ),
+    }
+    return templates[flow_key]
+
+
+def _known_architecture_mermaid(flow_key: str) -> str:
+    diagrams = {
+        "kubernetes_ingress": (
+            "```mermaid\n"
+            "graph LR\n"
+            "    Client[\"Client\"] --> DNS[\"DNS\"]\n"
+            "    DNS --> Controller[\"Ingress Controller / Load Balancer\"]\n"
+            "    Controller --> Ingress[\"Ingress host/path/TLS rules\"]\n"
+            "    Ingress --> Service[\"Kubernetes Service\"]\n"
+            "    Service --> Endpoints[\"Ready Endpoints\"]\n"
+            "    Endpoints --> Pods[\"Pods\"]\n"
+            "    Readiness[\"Readiness Probes\"] --> Endpoints\n"
+            "```"
+        ),
+        "cicd_pipeline": (
+            "```mermaid\n"
+            "graph LR\n"
+            "    Git[\"Git Commit\"] --> Build[\"Build\"]\n"
+            "    Build --> Test[\"Test\"]\n"
+            "    Test --> Scan[\"Security Scan\"]\n"
+            "    Scan --> Registry[\"Artifact / Image Registry\"]\n"
+            "    Registry --> Deploy[\"Deploy\"]\n"
+            "    Deploy --> Observe[\"Observe Health\"]\n"
+            "    Observe --> Rollback[\"Rollback if unhealthy\"]\n"
+            "```"
+        ),
+        "terraform_workflow": (
+            "```mermaid\n"
+            "graph LR\n"
+            "    Config[\"Terraform Config\"] --> Init[\"Init / Validate\"]\n"
+            "    Init --> Plan[\"Plan\"]\n"
+            "    State[\"State Backend + Lock\"] --> Plan\n"
+            "    Plan --> Review[\"Review / Policy Check\"]\n"
+            "    Review --> Apply[\"Apply\"]\n"
+            "    Apply --> State\n"
+            "    State --> Drift[\"Drift Detection\"]\n"
+            "```"
+        ),
+    }
+    return diagrams[flow_key]
+
+
 def _build_lifecycle_mermaid(normalized_query: str, entities: list[str]) -> str:
     q = (normalized_query or "").lower()
     if "kubernetes" in q or "docker" in q or "devops" in q or "lifecycle" in q:
@@ -360,6 +476,24 @@ def build_architecture_plan(route, evidence) -> AnswerPlan:
     evidence_blocks = list(evidence.evidence_blocks or [])
     topic = evidence.topic or route.topic or "external"
     response_mode = evidence.facts.get("response_mode", route.response_mode or "text")
+    known_flow = None if topic == "self_runtime" else _known_architecture_flow_key(route.normalized_query, entities)
+
+    if known_flow:
+        answer = _known_architecture_mermaid(known_flow) if response_mode == "diagram" else _known_architecture_text(known_flow)
+        return AnswerPlan(
+            intent="architecture",
+            mode="deterministic",
+            topic=known_flow,
+            answer=answer,
+            evidence={
+                "topic": known_flow,
+                "response_mode": response_mode,
+                "evidence_blocks": evidence_blocks,
+                "sources": evidence.facts.get("sources", []),
+            },
+            entities=entities,
+            confidence="high",
+        )
 
     component_lines = []
     for entity in entities[:6]:
