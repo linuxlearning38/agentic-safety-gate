@@ -157,12 +157,14 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
     - Added admin authentication to `/security/stats` and `/security/audit`; unauthenticated calls now return 401 while authenticated admin calls still return 200
     - Replaced raw `str(e)` API responses in sensitive routes with generic user-facing errors while preserving server-side logging
     - Replaced raw LLM exception text in `generate_response` with a generic retry message
+    - Added `tests/security_hardening_regression.py` so these security invariants are regression-tested instead of being remembered as one-off penetration-test answers
     - Verified this is policy-level hardening, not question-answer hardcoding: no default secrets, no unauthenticated internal security telemetry, no exception detail leaks
     - Static verification after hardening:
       - `py_compile`: PASS
       - `tests/intelligence_regression.py`: PASS
       - `tests/hybrid_retrieval_regression.py`: PASS
       - `tests/ava_benchmark_suite.py`: PASS
+      - `tests/security_hardening_regression.py`: PASS
     - Live verification after rebuild:
       - `/health`: OK
       - unauthenticated `/security/stats`: 401
