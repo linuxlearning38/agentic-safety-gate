@@ -703,7 +703,7 @@ def test_fix67_definition_answer_consistency(ns):
 
 
 def test_fix67_architecture_answer_consistency(ns):
-    FLOW_MARKERS = ["**Request Flow:**", "**Data Flow:**"]
+    FLOW_MARKERS = ["**Request Flow:**", "**Pipeline Flow:**", "**Data Flow:**"]
     TROUBLESHOOTING_MARKERS = [
         "**Confirm symptom:**",
         "**Inspect evidence:**",
@@ -1087,6 +1087,7 @@ def main():
     check("patch package maps to patch_package", ns["extract_operational_tool_request"]("patch package openssl") == {"tool_name": "patch_package", "tool_args": {"package": "openssl"}})
     check("vulnerability scan maps to scan_host_vulnerabilities", ns["extract_operational_tool_request"]("scan my system for vulnerabilities") == {"tool_name": "scan_host_vulnerabilities", "tool_args": {}})
     check("suspicious activity maps to check_suspicious_activity", ns["extract_operational_tool_request"]("is anything suspicious on this system") == {"tool_name": "check_suspicious_activity", "tool_args": {}})
+    check("short suspicious activity maps to check_suspicious_activity", ns["extract_operational_tool_request"]("is anything suspicious") == {"tool_name": "check_suspicious_activity", "tool_args": {}})
     check("stop process maps to stop_process", ns["extract_operational_tool_request"]("stop suspicious process 4321") == {"tool_name": "stop_process", "tool_args": {"pid": 4321}})
     check("inspect process maps to inspect_process", ns["extract_operational_tool_request"]("inspect process 4321") == {"tool_name": "inspect_process", "tool_args": {"pid": 4321}})
     check("linux operator comma query splits into multiple parts", ns["detect_multiple_questions"]("show running processes, show listening ports, check ssh failures") == ["show running processes", "show listening ports", "check ssh failures"])
@@ -1315,6 +1316,7 @@ def main():
     check("ingress architecture includes operator checks", "Failure Points" in ingress_architecture["response"] and "Operational Checks" in ingress_architecture["response"])
     cicd_architecture = ns["_resolve_architecture_response"]("Explain CI/CD pipeline flow")
     check("cicd architecture answer is deterministic", cicd_architecture["topic"] == "cicd_pipeline")
+    check("cicd architecture starts with pipeline flow", cicd_architecture["response"].startswith("**Pipeline Flow:**"))
     check("cicd architecture includes release stages", all(term in cicd_architecture["response"] for term in ["Build", "Security Scan", "Registry", "Deployment Controller"]))
     terraform_architecture = ns["_resolve_architecture_response"]("Explain Terraform plan apply state drift flow")
     check("terraform architecture answer is deterministic", terraform_architecture["topic"] == "terraform_workflow")

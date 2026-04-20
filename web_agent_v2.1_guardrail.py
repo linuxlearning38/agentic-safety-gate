@@ -1087,7 +1087,7 @@ def extract_operational_tool_request(query: str) -> dict | None:
         return {"tool_name": "scan_host_vulnerabilities", "tool_args": {}}
 
     if any(phrase in lower for phrase in (
-        "is anything suspicious on this system", "check suspicious activity",
+        "is anything suspicious", "is anything suspicious on this system", "check suspicious activity",
         "review recent security events", "inspect suspicious activity", "check for suspicious activity",
         "is my system suspicious",
     )):

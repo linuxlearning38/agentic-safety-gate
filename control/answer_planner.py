@@ -194,6 +194,8 @@ def _known_architecture_text(flow_key: str) -> str:
             "- Check DNS, Ingress status/events, controller logs, Service selectors/endpoints, Pod readiness, and recent rollout changes before changing traffic rules."
         ),
         "cicd_pipeline": (
+            "**Pipeline Flow:**\n"
+            "- Commit or merge triggers CI, CI builds the artifact, tests and scans it, pushes it to the registry, then deploys through the release controller.\n\n"
             "**Components and Roles:**\n"
             "- **Git Repository:** Source of truth for application and infrastructure changes.\n"
             "- **CI Runner:** Executes build, unit tests, integration tests, and security checks from a clean job environment.\n"
@@ -201,8 +203,6 @@ def _known_architecture_text(flow_key: str) -> str:
             "- **Security Scan:** Checks dependencies, container image, IaC, and secrets before release.\n"
             "- **Registry:** Stores the approved artifact or image used by deployment.\n"
             "- **Deployment Controller:** Rolls the artifact into the target runtime and observes health.\n\n"
-            "**Request Flow:**\n"
-            "- Commit or merge triggers CI, CI builds the artifact, tests and scans it, pushes it to the registry, then deploys through the release controller.\n\n"
             "**Data Flow:**\n"
             "- Source code becomes a build artifact; metadata, test results, scan results, image digest, and deployment status move through the pipeline as release evidence.\n\n"
             "**Failure Points:**\n"
