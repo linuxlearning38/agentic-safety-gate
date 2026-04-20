@@ -153,7 +153,36 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-20 Asia/Calcutta (zero-trust perimeter hardening)
   - 2026-04-20 Asia/Calcutta (read-only root filesystem hardening)
   - 2026-04-20 Asia/Calcutta (audit integrity hardening)
+  - 2026-04-20 Asia/Calcutta (OPA-backed action policy)
 - Latest changes made:
+  - Completed OPA-backed action policy enforcement:
+    - Added `policies/ava_actions.rego`
+    - Added mandatory OPA action decision calls in `control/secure_executor.py`
+    - Default enforcement is enabled through compose:
+      - `AVA_OPA_ACTION_POLICY_ENABLED=true`
+      - `OPA_ACTION_POLICY_URL=http://opa:8181/v1/data/ava/authz/decision`
+    - AVA now asks OPA for action decisions before execution/approval flow:
+      - low risk -> OPA allow required before execution
+      - medium/high risk -> OPA require_approval
+      - critical/destructive/shell-chain patterns -> OPA block
+      - OPA unavailable -> fail closed while enforcement is enabled
+    - Approved raw commands are rechecked against OPA before execution
+    - Tool executions also carry `metadata.opa_policy`
+    - `/security/posture` now reports `Action decisions pass through OPA`
+    - Added `tests/opa_action_policy_regression.py`
+    - Verification:
+      - `py_compile`: PASS
+      - `tests/opa_action_policy_regression.py`: PASS
+      - `tests/security_hardening_regression.py`: PASS
+      - `tests/audit_integrity_regression.py`: PASS
+      - direct OPA decisions:
+        - low `df -h`: allow
+        - medium `systemctl restart docker`: require_approval
+        - critical `rm -rf /`: block
+      - live `/health`: PASS
+      - `tests/ava_e2e_live_test.py`: 8/8 PASS
+      - live `/ask` low-risk result includes OPA allow metadata
+      - live `/security/posture` reports OPA control PASS
   - Completed audit log integrity hardening:
     - Added tamper-evident hash chaining for new security audit entries in `control/security_layer.py`
     - New audit entries now include:

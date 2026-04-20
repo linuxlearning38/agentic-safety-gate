@@ -16,6 +16,14 @@ from control.security_layer import (
     validate_command_safety,
 )
 from control.tool_registry import registry as tool_registry
+import json
+import os
+import urllib.error
+import urllib.request
+
+
+OPA_ACTION_POLICY_URL = os.getenv("OPA_ACTION_POLICY_URL", "http://opa:8181/v1/data/ava/authz/decision")
+OPA_ACTION_POLICY_ENABLED = os.getenv("AVA_OPA_ACTION_POLICY_ENABLED", "true").lower() == "true"
 
 
 def _normalize_source_label(source: str) -> str:
@@ -68,6 +76,68 @@ def _normalize_result(
     }
 
 
+def _opa_action_decision(*, mode: str, risk: str, command: str, query: str, tool_name: str = "", tool_args: dict | None = None, approved: bool = False) -> dict:
+    if not OPA_ACTION_POLICY_ENABLED:
+        return {"effect": "allow", "reason": "OPA action policy disabled", "policy_id": "disabled"}
+
+    payload = {
+        "input": {
+            "mode": mode,
+            "risk": risk,
+            "command": command,
+            "query": query,
+            "tool_name": tool_name,
+            "tool_args": tool_args or {},
+            "approved": approved,
+        }
+    }
+    req = urllib.request.Request(
+        OPA_ACTION_POLICY_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        return {
+            "effect": "block",
+            "reason": f"OPA action policy unavailable: {exc}",
+            "policy_id": "opa_unavailable_fail_closed",
+        }
+
+    result = body.get("result") or {}
+    effect = result.get("effect", "block")
+    if effect not in {"allow", "require_approval", "block"}:
+        effect = "block"
+    return {
+        "effect": effect,
+        "reason": result.get("reason") or "OPA action policy returned no reason",
+        "policy_id": result.get("policy_id") or "ava_action_policy",
+    }
+
+
+def _metadata_with_policy(metadata: dict | None, policy_decision: dict | None) -> dict:
+    enriched = dict(metadata or {})
+    if policy_decision:
+        enriched["opa_policy"] = policy_decision
+    return enriched
+
+
+def _opa_block_result(*, mode: str, risk: str, command_repr: str, policy_decision: dict, threats: list | None = None, blast_radius: str | None = None) -> dict:
+    return _normalize_result(
+        status="blocked",
+        mode=mode,
+        risk=risk,
+        command_repr=command_repr,
+        reason=policy_decision.get("reason", "Blocked by OPA action policy"),
+        threats=threats or [],
+        blast_radius=blast_radius,
+        metadata={"opa_policy": policy_decision},
+    )
+
+
 def _queue_for_approval(cmd, query, security_analysis, risk, threats, decision, *, mode, approval_key):
     approval_id = add_request(
         cmd,
@@ -111,13 +181,26 @@ def _tool_security_analysis(tool_name: str, tool_args: dict, risk: str):
     }
 
 
-def _execute_tool_now(tool_name: str, tool_args: dict, query: str, *, risk: str, approval_id=None, whitelisted=False):
+def _execute_tool_now(tool_name: str, tool_args: dict, query: str, *, risk: str, approval_id=None, whitelisted=False, policy_decision: dict | None = None):
+    cmd_repr = f"tool:{tool_name}({tool_args})"
+    policy_decision = policy_decision or _opa_action_decision(
+        mode="tool",
+        risk=risk,
+        command=cmd_repr,
+        query=query,
+        tool_name=tool_name,
+        tool_args=tool_args,
+        approved=bool(approval_id or whitelisted or risk == "low"),
+    )
+    if policy_decision["effect"] == "block":
+        return _opa_block_result(mode="tool", risk=risk, command_repr=cmd_repr, policy_decision=policy_decision)
+
     result = tool_registry.execute(tool_name, tool_args)
     execution_log(query, f"tool:{tool_name}({tool_args})", result)
     if approval_id:
         update_status(approval_id, "executed")
     status = "success" if result.get("status") == "success" else "failed"
-    metadata = {"tool_name": tool_name, "tool_args": tool_args, "tool_status": result.get("status")}
+    metadata = {"tool_name": tool_name, "tool_args": tool_args, "tool_status": result.get("status"), "opa_policy": policy_decision}
     if isinstance(result.get("metadata"), dict):
         metadata.update(result["metadata"])
     return _normalize_result(
@@ -134,7 +217,7 @@ def _execute_tool_now(tool_name: str, tool_args: dict, query: str, *, risk: str,
     )
 
 
-def _execute_raw_command_now(cmd, query, security_analysis, risk, threats, approval_id=None, whitelisted=False):
+def _execute_raw_command_now(cmd, query, security_analysis, risk, threats, approval_id=None, whitelisted=False, policy_decision: dict | None = None):
     import shlex
     from control.tool_registry import _run
 
@@ -153,6 +236,31 @@ def _execute_raw_command_now(cmd, query, security_analysis, risk, threats, appro
         )
 
     args = shlex.split(cmd)
+    policy_decision = policy_decision or _opa_action_decision(
+        mode="command",
+        risk=risk,
+        command=cmd,
+        query=query,
+        approved=bool(approval_id or whitelisted or risk == "low"),
+    )
+    if policy_decision["effect"] == "block":
+        security_audit_log(
+            event_type="blocked",
+            cmd=cmd,
+            query=query,
+            risk_analysis=security_analysis["risk_analysis"],
+            threats=threats,
+            decision="blocked_by_opa_policy",
+        )
+        return _opa_block_result(
+            mode="command",
+            risk=risk,
+            command_repr=cmd,
+            policy_decision=policy_decision,
+            threats=threats,
+            blast_radius=security_analysis["risk_analysis"]["blast_radius"],
+        )
+
     result = _run(args, timeout=15)
     execution_log(query, cmd, result)
     security_audit_log(
@@ -178,6 +286,7 @@ def _execute_raw_command_now(cmd, query, security_analysis, risk, threats, appro
         reason=result.get("error", "") if status != "success" else "",
         threats=threats,
         blast_radius=security_analysis["risk_analysis"]["blast_radius"],
+        metadata={"opa_policy": policy_decision},
     )
 
 
@@ -211,8 +320,39 @@ def execute_tool_secure(tool_name: str, tool_args: dict, query: str) -> dict:
     approval_key = f"tool:{tool_name}"
     security_analysis = _tool_security_analysis(tool_name, tool_args, risk)
     whitelisted = is_approved(approval_key) or is_approved(cmd_repr)
+    policy_decision = _opa_action_decision(
+        mode="tool",
+        risk=risk,
+        command=cmd_repr,
+        query=query,
+        tool_name=tool_name,
+        tool_args=tool_args,
+        approved=bool(whitelisted),
+    )
+
+    if policy_decision["effect"] == "block":
+        security_audit_log(
+            event_type="blocked",
+            cmd=cmd_repr,
+            query=query,
+            risk_analysis=security_analysis["risk_analysis"],
+            threats=[],
+            decision="blocked_by_opa_policy",
+        )
+        return _opa_block_result(mode="tool", risk=risk, command_repr=cmd_repr, policy_decision=policy_decision)
 
     if risk == "low":
+        if policy_decision["effect"] == "require_approval":
+            return _queue_for_approval(
+                cmd_repr,
+                query,
+                security_analysis,
+                risk,
+                [],
+                "opa_policy_requires_approval",
+                mode="tool",
+                approval_key=approval_key,
+            )
         security_audit_log(
             event_type="executed",
             cmd=cmd_repr,
@@ -221,7 +361,7 @@ def execute_tool_secure(tool_name: str, tool_args: dict, query: str) -> dict:
             threats=[],
             decision="auto_execute_low_risk_tool",
         )
-        return _execute_tool_now(tool_name, tool_args, query, risk=risk, whitelisted=whitelisted)
+        return _execute_tool_now(tool_name, tool_args, query, risk=risk, whitelisted=whitelisted, policy_decision=policy_decision)
 
     was_approved, approval_id = check_recent_approval(approval_key, minutes=10)
     if was_approved or whitelisted:
@@ -240,6 +380,7 @@ def execute_tool_secure(tool_name: str, tool_args: dict, query: str) -> dict:
             risk=risk,
             approval_id=approval_id if was_approved else None,
             whitelisted=whitelisted,
+            policy_decision=policy_decision,
         )
 
     return _queue_for_approval(
@@ -314,6 +455,42 @@ def execute_command_secure(cmd: str, query: str) -> dict:
             blast_radius=security_analysis["risk_analysis"]["blast_radius"],
         )
 
+    policy_decision = _opa_action_decision(
+        mode="command",
+        risk=risk,
+        command=cmd,
+        query=query,
+        approved=False,
+    )
+    if policy_decision["effect"] == "block":
+        security_audit_log(
+            event_type="blocked",
+            cmd=cmd,
+            query=query,
+            risk_analysis=security_analysis["risk_analysis"],
+            threats=threats,
+            decision="blocked_by_opa_policy",
+        )
+        return _opa_block_result(
+            mode="command",
+            risk=risk,
+            command_repr=cmd,
+            policy_decision=policy_decision,
+            threats=threats,
+            blast_radius=security_analysis["risk_analysis"]["blast_radius"],
+        )
+    if risk == "low" and policy_decision["effect"] == "require_approval":
+        return _queue_for_approval(
+            cmd,
+            query,
+            security_analysis,
+            risk,
+            threats,
+            "opa_policy_requires_approval",
+            mode="command",
+            approval_key=normalize_command_signature(cmd),
+        )
+
     whitelisted = is_approved(cmd)
     normalized_cmd = normalize_command_signature(cmd)
     if risk == "low":
@@ -343,6 +520,7 @@ def execute_command_secure(cmd: str, query: str) -> dict:
             risk,
             threats,
             whitelisted=whitelisted,
+            policy_decision=policy_decision,
         )
 
     was_approved, approval_id = check_recent_approval(normalized_cmd, minutes=10)
@@ -366,6 +544,7 @@ def execute_command_secure(cmd: str, query: str) -> dict:
             threats,
             approval_id=approval_id if was_approved else None,
             whitelisted=whitelisted,
+            policy_decision=policy_decision,
         )
 
     return _queue_for_approval(
@@ -432,6 +611,32 @@ def execute_approved_command(approval_id: str) -> dict:
             )
     else:
         # Legacy path — shlex.split, no shell
+        security_analysis = analyze_command_security(cmd, query)
+        risk = entry.get("risk") or security_analysis["risk_analysis"]["risk"]
+        policy_decision = _opa_action_decision(
+            mode="command",
+            risk=risk,
+            command=cmd,
+            query=query,
+            approved=True,
+        )
+        if policy_decision["effect"] == "block":
+            security_audit_log(
+                event_type="blocked",
+                cmd=cmd,
+                query=query,
+                risk_analysis=security_analysis["risk_analysis"],
+                threats=security_analysis["threats"],
+                decision="approved_execution_blocked_by_opa_policy",
+            )
+            return _opa_block_result(
+                mode="command",
+                risk=risk,
+                command_repr=cmd,
+                policy_decision=policy_decision,
+                threats=security_analysis["threats"],
+                blast_radius=security_analysis["risk_analysis"]["blast_radius"],
+            )
         args   = shlex.split(cmd)
         raw_result = _run(args, timeout=15)
         execution_log(query, cmd, raw_result)
@@ -439,12 +644,13 @@ def execute_approved_command(approval_id: str) -> dict:
         result = _normalize_result(
             status="success" if raw_result.get("status") == "success" else "failed",
             mode="command",
-            risk=entry.get("risk") or "medium",
+            risk=risk,
             approval_id=approval_id,
             command_repr=raw_result.get("command_repr", cmd),
             output=raw_result.get("output", ""),
             error=raw_result.get("error", ""),
             reason=raw_result.get("error", "") if raw_result.get("status") != "success" else "",
+            metadata={"opa_policy": policy_decision},
         )
 
     return result
