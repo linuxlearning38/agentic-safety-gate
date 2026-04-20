@@ -33,9 +33,16 @@ def _route_block(source: str, route: str) -> str:
     return match.group(0)
 
 
+def _compose_service_block(source: str, service: str) -> str:
+    pattern = re.compile(rf"^  {re.escape(service)}:\n(?P<body>.*?)(?=^  [a-zA-Z0-9_-]+:|\Z)", re.DOTALL | re.MULTILINE)
+    match = pattern.search(source)
+    return match.group(0) if match else ""
+
+
 def main() -> int:
     app = _read(APP)
     compose = _read(COMPOSE)
+    ava_service = _compose_service_block(compose, "ava")
 
     checks = [
         check(
@@ -57,6 +64,12 @@ def main() -> int:
             "@require_admin" in _route_block(app, "/security/audit"),
         ),
         check(
+            "/security/posture requires admin auth and reports non-perfect zero trust",
+            "@require_admin" in _route_block(app, "/security/posture")
+            and '"perfect_zero_trust": False' in app
+            and "remaining_gaps" in app,
+        ),
+        check(
             "hardened sensitive route errors do not return raw exception strings",
             "return jsonify({'error': str(e)}), 500" not in app
             and 'return jsonify({"error": str(e)}), 500' not in app
@@ -65,6 +78,45 @@ def main() -> int:
         check(
             "LLM generation errors do not expose raw exception text",
             "Error generating response: {str(e)}" not in app,
+        ),
+        check(
+            "rate limiting uses shared Redis storage by default",
+            'storage_uri=RATE_LIMIT_STORAGE_URI' in app
+            and 'redis://redis:6379/0' in app
+            and '"storage": RATE_LIMIT_STORAGE_URI' in app
+            and 'storage_uri="memory://"' not in app,
+        ),
+        check(
+            "internal dependency ports are bound to localhost only",
+            '"127.0.0.1:6379:6379"' in compose
+            and '"127.0.0.1:5432:5432"' in compose
+            and '"127.0.0.1:8181:8181"' in compose
+            and '"127.0.0.1:8200:8200"' in compose,
+        ),
+        check(
+            "AVA does not mount the Docker socket directly",
+            "- /var/run/docker.sock:/var/run/docker.sock" not in ava_service
+            and "docker-socket-proxy:" in compose
+            and "DOCKER_HOST:         http://docker-socket-proxy:2375" in compose,
+        ),
+        check(
+            "AVA container has baseline confinement options",
+            "no-new-privileges:true" in compose
+            and "cap_drop:" in compose
+            and "- ALL" in compose
+            and "/tmp:rw,noexec,nosuid" in compose,
+        ),
+        check(
+            "runtime write paths stay inside explicit writable data boundary",
+            'user: "999:999"' in compose
+            and "DB_PATH:             /data/ava.db" in compose
+            and "HISTORY_FILE:        /data/query_history.json" in compose
+            and "AVA_DATA_DIR:        /data" in compose,
+        ),
+        check(
+            "autonomous monitor/healer is opt-in for zero-trust mode",
+            'AVA_MONITOR_ENABLED", "false"' in app
+            and 'AVA_MONITOR_ENABLED: "false"' in compose,
         ),
     ]
 

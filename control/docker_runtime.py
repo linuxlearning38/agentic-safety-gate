@@ -10,12 +10,17 @@ from __future__ import annotations
 import json
 import os
 import socket
+import http.client
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 
 DOCKER_SOCKET_PATH = os.getenv("DOCKER_SOCKET_PATH", "/var/run/docker.sock")
+DOCKER_HOST = os.getenv("DOCKER_HOST", "").strip()
+
+_ALLOWED_GET_PATHS = {"/version", "/info"}
+_ALLOWED_GET_PREFIXES = ("/containers/json?",)
 
 
 def _result(status: str, output: str = "", error: str = "", command_repr: str = "docker_api") -> Dict[str, Any]:
@@ -29,11 +34,24 @@ def _result(status: str, output: str = "", error: str = "", command_repr: str = 
 
 
 def docker_socket_available() -> Tuple[bool, str]:
+    if DOCKER_HOST:
+        parsed = urlparse(DOCKER_HOST if "://" in DOCKER_HOST else f"http://{DOCKER_HOST}")
+        if parsed.scheme not in {"http", "tcp"} or not parsed.hostname:
+            return False, f"Unsupported Docker host: {DOCKER_HOST}"
+        return True, ""
     if not os.path.exists(DOCKER_SOCKET_PATH):
         return False, f"Docker socket not found: {DOCKER_SOCKET_PATH}"
     if not os.access(DOCKER_SOCKET_PATH, os.R_OK | os.W_OK):
         return False, f"Docker socket not accessible: {DOCKER_SOCKET_PATH}"
     return True, ""
+
+
+def _assert_allowed_read_path(path: str) -> None:
+    if path in _ALLOWED_GET_PATHS:
+        return
+    if any(path.startswith(prefix) for prefix in _ALLOWED_GET_PREFIXES):
+        return
+    raise RuntimeError(f"Docker API path is not in AVA read-only allowlist: {path}")
 
 
 def _decode_chunked_body(body: bytes) -> bytes:
@@ -61,9 +79,22 @@ def _decode_chunked_body(body: bytes) -> bytes:
 
 
 def _request(path: str, timeout: int = 5) -> Tuple[int, bytes]:
+    _assert_allowed_read_path(path)
     ok, err = docker_socket_available()
     if not ok:
         raise RuntimeError(err)
+
+    if DOCKER_HOST:
+        parsed = urlparse(DOCKER_HOST if "://" in DOCKER_HOST else f"http://{DOCKER_HOST}")
+        host = parsed.hostname
+        port = parsed.port or 2375
+        conn = http.client.HTTPConnection(host, port=port, timeout=timeout)
+        try:
+            conn.request("GET", path, headers={"User-Agent": "ava-docker-runtime/1.0"})
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
 
     req = (
         f"GET {path} HTTP/1.1\r\n"

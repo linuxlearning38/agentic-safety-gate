@@ -150,7 +150,49 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-20 Asia/Calcutta (Fix #7.2)
   - 2026-04-20 Asia/Calcutta (Fix #7.2 live verification hardening)
   - 2026-04-20 Asia/Calcutta (pre-pen-test hardening)
+  - 2026-04-20 Asia/Calcutta (zero-trust perimeter hardening)
 - Latest changes made:
+  - In progress: zero-trust perimeter hardening for the remaining pre-professional-pen-test gaps:
+    - AVA should not be described as "perfect zero trust"; the target is measurable zero-trust controls with reduced blast radius and regression coverage
+    - Added Redis-backed Flask-Limiter storage via `RATELIMIT_STORAGE_URI` / `AVA_RATE_LIMIT_STORAGE_URI`, defaulting to `redis://redis:6379/0` using the Compose service DNS name
+    - Added `redis==5.2.1` to runtime dependencies so Flask-Limiter can use Redis storage
+    - Bound local dependency ports to localhost only in compose: Redis, Postgres, OPA, and Vault
+    - Removed direct Docker socket mount from the AVA container
+    - Added `docker-socket-proxy` and routed AVA Docker inspection through `DOCKER_HOST=http://docker-socket-proxy:2375`
+    - Added read-only Docker API path enforcement in `control/docker_runtime.py`; only `/version`, `/info`, and `/containers/json?...` are allowed by AVA's Docker runtime client
+    - Added baseline container confinement for AVA: non-root host-data owner `999:999`, `no-new-privileges`, `cap_drop: ALL`, and a restricted `/tmp` tmpfs
+    - Changed AVA runtime write paths to explicit writable data boundaries under `/data` and `/tmp`, including `DB_PATH=/data/ava.db`, `HISTORY_FILE=/data/query_history.json`, Gunicorn logs under `/tmp`, and `TRIVY_CACHE_DIR=/tmp/trivy-cache`
+    - Added/updated regression coverage:
+      - `tests/security_hardening_regression.py` checks Redis rate-limit storage, localhost port bindings, no direct AVA Docker socket mount, container confinement, and runtime write boundaries
+      - `tests/docker_runtime_security_regression.py` checks Docker runtime read-only allowlist behavior
+    - Verification completed before live restart:
+      - `py_compile`: PASS
+      - `tests/security_hardening_regression.py`: PASS
+      - `tests/docker_runtime_security_regression.py`: PASS
+      - `docker compose config --quiet`: PASS
+      - `tests/intelligence_regression.py`: PASS
+      - `tests/hybrid_retrieval_regression.py`: PASS
+      - `tests/ava_benchmark_suite.py`: PASS
+    - Live restart exposed runtime issues under read-only root and bind-mount ownership; compose now runs AVA as UID/GID `999:999`, matching the existing `/home/manoj/ava-data` ownership, but `read_only: true` was not kept because it caused repeated clean Gunicorn exits without a stable live service
+    - Windows-side verification exposed that binding AVA itself to `127.0.0.1` inside Docker/WSL breaks the existing `https://localhost:5443` test/UI path, so only internal dependencies are localhost-bound; AVA HTTPS remains published for the local app entry point
+    - Live E2E exposed a reliability issue where background LLM warmup overlapped with knowledge retrieval and Ollama dropped a connection, causing a worker restart; hardened compose now sets `LLM_WARMUP_ENABLED=false` so user requests do not compete with a background warmup call
+    - The 60-second autonomous monitor/self-healer loop is now opt-in via `AVA_MONITOR_ENABLED=true`; zero-trust mode should not run background remediation implicitly
+    - Added admin-only `/security/posture` so the UI can report active hardening controls from runtime config instead of relying on static copy
+    - Updated the Security modal with:
+      - zero-trust posture summary
+      - pass/watch control list
+      - known remaining gaps
+      - quick diagnostic action buttons for system verification, Docker inspection, suspicious activity, and vulnerability scanning
+    - Current zero-trust wording standard:
+      - never claim "perfect zero trust"
+      - say "zero-trust-aligned local hardening" unless signed agents, mTLS, OPA-backed fleet policy, and tamper-resistant audit storage are implemented
+    - Verification after hardening/UI posture update:
+      - `/health` from Windows and WSL: PASS
+      - Docker inspection through proxy: PASS
+      - `tests/security_hardening_regression.py`: PASS
+      - `tests/docker_runtime_security_regression.py`: PASS
+      - `tests/ava_e2e_live_test.py`: 8/8 PASS
+      - paced security smoke: 26/26 PASS
   - Completed pre-penetration-test hardening for known application-layer findings:
     - Removed the hardcoded webhook secret fallback; `WEBHOOK_SECRET` now defaults to empty and `/webhook` is disabled until an explicit secret is configured
     - Removed the matching docker-compose fallback so deployments no longer silently use `ava-webhook-2026`
