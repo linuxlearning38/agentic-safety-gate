@@ -97,15 +97,17 @@ def _on_rate_limit_breach(limit):
         f"path='{request.path}'"
     )
 
+RATE_LIMIT_STORAGE_URI = os.getenv("RATELIMIT_STORAGE_URI", os.getenv("AVA_RATE_LIMIT_STORAGE_URI", "redis://redis:6379/0"))
+
 limiter = Limiter(
     app=app,
     key_func=_rate_limit_key,
     default_limits=["30 per minute"],
-    storage_uri="memory://",
+    storage_uri=RATE_LIMIT_STORAGE_URI,
     headers_enabled=True,
     swallow_errors=True,
 )
-logger.info("[RateLimit] Flask-Limiter initialised — default: 30 req/min per user")
+logger.info(f"[RateLimit] Flask-Limiter initialised — default: 30 req/min per user, storage={RATE_LIMIT_STORAGE_URI}")
 
 
 @app.before_request
@@ -227,7 +229,10 @@ db.init_db()
 
 # Phase 5C: background health monitor
 from control.monitor import start_monitor
-start_monitor()
+if os.getenv("AVA_MONITOR_ENABLED", "false").lower() == "true":
+    start_monitor()
+else:
+    logger.info("[Monitor] Background health monitor disabled by default; set AVA_MONITOR_ENABLED=true to enable.")
 
 # Command whitelist - expanded for server management
 ALLOWED_COMMANDS = [
@@ -4134,11 +4139,97 @@ def rate_limit_status():
             "/react/run":        "5 per minute",
             "/auth/login":       "10 per minute (per IP, unauthenticated)",
         },
-        "storage": "in-memory (resets on restart)",
+        "storage": RATE_LIMIT_STORAGE_URI,
         "headers": "X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset",
         "note":    "Rate limits are per-user for authenticated endpoints, per-IP for login.",
     }
     return jsonify(limits)
+
+
+@app.route('/security/posture', methods=['GET'])
+@require_admin
+def security_posture_route():
+    """
+    GET /security/posture
+    Admin-only runtime posture summary for the UI. This reports active
+    zero-trust controls instead of relying on static documentation.
+    """
+    try:
+        docker_host = os.getenv("DOCKER_HOST", "")
+        webhook_secret_configured = bool(os.getenv("WEBHOOK_SECRET", "").strip())
+        monitor_enabled = os.getenv("AVA_MONITOR_ENABLED", "false").lower() == "true"
+        warmup_enabled = os.getenv("LLM_WARMUP_ENABLED", "false").lower() == "true"
+
+        controls = [
+            {
+                "name": "Security telemetry requires admin",
+                "status": "pass",
+                "detail": "/security/stats and /security/audit are protected by admin JWT.",
+            },
+            {
+                "name": "Webhook has no default secret",
+                "status": "pass" if webhook_secret_configured else "warn",
+                "detail": (
+                    "Explicit WEBHOOK_SECRET is configured."
+                    if webhook_secret_configured
+                    else "Webhook is disabled until WEBHOOK_SECRET is explicitly configured."
+                ),
+            },
+            {
+                "name": "Rate limiting uses shared storage",
+                "status": "pass" if RATE_LIMIT_STORAGE_URI.startswith("redis://") else "warn",
+                "detail": RATE_LIMIT_STORAGE_URI,
+            },
+            {
+                "name": "Docker access is proxied",
+                "status": "pass" if docker_host.startswith("http://docker-socket-proxy") else "warn",
+                "detail": docker_host or "DOCKER_HOST not set; Docker runtime will fall back to local socket rules.",
+            },
+            {
+                "name": "Autonomous monitor is opt-in",
+                "status": "pass" if not monitor_enabled else "warn",
+                "detail": "disabled" if not monitor_enabled else "enabled",
+            },
+            {
+                "name": "LLM warmup is opt-in",
+                "status": "pass" if not warmup_enabled else "warn",
+                "detail": "disabled" if not warmup_enabled else "enabled",
+            },
+        ]
+
+        posture = {
+            "mode": "zero-trust-aligned local hardening",
+            "perfect_zero_trust": False,
+            "summary": "AVA is hardened for local/personal penetration testing, but enterprise zero-trust still needs signed agents, mTLS, policy-backed fleet actions, and tamper-resistant audit storage.",
+            "rate_limit_storage": RATE_LIMIT_STORAGE_URI,
+            "docker_access": "proxy" if docker_host else "local_socket_fallback",
+            "webhook_enabled": webhook_secret_configured,
+            "autonomous_monitor_enabled": monitor_enabled,
+            "llm_warmup_enabled": warmup_enabled,
+            "runtime_paths": {
+                "db": os.getenv("DB_PATH", ""),
+                "history": os.getenv("HISTORY_FILE", ""),
+                "data_dir": os.getenv("AVA_DATA_DIR", ""),
+                "trivy_cache": os.getenv("TRIVY_CACHE_DIR", ""),
+            },
+            "controls": controls,
+            "remaining_gaps": [
+                "No mTLS or signed command protocol for future remote agents yet.",
+                "Audit log integrity is not tamper-resistant yet.",
+                "Container root filesystem is not read-only yet; this was attempted but needs a dedicated compatibility pass.",
+                "OPA is present, but not every action is policy-decided through OPA yet.",
+            ],
+            "recommended_next_ui_actions": [
+                "verify my system",
+                "check docker",
+                "look for suspicious activity",
+                "scan my system for vulnerabilities",
+            ],
+        }
+        return jsonify(posture)
+    except Exception as e:
+        logger.error(f"Error getting security posture: {e}")
+        return _api_error("Security posture is unavailable")
 
 
 @app.errorhandler(404)
@@ -7009,10 +7100,11 @@ HTML_TEMPLATE = r'''
         function loadSecurityData() {
             Promise.all([
                 fetch('/security/stats').then(r => r.json()),
-                fetch('/security/audit?count=10').then(r => r.json())
+                fetch('/security/audit?count=10').then(r => r.json()),
+                fetch('/security/posture').then(r => r.json())
             ])
-            .then(([stats, audit]) => {
-                displaySecurityData(stats, audit);
+            .then(([stats, audit, posture]) => {
+                displaySecurityData(stats, audit, posture);
             })
             .catch(err => {
                 console.error('Error loading security data:', err);
@@ -7021,7 +7113,7 @@ HTML_TEMPLATE = r'''
             });
         }
         
-        function displaySecurityData(stats, audit) {
+        function displaySecurityData(stats, audit, posture) {
             const quickApprovalCount = document.getElementById('quickApprovalCount');
             const quickBlockedCount = document.getElementById('quickBlockedCount');
             if (quickApprovalCount) quickApprovalCount.textContent = stats.pending || 0;
@@ -7040,6 +7132,42 @@ HTML_TEMPLATE = r'''
             const content = document.getElementById('securityContent');
             
             let html = '<div style="margin-bottom: 24px;">';
+            html += '<h3 style="margin-bottom: 12px; font-size: 14px; color: #888; text-transform: uppercase;">Zero-Trust Posture</h3>';
+            html += `<div class="stat-card" style="margin-bottom: 12px;">
+                <div class="stat-label">Runtime Mode</div>
+                <div class="stat-value" style="font-size: 18px;">${escapeHtml(posture.mode || 'unknown')}</div>
+                <div style="color: #aaa; font-size: 12px; line-height: 1.55; margin-top: 8px;">${escapeHtml(posture.summary || '')}</div>
+            </div>`;
+
+            if (posture.controls && posture.controls.length > 0) {
+                posture.controls.forEach(control => {
+                    const status = control.status === 'pass' ? 'success' : 'danger';
+                    const label = control.status === 'pass' ? 'PASS' : 'WATCH';
+                    html += `<div class="security-stat">
+                        <span class="security-stat-label">${escapeHtml(control.name || '')}<br><span style="color:#777;font-size:11px;font-weight:400;">${escapeHtml(control.detail || '')}</span></span>
+                        <span class="security-stat-value ${status}">${label}</span>
+                    </div>`;
+                });
+            }
+
+            if (posture.remaining_gaps && posture.remaining_gaps.length > 0) {
+                html += '<div class="stat-card" style="margin-top: 12px;">';
+                html += '<div class="stat-label">Known Remaining Gaps</div>';
+                html += '<ul style="margin: 10px 0 0 18px; padding: 0; color: #bbb; font-size: 12px; line-height: 1.65;">';
+                posture.remaining_gaps.forEach(gap => {
+                    html += `<li>${escapeHtml(gap)}</li>`;
+                });
+                html += '</ul></div>';
+            }
+
+            html += '<div class="findings-actions" style="margin: 14px 0 24px;">';
+            ['verify my system', 'check docker', 'look for suspicious activity', 'scan my system for vulnerabilities'].forEach(prompt => {
+                html += `<button class="findings-action-btn" data-prompt="${encodeURIComponent(prompt)}" onclick="submitSuggestedPrompt(this)">${escapeHtml(prompt)}</button>`;
+            });
+            html += '</div>';
+            html += '</div>';
+
+            html += '<div style="margin-bottom: 24px;">';
             html += '<h3 style="margin-bottom: 12px; font-size: 14px; color: #888; text-transform: uppercase;">Last 24 Hours</h3>';
             
             html += `<div class="security-stat">

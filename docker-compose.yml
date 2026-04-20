@@ -6,7 +6,7 @@ services:
     container_name: agent_redis
     command: redis-server --appendonly yes
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     restart: unless-stopped
 
   postgres:
@@ -17,14 +17,14 @@ services:
       POSTGRES_USER: agent
       POSTGRES_PASSWORD: localdev_only
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     restart: unless-stopped
 
   opa:
     image: openpolicyagent/opa:latest
     container_name: agent_opa
     ports:
-      - "8181:8181"
+      - "127.0.0.1:8181:8181"
     volumes:
       - ./policies:/policies
     command: >
@@ -38,9 +38,25 @@ services:
       VAULT_DEV_ROOT_TOKEN_ID: "localdev-root-token"
       VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
     ports:
-      - "8200:8200"
+      - "127.0.0.1:8200:8200"
     cap_add:
       - IPC_LOCK
+    restart: unless-stopped
+
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: ava_docker_socket_proxy
+    environment:
+      LOG_LEVEL: warning
+      CONTAINERS: 1
+      INFO: 1
+      VERSION: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     restart: unless-stopped
 
   ava:
@@ -49,18 +65,19 @@ services:
       dockerfile: Dockerfile
     image: ava-agent:latest
     container_name: ava-agent
-    user: "0:0"
+    user: "999:999"
     ports:
       - "5443:5443"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
 
     volumes:
       - ./certs:/app/certs:ro
-      - /home/manoj/ava-data/chromadb:/data/chromadb
-      - /home/manoj/ava-data/logs:/data/logs
-      - /home/manoj/ava-data/query_history.json:/data/history/query_history.json
-      - /home/manoj/ava-data/ava_memory.json:/data/ava_memory.json
-      - /home/manoj/ava-data/ava.db:/data/ava.db
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/manoj/ava-data:/data
       - /proc:/host/proc:ro
 
     env_file:
@@ -68,15 +85,22 @@ services:
 
     environment:
       CHROMA_PATH:         /data/chromadb
-      HISTORY_FILE:        /data/history/query_history.json
+      HISTORY_FILE:        /data/query_history.json
       MEMORY_PATH:         /data/ava_memory.json
-      GUNICORN_ACCESS_LOG: /data/logs/ava_access.log
-      GUNICORN_ERROR_LOG:  /data/logs/ava_error.log
+      GUNICORN_ACCESS_LOG: /tmp/ava_access.log
+      GUNICORN_ERROR_LOG:  /tmp/ava_error.log
       OLLAMA_HOST:         http://host.docker.internal:11434
       AVA_HOST_PROC:       /host/proc
       FLASK_ENV:           production
+      LLM_WARMUP_ENABLED:  "false"
+      AVA_MONITOR_ENABLED: "false"
       WEBHOOK_SECRET:      ${WEBHOOK_SECRET:-}
-      DB_PATH:             ${DB_PATH:-/data/ava.db}
+      DB_PATH:             /data/ava.db
+      AVA_DATA_DIR:        /data
+      HOME:                /tmp
+      TRIVY_CACHE_DIR:     /tmp/trivy-cache
+      RATELIMIT_STORAGE_URI: redis://redis:6379/0
+      DOCKER_HOST:         http://docker-socket-proxy:2375
 
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -84,6 +108,7 @@ services:
     depends_on:
       - redis
       - postgres
+      - docker-socket-proxy
 
     healthcheck:
       test:
