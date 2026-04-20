@@ -144,7 +144,20 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
 ## Current Working State (Session Memory)
 - Timestamp:
   - 2026-04-19 Asia/Calcutta
+  - 2026-04-20 Asia/Calcutta
 - Latest changes made:
+  - Completed Fix #6.1 honest weak-evidence fallback:
+    - Added `_WEAK_EVIDENCE_FALLBACK` and grounded evidence gates in `web_agent_v2.1_guardrail.py`
+    - Low-confidence grounded DevOps/RAG answers now return: `I do not have enough grounded evidence to answer this confidently.`
+    - Added unsupported-specific-term detection so generic Kubernetes/service-mesh context cannot confidently answer invented or unsupported terms such as `frobnicator` or `zarglebop`
+    - Applied the same evidence gate to controlled definition and troubleshooting paths, not only the generic grounded-knowledge path
+    - Preserved known-good concepts such as OOMKilled, CrashLoopBackOff, and pod-network troubleshooting
+    - Added regression coverage in `tests/intelligence_regression.py` and benchmark-loader coverage in `tests/ava_benchmark_suite.py`
+    - Rebuilt AVA and verified live:
+      - unsupported invented DevOps terms now return low-confidence honest fallback
+      - `What is machine learning?` still routes to direct general Qwen
+      - `What is Kubernetes?` still returns seeded grounded definition
+      - full live serving-contract suite passed 100/100
   - Completed first Fix #6 RAG/knowledge-quality hardening for core DevOps definitions:
     - Added deterministic seeded definition blocks for core DevOps terms in `web_agent_v2.1_guardrail.py`
     - Current seeded terms: Kubernetes, Docker, Terraform, Helm, Linux, Pod, Deployment, Kubernetes Service, ConfigMap, Ingress, readiness probe, liveness probe, OOMKilled, CrashLoopBackOff, namespace, PVC, Dockerfile, kubeconfig
