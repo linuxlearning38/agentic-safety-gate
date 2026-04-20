@@ -732,6 +732,7 @@ def main():
     check("control metadata preserves compliance note", controlled_metadata["compliance_note"] == "scope note")
     check("disk usage maps to check_disk", ns["extract_operational_tool_request"]("show disk usage") == {"tool_name": "check_disk", "tool_args": {}})
     check("verify system maps to verify_system", ns["extract_operational_tool_request"]("verify my system") == {"tool_name": "verify_system", "tool_args": {}})
+    check("host telemetry maps to read-only bridge", ns["extract_operational_tool_request"]("show host telemetry") == {"tool_name": "check_host_telemetry", "tool_args": {}})
     check("docker health maps to check_docker", ns["extract_operational_tool_request"]("check docker") == {"tool_name": "check_docker", "tool_args": {}})
     check("running containers map to list_containers", ns["extract_operational_tool_request"]("show running containers") == {"tool_name": "list_containers", "tool_args": {}})
     check("pod status maps to check_pod_status", ns["extract_operational_tool_request"]("show pod status") == {"tool_name": "check_pod_status", "tool_args": {"namespace": "default"}})
@@ -762,6 +763,11 @@ def main():
     check("restart deployment clarification asks for deployment name", ns["extract_operational_clarification"]("restart my deployment") == "I can queue a deployment restart, but I need the deployment name. Example: restart deployment nginx.")
     check("stop process clarification asks for pid", ns["extract_operational_clarification"]("stop suspicious process") == "I can queue a process stop action, but I need the PID. Example: stop suspicious process 4321.")
     check("patch package clarification asks for package", ns["extract_operational_clarification"]("patch package") == "I can queue a package patch action, but I need the package name. Example: patch package openssl.")
+    telemetry_result = tool_registry.registry.execute("check_host_telemetry", {})
+    telemetry_metadata = telemetry_result.get("metadata", {})
+    check("host telemetry tool is low-risk read-only", telemetry_result["status"] == "success" and telemetry_metadata.get("read_only") is True)
+    check("host telemetry labels truth surface", telemetry_metadata.get("runtime_scope") in {"host_observed", "container_observed"})
+    check("host telemetry reports proc source", "read-only telemetry:" in telemetry_result.get("command_repr", ""))
 
     fake_db.queries = [
         {"query": "Remember this exactly: cluster=prod-west-2", "response": "Okay", "intent": "memory"},

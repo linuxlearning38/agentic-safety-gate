@@ -24,6 +24,7 @@ except Exception:
     ollama = None
 
 from control.docker_runtime import inspect_docker, list_containers
+from control.host_telemetry import collect_host_telemetry, format_host_telemetry
 from control.vuln_scanner import scan_trivy, check_tools as check_vuln_tools
 from control import database as db
 
@@ -857,6 +858,29 @@ def _check_processes(args: Dict) -> Dict:
     lines = result.get("output", "").splitlines()
     trimmed = "\n".join(lines[:11]).strip() if lines else "(no output)"
     return _ok(trimmed, result.get("command_repr", "ps aux --sort=-%cpu"))
+
+
+def _check_host_telemetry(args: Dict) -> Dict:
+    snapshot = collect_host_telemetry()
+    runtime_scope = snapshot.get("runtime_scope", "container_observed")
+    compliance_note = (
+        "Host telemetry bridge is read-only. It reads only mounted proc telemetry; "
+        "auth logs and package databases are not mounted by default."
+    )
+    return _metadata_result(
+        format_host_telemetry(snapshot),
+        f"read-only telemetry:{snapshot.get('proc_root', '/proc')}",
+        _with_control_metadata(
+            {
+                "inspection_type": "host_telemetry",
+                "read_only": True,
+                "telemetry": snapshot,
+            },
+            runtime_scope=runtime_scope,
+            assessment_mode="deterministic",
+            compliance_note=compliance_note,
+        ),
+    )
 
 
 def _suggest_package_patch_command(package: str) -> str:
@@ -2233,6 +2257,12 @@ class ToolRegistry:
             function=_verify_system,
             risk_level="low",
             description="Run a combined low-risk system verification",
+        )
+        self.register(
+            name="check_host_telemetry",
+            function=_check_host_telemetry,
+            risk_level="low",
+            description="Read OS, memory, processes, and listeners from the read-only host telemetry bridge",
         )
         self.register(
             name="check_node_status",

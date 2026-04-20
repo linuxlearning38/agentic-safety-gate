@@ -192,6 +192,18 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
       - `Draw Kubernetes ingress request flow diagram`
       - `Explain CI/CD pipeline flow`
       - `Draw Terraform plan apply state drift flow diagram`
+  - Completed Fix #7.1 host telemetry read-only bridge:
+    - Added `control/host_telemetry.py` to read OS, memory, process, and listening-port facts from a configured read-only proc mount
+    - Added low-risk `check_host_telemetry` tool in `control/tool_registry.py`
+    - Added deterministic routing for `show host telemetry`, `check host telemetry`, and related host-fact prompts
+    - Mounted `/proc` into the AVA container as `/host/proc:ro` and set `AVA_HOST_PROC=/host/proc`
+    - The bridge reports `runtime_scope=host_observed` when the host proc mount is available and falls back to `container_observed` when it is not
+    - The bridge is read-only and does not mount auth logs or package databases by default; those are explicitly labeled unavailable/runtime-scoped
+    - Added regression coverage for routing, read-only metadata, runtime-scope labeling, and command provenance
+    - Rebuilt AVA and verified live container check:
+      - `check_host_telemetry` returned `host_observed`
+      - `read_only=True`
+      - WSL host processes, memory, and listening ports were visible
   - Completed first Fix #6 RAG/knowledge-quality hardening for core DevOps definitions:
     - Added deterministic seeded definition blocks for core DevOps terms in `web_agent_v2.1_guardrail.py`
     - Current seeded terms: Kubernetes, Docker, Terraform, Helm, Linux, Pod, Deployment, Kubernetes Service, ConfigMap, Ingress, readiness probe, liveness probe, OOMKilled, CrashLoopBackOff, namespace, PVC, Dockerfile, kubeconfig
