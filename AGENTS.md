@@ -146,7 +146,19 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-19 Asia/Calcutta
   - 2026-04-20 Asia/Calcutta
   - 2026-04-20 Asia/Calcutta (Fix #6.6)
+  - 2026-04-20 Asia/Calcutta (Fix #6.7)
 - Latest changes made:
+  - Completed Fix #6.7 knowledge answer consistency (content restructure only, no routing/retrieval change):
+    - Normalized `imagepullbackoff` canned answer in `control/answer_planner.py` from 4-part Root Cause/Fix/Why/Watch format to 5-stage contract (Confirm symptom → Inspect evidence → Likely cause → Low-risk fix → Unsafe shortcuts to avoid)
+    - Normalized `pending` canned answer in `control/answer_planner.py` from 4-part format to 5-stage contract; content preserved (scheduler events, PVC binding, taints, tolerations, resource requests, autoscaler)
+    - Left `generic` canned answer unchanged — Fix #6.6 MySQL test asserts generic does NOT start with `**Confirm symptom:**`
+    - Added `imagepullbackoff` and `pending` to `_COMMON_GROUNDING_TERMS` in `web_agent_v2.1_guardrail.py` — these are core K8s pod states required for consistent test phrase routing
+    - Added 3 named test functions to `tests/intelligence_regression.py`:
+      - `test_fix67_troubleshooting_answer_consistency`: verifies all 13 troubleshooting topics (oomkilled through service_down) have all 5 stage markers
+      - `test_fix67_definition_answer_consistency`: verifies 10 definition responses contain no troubleshooting stage markers
+      - `test_fix67_architecture_answer_consistency`: verifies 3 architecture responses contain flow markers and no troubleshooting markers
+    - Tests: 359 → 434 (75 new intelligence checks)
+    - All 16 hybrid retrieval regression checks still pass
   - Completed Fix #6.6 deep-topic retrieval regression tests (test-only, no serving change):
     - Added 8 named test functions to `tests/intelligence_regression.py` providing explicit regression coverage for Fix #6.5 deep-incident knowledge pack:
       - `test_fix66_redis_runbook_resolves`: routing variants + staged response + safety check
