@@ -157,7 +157,12 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
       - `test_fix67_troubleshooting_answer_consistency`: verifies all 13 troubleshooting topics (oomkilled through service_down) have all 5 stage markers
       - `test_fix67_definition_answer_consistency`: verifies 10 definition responses contain no troubleshooting stage markers
       - `test_fix67_architecture_answer_consistency`: verifies 3 architecture responses contain flow markers and no troubleshooting markers
-    - Tests: 359 → 434 (75 new intelligence checks)
+    - Follow-up 100-question stress retest closed 2 quality gaps:
+      - Short phrase `is anything suspicious` now maps to `check_suspicious_activity`
+      - CI/CD architecture answers now start with `**Pipeline Flow:**` to satisfy the architecture consistency contract
+    - Added regression checks for both retest gaps in `tests/intelligence_regression.py`
+    - 100-question stress harness result: 100/100 passing across identity, destructive safety, vague clarification, definitions, troubleshooting, weak fallback, architecture, follow-up, operational mapping, and answer consistency
+    - Tests: 359 → 436 intelligence checks; 16 hybrid retrieval checks; 117 benchmark checks
     - All 16 hybrid retrieval regression checks still pass
   - Completed Fix #6.6 deep-topic retrieval regression tests (test-only, no serving change):
     - Added 8 named test functions to `tests/intelligence_regression.py` providing explicit regression coverage for Fix #6.5 deep-incident knowledge pack:
