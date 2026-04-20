@@ -148,7 +148,26 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-20 Asia/Calcutta (Fix #6.6)
   - 2026-04-20 Asia/Calcutta (Fix #6.7)
   - 2026-04-20 Asia/Calcutta (Fix #7.2)
+  - 2026-04-20 Asia/Calcutta (Fix #7.2 live verification hardening)
 - Latest changes made:
+  - Completed Fix #7.2 live verification hardening after full `/ask` testing:
+    - Root cause found during live 100-question run: host service/systemd inspection could raise `PermissionError` when probing inaccessible `/host/proc/1/root/...` paths
+    - Fixed `control/host_telemetry.py` to use permission-safe path existence checks so inaccessible host paths are treated as unavailable/limited truth surfaces instead of crashing `/ask`
+    - Added regression check: `fix72: permission-denied host paths are treated as unavailable`
+    - Root cause found during live vulnerability scan: `trivy filesystem /` traversed volatile pseudo-filesystems and failed on transient `/host/proc/.../fdinfo` entries
+    - Fixed `control/vuln_scanner.py` to skip volatile filesystem trees during runtime scans: `/proc`, `/sys`, `/dev`, `/run`, `/host/proc`
+    - Improved Trivy parse-failure diagnostics so empty stdout reports stderr detail instead of hiding the actual scanner failure
+    - Root cause found in live 100-question harness: default delay exceeded the authenticated `/ask` rate limit under real timing, causing HTTP 429 false failures
+    - Fixed `tests/ava_live_100_question_test.py` to use a safer default delay and retry one 429 response using the server-provided retry window
+    - Rebuilt AVA and verified live after fixes:
+      - `/health`: OK
+      - `tests/ava_e2e_live_test.py`: 8/8 passing
+      - `tests/ava_live_100_question_test.py`: 100/100 passing
+    - Local verification after fixes:
+      - `py_compile`: PASS
+      - `tests/intelligence_regression.py`: 443 checks passing
+      - `tests/hybrid_retrieval_regression.py`: 16 checks passing
+      - `tests/ava_benchmark_suite.py`: 117 checks passing
   - Completed Fix #7.2 host service inspection truth-surface hardening:
     - Added read-only host systemd detection to `control/host_telemetry.py` using the existing `/host/proc` bridge and host root view at `/host/proc/1/root`
     - `inspect_service` now prefers host-observed service unit evidence when host systemd is visible, labels it `host_observed_limited`, and explicitly states runtime active/failed state was not read without host systemd bus access

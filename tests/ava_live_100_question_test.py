@@ -66,13 +66,24 @@ def _get_path(data: dict, path: str):
 
 def check_case(case: dict, token: str) -> tuple[bool, str, dict | None]:
     query = case["query"]
-    try:
-        data = post_json("/ask", {"query": query}, token, timeout=case.get("timeout", 90))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        return False, f"HTTP {exc.code}: {body[:300]}", None
-    except Exception as exc:
-        return False, repr(exc), None
+    for attempt in range(2):
+        try:
+            data = post_json("/ask", {"query": query}, token, timeout=case.get("timeout", 90))
+            break
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            if exc.code == 429 and attempt == 0:
+                try:
+                    retry_after = int(json.loads(body).get("retry_after_seconds", 60))
+                except Exception:
+                    retry_after = 60
+                time.sleep(max(retry_after, 1) + 1)
+                continue
+            return False, f"HTTP {exc.code}: {body[:300]}", None
+        except Exception as exc:
+            return False, repr(exc), None
+    else:
+        return False, "request retry exhausted", None
 
     text = _flatten_text(data)
     failures = []
@@ -218,7 +229,7 @@ def build_cases() -> list[dict]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--delay", type=float, default=2.15, help="delay between questions; default stays under 30/min")
+    parser.add_argument("--delay", type=float, default=3.15, help="delay between questions; default stays under the authenticated user rate limit")
     parser.add_argument("--start", type=int, default=1, help="1-based start index")
     parser.add_argument("--limit", type=int, default=0, help="optional number of cases to run")
     args = parser.parse_args()
