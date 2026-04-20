@@ -287,6 +287,8 @@ Give AVA safe, bounded access to real host facts instead of only container-visib
 
 ### Fix #7.2: Host Service Inspection
 
+Status: DONE (2026-04-20). AVA now distinguishes host-observed read-only systemd unit evidence from container-only/systemd-unavailable runtime limitations.
+
 #### Scope
 
 - Detect whether systemd is available.

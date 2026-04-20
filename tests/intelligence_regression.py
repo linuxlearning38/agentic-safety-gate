@@ -3,6 +3,7 @@ import importlib.util
 import json
 import re
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -730,6 +731,74 @@ def test_fix67_architecture_answer_consistency(ns):
         )
 
 
+def test_fix72_host_service_inspection_truth_surface(tool_registry):
+    import control.host_telemetry as host_telemetry
+
+    original_host_proc = host_telemetry.HOST_PROC
+    original_host_root = host_telemetry.HOST_ROOT
+    original_which = tool_registry.shutil.which
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            host_proc = root / "host_proc"
+            host_root = root / "host_root"
+            (host_proc / "1").mkdir(parents=True)
+            (host_proc / "net").mkdir()
+            (host_proc / "1" / "status").write_text("Name:\tsystemd\n", encoding="utf-8")
+            (host_proc / "1" / "comm").write_text("systemd\n", encoding="utf-8")
+            unit_dir = host_root / "etc/systemd/system"
+            unit_dir.mkdir(parents=True)
+            (unit_dir / "nginx.service").write_text(
+                "[Unit]\nDescription=nginx web server\n[Service]\nExecStart=/usr/sbin/nginx -g daemon off;\n",
+                encoding="utf-8",
+            )
+
+            host_telemetry.HOST_PROC = host_proc
+            host_telemetry.HOST_ROOT = host_root
+            service_result = tool_registry.registry.execute("inspect_service", {"service": "nginx"})
+            metadata = service_result.get("metadata", {})
+            check(
+                "fix72: host service inspection uses host-observed limited scope",
+                metadata.get("runtime_scope") == "host_observed_limited",
+            )
+            check(
+                "fix72: host service inspection remains read-only",
+                metadata.get("read_only") is True,
+            )
+            check(
+                "fix72: host service inspection reports unit evidence",
+                metadata.get("unit_found") is True and "ExecStart=/usr/sbin/nginx" in service_result.get("output", ""),
+            )
+            check(
+                "fix72: host service inspection labels runtime state limitation",
+                "runtime state requires host systemd bus access" in service_result.get("output", ""),
+            )
+
+            failed_result = tool_registry.registry.execute("check_failed_services", {})
+            failed_metadata = failed_result.get("metadata", {})
+            check(
+                "fix72: failed-service inspection labels host systemd read-only limitation",
+                failed_metadata.get("runtime_scope") == "host_observed_limited"
+                and failed_metadata.get("environment_note") == "host_systemd_read_only",
+            )
+
+        host_telemetry.HOST_PROC = Path("/definitely/not/a/host/proc")
+        host_telemetry.HOST_ROOT = Path("/definitely/not/a/host/root")
+        tool_registry.shutil.which = lambda name: None
+        limited = tool_registry.registry.execute("inspect_service", {"service": "nginx"})
+        limited_metadata = limited.get("metadata", {})
+        check(
+            "fix72: service inspection explains unavailable systemd context",
+            limited_metadata.get("runtime_scope") == "container_runtime_limited"
+            and limited_metadata.get("environment_note") == "systemd_unavailable"
+            and "systemd is not running here" in limited.get("output", ""),
+        )
+    finally:
+        host_telemetry.HOST_PROC = original_host_proc
+        host_telemetry.HOST_ROOT = original_host_root
+        tool_registry.shutil.which = original_which
+
+
 def main():
     sys.path.insert(0, str(SOURCE.parent))
     ns = load_helpers()
@@ -1099,6 +1168,7 @@ def main():
     check("host telemetry tool is low-risk read-only", telemetry_result["status"] == "success" and telemetry_metadata.get("read_only") is True)
     check("host telemetry labels truth surface", telemetry_metadata.get("runtime_scope") in {"host_observed", "container_observed"})
     check("host telemetry reports proc source", "read-only telemetry:" in telemetry_result.get("command_repr", ""))
+    test_fix72_host_service_inspection_truth_surface(tool_registry)
 
     fake_db.queries = [
         {"query": "Remember this exactly: cluster=prod-west-2", "response": "Okay", "intent": "memory"},

@@ -147,7 +147,15 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-20 Asia/Calcutta
   - 2026-04-20 Asia/Calcutta (Fix #6.6)
   - 2026-04-20 Asia/Calcutta (Fix #6.7)
+  - 2026-04-20 Asia/Calcutta (Fix #7.2)
 - Latest changes made:
+  - Completed Fix #7.2 host service inspection truth-surface hardening:
+    - Added read-only host systemd detection to `control/host_telemetry.py` using the existing `/host/proc` bridge and host root view at `/host/proc/1/root`
+    - `inspect_service` now prefers host-observed service unit evidence when host systemd is visible, labels it `host_observed_limited`, and explicitly states runtime active/failed state was not read without host systemd bus access
+    - `check_failed_services` now distinguishes host-systemd-visible-but-read-only from container/systemd unavailable, instead of treating the container limitation as full host truth
+    - No host mutation path was added; no DBus/system bus mount was added; all host evidence remains read-only
+    - Added `test_fix72_host_service_inspection_truth_surface` with 6 checks covering host-observed unit evidence, read-only metadata, runtime-state limitation wording, failed-service limitation metadata, and unavailable systemd fallback
+    - Tests: 442 intelligence checks, 16 hybrid retrieval checks, 117 benchmark checks
   - Completed Fix #6.7 knowledge answer consistency (content restructure only, no routing/retrieval change):
     - Normalized `imagepullbackoff` canned answer in `control/answer_planner.py` from 4-part Root Cause/Fix/Why/Watch format to 5-stage contract (Confirm symptom → Inspect evidence → Likely cause → Low-risk fix → Unsafe shortcuts to avoid)
     - Normalized `pending` canned answer in `control/answer_planner.py` from 4-part format to 5-stage contract; content preserved (scheduler events, PVC binding, taints, tolerations, resource requests, autoscaler)

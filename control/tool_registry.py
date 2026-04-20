@@ -24,7 +24,7 @@ except Exception:
     ollama = None
 
 from control.docker_runtime import inspect_docker, list_containers
-from control.host_telemetry import collect_host_telemetry, format_host_telemetry
+from control.host_telemetry import collect_host_telemetry, format_host_telemetry, inspect_host_service_unit
 from control.vuln_scanner import scan_trivy, check_tools as check_vuln_tools
 from control import database as db
 
@@ -1059,6 +1059,24 @@ def _systemd_unavailable_message(action_label: str) -> str:
 
 def _check_failed_services(args: Dict) -> Dict:
     if not shutil.which("systemctl"):
+        host_probe = inspect_host_service_unit("__ava_probe__")
+        if host_probe.get("environment_note") == "host_systemd_detected":
+            output = (
+                "Failed service inspection is limited: host systemd is visible through the read-only host bridge, "
+                "but AVA does not have a writable/system bus connection for `systemctl --failed`.\n"
+                "Use `inspect service <name>` for read-only host unit-file evidence, or run failed-unit inspection on the host."
+            )
+            return _metadata_result(
+                output,
+                "host_systemd:read_only_failed_services",
+                _with_control_metadata({
+                    "inspection_type": "failed_services",
+                    "failed_service_count": 0,
+                    "failed_services": [],
+                    "environment_note": "host_systemd_read_only",
+                    "read_only": True,
+                }, runtime_scope="host_observed_limited", compliance_note="Host systemd is visible, but failed-unit state requires host system bus access and was not read."),
+            )
         return _metadata_result(
             _systemd_unavailable_message("Failed service inspection"),
             "systemctl --failed",
@@ -1100,6 +1118,46 @@ def _inspect_service(args: Dict) -> Dict:
     if not ok:
         return _fail(err)
     sections: List[str] = []
+    host_unit = inspect_host_service_unit(service)
+    if host_unit.get("environment_note") == "host_systemd_detected":
+        if host_unit.get("unit_found"):
+            unit_paths = "\n".join(f"- {path}" for path in host_unit.get("unit_paths", []))
+            unit_preview = host_unit.get("unit_preview") or "(unit file was found, but no readable non-comment lines were available)"
+            sections.append(
+                "[host service unit]\n"
+                f"Host systemd detected through read-only bridge.\n"
+                f"Service: {service}\n"
+                f"Unit: {host_unit.get('unit')}\n"
+                f"Unit path(s):\n{unit_paths}\n\n"
+                f"[unit preview]\n{unit_preview}"
+            )
+        else:
+            sections.append(
+                "[host service unit]\n"
+                f"Host systemd detected through read-only bridge, but no host unit file was found for `{host_unit.get('unit')}` "
+                "in the standard systemd unit paths visible to AVA."
+            )
+        sections.append(
+            "[runtime state limitation]\n"
+            "This is host-observed, read-only unit-file evidence. Active/failed runtime state requires host systemd bus access and was not read by AVA."
+        )
+        remediation = _service_remediation_suggestions(service, "\n\n".join(sections))
+        sections.append("[Suggested Next Steps]\n" + "\n".join(f"- {item}" for item in remediation))
+        return _metadata_result(
+            "\n\n".join(sections).strip(),
+            f"host_systemd:inspect_unit:{service}",
+            _with_control_metadata({
+                "inspection_type": "service",
+                "service": service,
+                "unit": host_unit.get("unit"),
+                "unit_found": host_unit.get("unit_found"),
+                "unit_paths": host_unit.get("unit_paths", []),
+                "suggested_actions": remediation,
+                "environment_note": "host_systemd_read_only",
+                "read_only": True,
+            }, runtime_scope="host_observed_limited", compliance_note="Host service inspection used read-only unit-file evidence; runtime state was not read without host systemd bus access."),
+        )
+
     if not shutil.which("systemctl"):
         unavailable = _systemd_unavailable_message(f"Service inspection for '{service}'")
         remediation = _service_remediation_suggestions(service, unavailable)
