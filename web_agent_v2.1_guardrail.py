@@ -1470,6 +1470,9 @@ def _resolve_follow_up_response(query):
     route = _route_query(query)
     if route.intent != "follow_up":
         return None
+    operational = _resolve_operational_follow_up_response(query)
+    if operational:
+        return operational
     recent_turns = _get_recent_distinct_turns(limit=4)
     evidence = select_follow_up_evidence(route, recent_turns, _topic_from_turn, _response_summary)
     plan = build_follow_up_plan(route, evidence)
@@ -1478,6 +1481,130 @@ def _resolve_follow_up_response(query):
         "confidence": plan.confidence,
         "sources_used": len(recent_turns[:2]),
         "topic": plan.topic,
+    }
+
+
+_FOLLOW_UP_EXECUTION_MARKERS = (
+    "do that", "do it", "run that", "run it", "apply that", "apply it",
+    "fix it", "run the next step", "continue with that",
+)
+
+_FOLLOW_UP_NEXT_STEP_MARKERS = (
+    "what should i do next", "what is the next step", "next step",
+)
+
+
+def _extract_action_after_label(text: str, labels: tuple[str, ...]) -> str:
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        for label in labels:
+            prefix = f"- {label}:"
+            if line.lower().startswith(prefix.lower()):
+                return line[len(prefix):].strip()
+    return ""
+
+
+def _extract_follow_up_action(turn: dict) -> dict | None:
+    response = _normalize_text((turn or {}).get("response", "")).strip()
+    if not response:
+        return None
+    remediation = _extract_action_after_label(response, ("Action",))
+    if remediation and "[Safest Remediation Path]" in response:
+        return {
+            "kind": "remediation",
+            "action": remediation,
+            "summary": "safest remediation path",
+        }
+    diagnostic = _extract_action_after_label(response, ("Step",))
+    if diagnostic and "[Next Diagnostic Step]" in response:
+        return {
+            "kind": "diagnostic",
+            "action": diagnostic,
+            "summary": "next diagnostic step",
+        }
+    next_action = _extract_action_after_label(response, ("Next action",))
+    if next_action and not next_action.lower().startswith("no urgent action"):
+        return {
+            "kind": "next_action",
+            "action": next_action,
+            "summary": "next action",
+        }
+    return None
+
+
+def _get_recent_operational_turns(limit=6):
+    rows = db.get_recent_queries(n=limit * 3)
+    useful = []
+    for row in reversed(rows):
+        intent = _normalize_text(row.get("intent")).strip().lower()
+        if intent in {"follow_up", "general", "definition", "comparison", "architecture", "ava_self"}:
+            continue
+        response = _normalize_text(row.get("response")).strip()
+        if not response:
+            continue
+        turn = {
+            "query": _normalize_text(row.get("query")).strip(),
+            "response": response,
+            "intent": intent,
+        }
+        if _extract_follow_up_action(turn):
+            useful.append(turn)
+        if len(useful) >= limit:
+            break
+    return useful
+
+
+def _resolve_operational_follow_up_response(query):
+    q = _normalize_text(query).lower().strip()
+    wants_execution = any(marker in q for marker in _FOLLOW_UP_EXECUTION_MARKERS)
+    wants_next_step = any(marker in q for marker in _FOLLOW_UP_NEXT_STEP_MARKERS)
+    if not wants_execution and not wants_next_step:
+        return None
+
+    recent_turns = _get_recent_operational_turns(limit=4)
+    if not recent_turns:
+        return {
+            "response": "I do not have a recent operational result with a concrete next action to continue from.",
+            "confidence": "low",
+            "sources_used": 0,
+            "topic": "follow_up",
+        }
+
+    action_context = _extract_follow_up_action(recent_turns[0])
+    if not action_context:
+        return None
+    action = action_context["action"]
+
+    if wants_execution:
+        direct_action = _resolve_direct_action_query(action)
+        if direct_action and direct_action["kind"] == "command":
+            return {
+                "type": "command",
+                "intent": "command",
+                "response": direct_action["response"],
+                "result": _build_command_response(direct_action["result"]),
+                "raw_result": direct_action["result"],
+                "sources_used": 1,
+            }
+        return {
+            "response": (
+                f"The last {action_context['summary']} was: {action}.\n\n"
+                "I did not execute it because it does not resolve to a supported AVA action. "
+                "Please restate the exact action if you want me to queue or run it."
+            ),
+            "confidence": "medium",
+            "sources_used": 1,
+            "topic": "follow_up",
+        }
+
+    return {
+        "response": (
+            f"The next grounded step from the last operational result is: {action}.\n\n"
+            "If you want me to proceed, say `run that`. AVA will still apply the normal safety and approval checks."
+        ),
+        "confidence": "high",
+        "sources_used": 1,
+        "topic": "follow_up",
     }
 
 
@@ -1495,7 +1622,130 @@ def _resolve_comparison_response(query):
     }
 
 
+class _SeedKnowledgeChunk:
+    def __init__(self, content, source_collection="policies"):
+        self.content = content
+        self.source_collection = source_collection
+
+
+_CORE_DEVOPS_DEFINITION_BLOCKS = {
+    "kubernetes": [
+        "Kubernetes is a container orchestration platform that keeps containerized applications running in the desired state across a cluster.",
+        "Kubernetes manages workloads through Pods, Deployments, Services, ConfigMaps, Secrets, volumes, scheduling, scaling, and rollout or rollback control.",
+        "Operators use Kubernetes when applications need service discovery, self-healing, horizontal scaling, controlled releases, and consistent runtime management across multiple nodes.",
+        "Kubernetes is not the same as Docker: Docker builds and runs containers, while Kubernetes coordinates many containers and the infrastructure objects around them.",
+    ],
+    "docker": [
+        "Docker is a container runtime and image tooling platform used to package applications with their dependencies into portable container images.",
+        "Docker runs containers from images, manages local container networking and volumes, and is commonly used for development, packaging, and single-host runtime workflows.",
+        "In production platforms, Docker-style images are often scheduled by orchestrators such as Kubernetes rather than managed manually container by container.",
+    ],
+    "terraform": [
+        "Terraform is an infrastructure-as-code tool that declares cloud and platform resources in configuration files and reconciles real infrastructure toward that desired state.",
+        "Terraform plans changes before applying them, tracks managed resources in state, and is commonly used for repeatable provisioning across AWS, Azure, GCP, and other providers.",
+        "Operators should review plans carefully because Terraform can create, modify, or destroy infrastructure depending on configuration and state.",
+    ],
+    "helm": [
+        "Helm is a Kubernetes package manager that templates and installs related Kubernetes manifests as a versioned release.",
+        "Helm charts package Deployments, Services, ConfigMaps, Secrets, and other resources so applications can be installed, upgraded, rolled back, and configured consistently.",
+        "Operators should inspect rendered manifests and values because a chart upgrade can change live Kubernetes resources.",
+    ],
+    "linux": [
+        "Linux is an operating system kernel and ecosystem commonly used to run servers, containers, networking, storage, and infrastructure services.",
+        "For DevOps work, Linux is the runtime layer where processes, services, filesystems, users, permissions, packages, logs, and network sockets are inspected and controlled.",
+        "Operational checks should be grounded in live host facts such as process state, service state, disk usage, package versions, and logs.",
+    ],
+    "pod": [
+        "A Kubernetes Pod is the smallest schedulable workload unit in Kubernetes and runs one or more tightly related containers together.",
+        "Pods share networking and storage context, so containers in the same Pod can communicate through localhost and share mounted volumes.",
+        "Operators usually manage Pods through higher-level controllers such as Deployments, StatefulSets, DaemonSets, or Jobs rather than creating standalone Pods manually.",
+    ],
+    "deployment": [
+        "A Kubernetes Deployment is a controller that manages stateless Pods through ReplicaSets and keeps the requested number of replicas running.",
+        "Deployments support rolling updates, rollbacks, scaling, and declarative desired state for application workloads.",
+        "Operators inspect Deployments when rollout status, replica count, image version, readiness, or application availability is wrong.",
+    ],
+    "service": [
+        "A Kubernetes Service gives a stable virtual network endpoint for reaching a changing set of Pods selected by labels.",
+        "Services decouple clients from individual Pod IPs and commonly expose workloads inside the cluster or through NodePort and LoadBalancer integrations.",
+        "Operators check Services together with endpoints, selectors, readiness probes, DNS, and ingress rules when traffic is not reaching Pods.",
+    ],
+    "configmap": [
+        "A Kubernetes ConfigMap is an object that stores non-secret configuration data so Pods can consume settings without baking them into container images.",
+        "ConfigMaps can be mounted as files or exposed as environment variables, but they are not meant for passwords or credentials.",
+        "Operators inspect ConfigMaps when configuration drift, missing keys, stale mounted values, or application startup failures are suspected.",
+    ],
+    "ingress": [
+        "Kubernetes Ingress defines HTTP and HTTPS routing rules that send external traffic to Services inside a cluster.",
+        "Ingress usually depends on an ingress controller such as NGINX, Traefik, or a cloud load-balancer integration to enforce those rules.",
+        "Operators inspect Ingress with Services, endpoints, TLS secrets, DNS, controller logs, and backend readiness when external traffic fails.",
+    ],
+    "readiness probe": [
+        "A readiness probe tells Kubernetes whether a container is ready to receive traffic.",
+        "When readiness fails, Kubernetes removes the Pod from Service endpoints without necessarily restarting the container.",
+        "Operators inspect readiness probes when Pods are running but traffic is not reaching them or rollouts never become available.",
+    ],
+    "liveness probe": [
+        "A liveness probe tells Kubernetes whether a container should be restarted because it appears unhealthy.",
+        "When liveness fails repeatedly, Kubernetes restarts the container, which can create restart loops if the probe is too strict or the app startup is slow.",
+        "Operators inspect liveness probes when containers restart unexpectedly despite the application only being temporarily slow or overloaded.",
+    ],
+    "oomkilled": [
+        "OOMKilled is a Kubernetes termination reason that means a container exceeded its memory limit and was killed by the kernel.",
+        "Operators investigate OOMKilled events by checking memory limits, peak usage, application leaks, recent deployments, and node memory pressure.",
+        "The safe fix is not always increasing memory; first confirm whether the workload is undersized, leaking memory, or receiving abnormal traffic.",
+    ],
+    "crashloopbackoff": [
+        "CrashLoopBackOff means Kubernetes is repeatedly starting a container, seeing it exit or fail, and backing off before retrying.",
+        "Common causes include bad entrypoints, missing configuration, failing probes, image issues, permission errors, or dependency failures.",
+        "Operators investigate CrashLoopBackOff with `kubectl describe pod`, current and previous logs, events, mounts, secrets, config, and recent rollout changes.",
+    ],
+    "namespace": [
+        "A Kubernetes namespace is a logical scope for grouping and isolating namespaced resources inside a cluster.",
+        "Namespaces help separate teams, environments, permissions, quotas, policies, and resource names without creating separate clusters.",
+        "Operators include namespace context when checking Pods, Services, events, secrets, RBAC, quotas, and network policies.",
+    ],
+    "pvc": [
+        "A PersistentVolumeClaim is a Kubernetes request for durable storage that a Pod can mount through a PersistentVolume.",
+        "PVCs decouple workload manifests from the underlying storage implementation such as cloud disks, network storage, or local volumes.",
+        "Operators inspect PVCs when Pods are stuck pending, mounts fail, storage is full, access modes mismatch, or a storage class cannot provision a volume.",
+    ],
+    "dockerfile": [
+        "A Dockerfile is a build recipe that defines how to create a container image from a base image, files, dependencies, environment, and commands.",
+        "Operators review Dockerfiles for reproducibility, image size, build caching, secret leakage, package freshness, user privileges, and runtime command behavior.",
+        "A good Dockerfile keeps build-time concerns separate from runtime behavior and avoids baking credentials or host-specific assumptions into the image.",
+    ],
+    "kubeconfig": [
+        "A kubeconfig file is a Kubernetes client configuration file that stores cluster connection details, users, contexts, and credentials used by kubectl and clients.",
+        "Operators use kubeconfig contexts to choose which cluster and namespace kubectl commands target.",
+        "Kubeconfig files are sensitive because they may contain credentials or token references, so access should be controlled and audited.",
+    ],
+}
+
+
+def _core_definition_terms(query):
+    q = (query or "").lower().strip()
+    terms = []
+    for term in _CORE_DEVOPS_DEFINITION_BLOCKS:
+        if re.search(rf"\b{re.escape(term)}\b", q) or (term == "kubernetes" and re.search(r"\bk8s\b", q)):
+            terms.append(term)
+    return terms
+
+
+def _seed_definition_chunks(query):
+    chunks = []
+    seen_lines = set()
+    for term in _core_definition_terms(query):
+        lines = _CORE_DEVOPS_DEFINITION_BLOCKS.get(term, [])
+        block = "\n".join(line for line in lines if line and line not in seen_lines)
+        if block:
+            chunks.append(_SeedKnowledgeChunk(block, source_collection="seeded_definitions"))
+            seen_lines.update(lines)
+    return chunks
+
+
 def _retrieve_definition_chunks(query):
+    seed_chunks = _seed_definition_chunks(query)
     raw_chunks = hybrid_retriever.query(
         query_text=query,
         n_policies=6,
@@ -1522,6 +1772,8 @@ def _retrieve_definition_chunks(query):
                 seen.add(content)
         if prepended:
             raw_chunks = prepended + list(raw_chunks or [])
+    if seed_chunks:
+        raw_chunks = seed_chunks + list(raw_chunks or [])
     cleaned = []
     for chunk in raw_chunks or []:
         if hasattr(chunk, "content"):
@@ -1628,6 +1880,8 @@ def _resolve_controlled_query(query, *, controlled_route=None, prior_messages=No
 
     if controlled_route.intent == "follow_up":
         resolved = _resolve_follow_up_response(query)
+        if resolved.get("type") == "command":
+            return resolved
         return {
             "type": "knowledge",
             "intent": "follow_up",
@@ -1742,6 +1996,60 @@ def _resolve_grounded_knowledge_query(query, *, prior_messages=None):
         "context": context,
         "query_intent": query_intent,
     }
+
+
+def _finalize_command_payload(query, raw_result, response_text, elapsed):
+    response_text = _normalize_text(response_text)
+    save_history({
+        'timestamp': datetime.now().isoformat(),
+        'query': query,
+        'type': 'command',
+        'blocked': raw_result.get('status') == 'blocked',
+        'time_taken': f"{elapsed:.2f}s",
+        'response_preview': response_text[:200] + '...' if len(response_text) > 200 else response_text,
+    })
+    try:
+        db.save_query(
+            query=query,
+            response=response_text,
+            confidence=raw_result.get("risk") or raw_result.get("status"),
+            intent="command",
+            sources_used=0,
+        )
+    except Exception as _dbe:
+        logger.warning(f"[DB] save command query failed: {_dbe}")
+    return _chat_payload(
+        response_text,
+        response_type='command',
+        time_taken=f"{elapsed:.2f}s",
+        result=_build_command_response(raw_result),
+    )
+
+
+def _finalize_resolved_payload(query, resolved, elapsed):
+    if resolved["type"] == "command":
+        return _finalize_command_payload(query, resolved["raw_result"], resolved["response"], elapsed)
+
+    _record_query(
+        query,
+        resolved["response"],
+        resolved["intent"],
+        elapsed,
+        sources_used=resolved.get("sources_used", 0),
+        confidence=resolved.get("confidence"),
+    )
+    return _chat_payload(
+        resolved["response"],
+        response_type=resolved["type"],
+        confidence=resolved.get("confidence"),
+        sources_used=resolved.get("sources_used", 0),
+        time_taken=f"{elapsed:.2f}s",
+        **{
+            key: resolved[key]
+            for key in ("healing", "action_taken", "graph_used", "steps_run", "react_trace")
+            if key in resolved
+        }
+    )
 
 def _normalize_fact_key(label):
     return re.sub(r'[^a-z0-9]+', '_', label.lower()).strip('_')
@@ -2997,42 +3305,7 @@ def ask():
         controlled_resolved = _resolve_controlled_query(query, controlled_route=controlled_route, prior_messages=prior_messages)
         if controlled_resolved:
             elapsed = time.time() - start_time
-            if controlled_resolved["type"] == "command":
-                result = controlled_resolved["raw_result"]
-                save_history({
-                    'timestamp': datetime.now().isoformat(),
-                    'query': query,
-                    'type': 'command',
-                    'blocked': result.get('status') == 'blocked',
-                    'time_taken': f"{elapsed:.2f}s"
-                })
-                return jsonify(_chat_payload(
-                    controlled_resolved["response"],
-                    response_type='command',
-                    time_taken=f"{elapsed:.2f}s",
-                    result=controlled_resolved["result"],
-                ))
-
-            _record_query(
-                query,
-                controlled_resolved["response"],
-                controlled_resolved["intent"],
-                elapsed,
-                sources_used=controlled_resolved.get("sources_used", 0),
-                confidence=controlled_resolved.get("confidence"),
-            )
-            return jsonify(_chat_payload(
-                controlled_resolved["response"],
-                response_type=controlled_resolved["type"],
-                confidence=controlled_resolved.get("confidence"),
-                sources_used=controlled_resolved.get("sources_used", 0),
-                time_taken=f"{elapsed:.2f}s",
-                **{
-                    key: controlled_resolved[key]
-                    for key in ("healing", "action_taken")
-                    if key in controlled_resolved
-                }
-            ))
+            return jsonify(_finalize_resolved_payload(query, controlled_resolved, elapsed))
         
         # ── Phase 4: Command Graph — deterministic diagnostics ──────────────
         # Skip command graph for knowledge/troubleshooting questions that don't
@@ -3064,8 +3337,10 @@ def ask():
             # If a medium-risk step needs approval, pause and tell the user
             if graph_result.paused_at:
                 elapsed = time.time() - start_time
-                return jsonify(_chat_payload(
-                    (
+                return jsonify(_finalize_resolved_payload(query, {
+                    "type": "knowledge",
+                    "intent": "command_graph",
+                    "response": (
                         f"⚠️ **Approval Required**\n\n"
                         f"I ran the `{graph_name}` diagnostic and reached a step that "
                         f"needs your approval before continuing:\n\n"
@@ -3075,11 +3350,9 @@ def ask():
                         f"```bash\npython3 -m control.security_review\n```\n\n"
                         f"Steps completed so far:\n{graph_result.summary_for_ui()}"
                     ),
-                    response_type='knowledge',
-                    sources_used=0,
-                    time_taken=f"{elapsed:.2f}s",
-                    graph_used=graph_name,
-                ))
+                    "sources_used": 0,
+                    "graph_used": graph_name,
+                }, elapsed))
 
             # Build context from live tool outputs → send to LLM for analysis
             context_blocks = graph_result.to_context_blocks()
@@ -3093,26 +3366,17 @@ def ask():
             response = generate_response(query, context_blocks)
 
             elapsed = time.time() - start_time
-            save_history({
-                'timestamp':  datetime.now().isoformat(),
-                'query':      query,
-                'type':       'command_graph',
-                'graph':      graph_name,
-                'steps':      len(graph_result.steps_run),
-                'time_taken': f"{elapsed:.2f}s",
-            })
-
-            return jsonify(_chat_payload(
-                response,
-                response_type='knowledge',
-                sources_used=len(context_blocks),
-                time_taken=f"{elapsed:.2f}s",
-                graph_used=graph_name,
-                steps_run=[
+            return jsonify(_finalize_resolved_payload(query, {
+                "type": "knowledge",
+                "intent": "command_graph",
+                "response": response,
+                "sources_used": len(context_blocks),
+                "graph_used": graph_name,
+                "steps_run": [
                     {'tool': s['tool'], 'status': s['status']}
                     for s in graph_result.steps_run
                 ],
-            ))
+            }, elapsed))
         # ── End Command Graph ───────────────────────────────────────────────
 
         # ── Phase 4: ReAct Loop — for complex/unknown problems ─────────────
@@ -3149,22 +3413,12 @@ def ask():
             logger.info(f"[ReAct] {react_result.summary_for_log()}")
 
             elapsed = time.time() - start_time
-            save_history({
-                'timestamp':   datetime.now().isoformat(),
-                'query':       query,
-                'type':        'react',
-                'iterations':  react_result.iterations,
-                'stopped':     react_result.stopped_reason,
-                'tools_used':  [s.action for s in react_result.steps if s.action],
-                'time_taken':  f"{elapsed:.2f}s",
-            })
-
-            return jsonify(_chat_payload(
-                react_result.final_answer or "I was unable to complete the diagnostic. Please check kubectl is available in this environment.",
-                response_type='knowledge',
-                sources_used=react_result.iterations,
-                time_taken=f"{elapsed:.2f}s",
-                react_trace=[
+            return jsonify(_finalize_resolved_payload(query, {
+                "type": "knowledge",
+                "intent": "react",
+                "response": react_result.final_answer or "I was unable to complete the diagnostic. Please check kubectl is available in this environment.",
+                "sources_used": react_result.iterations,
+                "react_trace": [
                     {
                         'iteration':    s.iteration,
                         'thought':      s.thought[:200],
@@ -3174,7 +3428,7 @@ def ask():
                     }
                     for s in react_result.steps
                 ],
-            ))
+            }, elapsed))
         # ── End ReAct Loop ──────────────────────────────────────────────────
 
         logger.info("[*] Searching knowledge base...")
@@ -3199,15 +3453,13 @@ def ask():
 
         elapsed = time.time() - start_time
 
-        _record_query(query, response, "knowledge", elapsed, sources_used=len(context), confidence=confidence)
-
-        return jsonify(_chat_payload(
-            response,
-            response_type='knowledge',
-            sources_used=len(context),
-            confidence=confidence,
-            time_taken=f"{elapsed:.2f}s"
-        ))
+        return jsonify(_finalize_resolved_payload(query, {
+            "type": "knowledge",
+            "intent": "knowledge",
+            "response": response,
+            "sources_used": len(context),
+            "confidence": confidence,
+        }, elapsed))
         
     except Exception as e:
         logger.error(f"Error in ask endpoint: {e}")
@@ -6104,6 +6356,12 @@ HTML_TEMPLATE = r'''
             const authFailureDelta = Number(metadata.auth_failure_delta || 0);
             const correlatedAssessment = metadata.correlated_assessment && typeof metadata.correlated_assessment === 'object' ? metadata.correlated_assessment : null;
             const primaryConcern = metadata.primary_concern && typeof metadata.primary_concern === 'object' ? metadata.primary_concern : null;
+            const investigationPlan = metadata.investigation_plan && typeof metadata.investigation_plan === 'object' ? metadata.investigation_plan : null;
+            const remediationPlan = metadata.remediation_plan && typeof metadata.remediation_plan === 'object' ? metadata.remediation_plan : null;
+            const runtimeScope = safeString(metadata.runtime_scope || '');
+            const assessmentMode = safeString(metadata.assessment_mode || '');
+            const complianceNote = safeString(metadata.compliance_note || '');
+            const routeSource = safeString(metadata.route_source || metadata.source || '');
 
             const renderStringList = (title, items) => {
                 if (!items.length) return '';
@@ -6170,6 +6428,69 @@ HTML_TEMPLATE = r'''
                 </div>`;
             };
 
+            const renderAssessmentControls = () => {
+                if (!runtimeScope && !assessmentMode && !complianceNote && !routeSource) return '';
+                return `<div class="findings-panel">
+                    <div class="findings-label">Assessment controls</div>
+                    <div class="status-card-meta" style="margin: 10px 0 8px 0;">
+                        ${routeSource ? `<span class="status-chip">Route: ${escapeHtml(routeSource)}</span>` : ''}
+                        ${runtimeScope ? `<span class="status-chip">Scope: ${escapeHtml(runtimeScope)}</span>` : ''}
+                        ${assessmentMode ? `<span class="status-chip">Mode: ${escapeHtml(assessmentMode)}</span>` : ''}
+                    </div>
+                    ${complianceNote ? `<div class="findings-item-copy">${escapeHtml(complianceNote)}</div>` : ''}
+                </div>`;
+            };
+
+            const renderInvestigationPlan = (plan) => {
+                if (!plan || !plan.step) return '';
+                const step = safeString(plan.step || '');
+                const rationale = safeString(plan.rationale || '');
+                const expectedSignal = safeString(plan.expected_signal || '');
+                const priority = escapeHtml(String(plan.priority || 'medium'));
+                const actionButton = step
+                    ? `<div class="findings-actions">
+                        <button class="findings-action-btn" data-prompt="${encodeURIComponent(step)}" onclick="submitSuggestedPrompt(this)">Run next diagnostic</button>
+                    </div>`
+                    : '';
+                return `<div class="findings-panel primary-concern-panel">
+                    <div class="findings-label">Next diagnostic step</div>
+                    <div class="findings-item-title">${escapeHtml(step)}</div>
+                    <div class="status-card-meta" style="margin: 10px 0 8px 0;">
+                        <span class="status-chip">Priority: ${priority}</span>
+                    </div>
+                    ${rationale ? `<div class="findings-item-copy">${escapeHtml(rationale)}</div>` : ''}
+                    ${expectedSignal ? `<div class="findings-item-subcopy" style="margin-top: 8px;">Expect to confirm: ${escapeHtml(expectedSignal)}</div>` : ''}
+                    ${actionButton}
+                </div>`;
+            };
+
+            const renderRemediationPlan = (plan) => {
+                if (!plan || !plan.action) return '';
+                const action = safeString(plan.action || '');
+                const rationale = safeString(plan.rationale || '');
+                const risk = escapeHtml(String(plan.risk || 'medium'));
+                const precondition = safeString(plan.precondition || '');
+                const rollback = safeString(plan.rollback || '');
+                const approvalRequired = plan.approval_required !== false ? 'Approval required' : 'Approval not required';
+                const actionButton = action
+                    ? `<div class="findings-actions">
+                        <button class="findings-action-btn" data-prompt="${encodeURIComponent(action)}" onclick="submitSuggestedPrompt(this)">Run through AVA</button>
+                    </div>`
+                    : '';
+                return `<div class="findings-panel primary-concern-panel">
+                    <div class="findings-label">Safest remediation path</div>
+                    <div class="findings-item-title">${escapeHtml(action)}</div>
+                    <div class="status-card-meta" style="margin: 10px 0 8px 0;">
+                        <span class="status-chip">Risk: ${risk}</span>
+                        <span class="status-chip">${approvalRequired}</span>
+                    </div>
+                    ${rationale ? `<div class="findings-item-copy">${escapeHtml(rationale)}</div>` : ''}
+                    ${precondition ? `<div class="findings-item-subcopy" style="margin-top: 8px;">Precondition: ${escapeHtml(precondition)}</div>` : ''}
+                    ${rollback ? `<div class="findings-item-subcopy" style="margin-top: 8px;">Rollback: ${escapeHtml(rollback)}</div>` : ''}
+                    ${actionButton}
+                </div>`;
+            };
+
             const renderCandidateList = (title, items) => {
                 if (!items.length) return '';
                 const rows = items.map(item => {
@@ -6203,6 +6524,9 @@ HTML_TEMPLATE = r'''
                 const panels = [
                     renderCorrelatedAssessment(correlatedAssessment),
                     renderPrimaryConcern(primaryConcern),
+                    renderInvestigationPlan(investigationPlan),
+                    renderRemediationPlan(remediationPlan),
+                    renderAssessmentControls(),
                     renderStringList('Alerts', alerts),
                     renderStringList('Suggested actions', suggestedActions),
                     renderCandidateList('Remediation candidates', remediationCandidates),

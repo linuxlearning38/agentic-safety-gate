@@ -65,6 +65,8 @@ def _is_noisy_architecture_line(line: str) -> bool:
 def _definition_line_score(line: str, target_entities: list[str], source_collection: str) -> int:
     lower = line.lower()
     score = 0
+    if source_collection == "seeded_definitions":
+        score += 20
     if source_collection == "patterns":
         score += 8
     if any(lower.startswith(prefix) for prefix in ("description:", "a ", "an ", "the ")):
@@ -363,6 +365,7 @@ def select_comparison_evidence(route, retrieved_chunks: list) -> EvidencePacket:
 
 def select_definition_evidence(route, retrieved_chunks: list) -> EvidencePacket:
     target_entities = [entity for entity in (route.entities or []) if entity]
+    seed_lines = []
     pattern_lines = []
     fallback_lines = []
     seen = set()
@@ -386,7 +389,7 @@ def select_definition_evidence(route, retrieved_chunks: list) -> EvidencePacket:
             lowered = line.lower()
             if lowered in seen:
                 continue
-            if any(marker in lowered for marker in ARCHITECTURE_NOISE_MARKERS):
+            if source_collection != "seeded_definitions" and any(marker in lowered for marker in ARCHITECTURE_NOISE_MARKERS):
                 continue
             if target_entities and not any(entity.lower() in lowered for entity in target_entities):
                 continue
@@ -394,12 +397,14 @@ def select_definition_evidence(route, retrieved_chunks: list) -> EvidencePacket:
             score = _definition_line_score(line, target_entities, source_collection)
             if score <= 0:
                 continue
-            if source_collection == "patterns":
+            if source_collection == "seeded_definitions":
+                seed_lines.append((score, line))
+            elif source_collection == "patterns":
                 pattern_lines.append((score, line))
             else:
                 fallback_lines.append((score, line))
 
-    scored_lines = pattern_lines or fallback_lines
+    scored_lines = seed_lines or pattern_lines or fallback_lines
     scored_lines.sort(key=lambda item: (-item[0], len(item[1])))
     evidence_blocks = []
     for _, line in scored_lines:

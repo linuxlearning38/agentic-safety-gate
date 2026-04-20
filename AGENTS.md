@@ -143,8 +143,68 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
 
 ## Current Working State (Session Memory)
 - Timestamp:
-  - 2026-04-18 Asia/Calcutta
+  - 2026-04-19 Asia/Calcutta
 - Latest changes made:
+  - Completed first Fix #6 RAG/knowledge-quality hardening for core DevOps definitions:
+    - Added deterministic seeded definition blocks for core DevOps terms in `web_agent_v2.1_guardrail.py`
+    - Current seeded terms: Kubernetes, Docker, Terraform, Helm, Linux, Pod, Deployment, Kubernetes Service, ConfigMap, Ingress, readiness probe, liveness probe, OOMKilled, CrashLoopBackOff, namespace, PVC, Dockerfile, kubeconfig
+    - Seeded facts feed the existing controlled `definition` evidence path instead of bypassing AVA's serving contract
+    - Seeded definition chunks now use a dedicated `seeded_definitions` source and are preferred over noisy pattern/blog retrieval for controlled definitions
+    - Removed the old Kubernetes one-line override in `control/answer_planner.py`
+    - `what is Kubernetes?` now returns a richer controlled answer covering orchestration, desired state, Pods, Services, rollout/rollback, and the Docker distinction
+    - Common first-touch Kubernetes/Linux concepts now have stable AVA-owned grounding even when retrieval is thin or noisy
+    - `What is Helm?`, `What is Linux?`, and `What is kubeconfig?` now stay grounded instead of falling through to weak retrieval/general answers
+    - Added Kubernetes-specific Mermaid edges so `Draw a diagram showing Kubernetes deployment flow` includes Kubernetes Service, Pods, Deployment, ReplicaSet, and Container rather than a generic app-service/data-store graph
+    - Added a specific `pod_network` troubleshooting topic for `My pod network is failing`, with CNI, NetworkPolicy, DNS, Service endpoints, node routing, and workload-readiness guidance
+    - General non-DevOps questions still route to `general_qwen`; AVA does not claim grounded DevOps authority for unrelated topics
+    - Regression coverage added for Kubernetes, Helm, Linux, Pod, Deployment, Ingress, CrashLoopBackOff, Dockerfile, kubeconfig, pod-network troubleshooting, and non-DevOps no-seed behavior
+  - Added `tests/ava_live_100_question_test.py`:
+    - Exercises the real `/auth/login` and `/ask` serving path with exactly 100 prompts
+    - Covers identity, AVA safety, diagrams, architecture, controlled DevOps definitions, troubleshooting, general Qwen answers, safe tools, raw safe commands, vague clarifications, ambiguous operational clarification, approval-gated actions, destructive blocking, learning queries, memory store/recall, and follow-up behavior
+    - The full throttled run passed 100/100 after fixes
+    - Initial live failures found and fixed:
+      - noisy Helm retrieval outranked seeded definition facts
+      - Linux definition fell through to general Qwen because Linux was only a weak DevOps marker
+      - kubeconfig preferred the credential warning over the actual cluster/context definition
+      - generic Kubernetes deployment-flow diagram omitted Kubernetes-specific nodes
+      - pod-network troubleshooting returned generic troubleshooting text
+    - Initial live expectation mismatches corrected:
+      - diagram prompts correctly return `type=diagram`
+      - memory store/recall correctly return `type=memory`
+      - `restart my pod` asks for deployment name because AVA restarts through the deployment-safe path
+      - process clarification uses `PID` wording
+  - Added bounded remediation planning for host-risk assessments:
+    - AVA can now produce one `remediation_plan` with action, rationale, risk, approval requirement, precondition, and rollback note
+    - Remediation actions are allowlist-bound only; Qwen cannot invent shell commands or bypass AVA execution policy
+    - The first wired path is `assess_host_risk`, using existing remediation candidates such as `patch package <name>` or `install security updates`
+    - If the model returns a disallowed action, AVA rejects it and falls back to the safest allowlisted remediation candidate
+    - UI now renders a `Safest remediation path` panel with a `Run through AVA` button, which resubmits the action through the existing safety/approval pipeline
+    - Regression coverage added for targeted patch selection, forced approval, and rejection of disallowed remediation output
+  - Tightened bounded diagnostic planning:
+    - Qwen may choose only an allowlisted diagnostic step
+    - AVA now owns the final diagnostic rationale, expected signal, and priority text deterministically
+    - Deterministic fallback now runs when the model is unavailable or errors, instead of silently omitting the diagnostic plan
+  - Completed Fix #5 session follow-up memory for operational turns:
+    - Command/tool results are now saved into DB-backed query history, not only JSON history
+    - Follow-up prompts such as `what should I do next`, `run that`, `do that`, and `apply it` now route as controlled follow-ups
+    - AVA extracts the last operational `Safest Remediation Path`, `Next Diagnostic Step`, or `Next action` from recent command output
+    - Informational follow-ups explain the next grounded action without executing it
+    - Execution follow-ups re-enter `_resolve_direct_action_query(...)`, so the normal block/approval/execute policy still applies
+    - Regression coverage added for operational follow-up routing, recall, and command-path re-entry
+  - Added canonical response finalizers in `web_agent_v2.1_guardrail.py`:
+    - `_finalize_command_payload(...)`
+    - `_finalize_resolved_payload(...)`
+  - Standardized how `/ask` turns resolved outcomes into:
+    - saved history
+    - API payload shape
+    - command result envelopes
+  - Switched the remaining major `/ask` branches to use the same finalization path:
+    - controlled resolver output
+    - command-graph knowledge output
+    - command-graph approval pause output
+    - ReAct output
+    - grounded-knowledge fallback output
+  - Removed another layer of hand-built per-branch payload logic from `/ask`
   - Refactored `/ask` so the main serving path now uses one canonical controlled-query resolver plus one canonical grounded-knowledge resolver instead of repeating similar routing logic in multiple places
   - Added `_resolve_controlled_query(...)` in `web_agent_v2.1_guardrail.py` to unify:
     - direct action execution
@@ -326,6 +386,9 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - Added regression coverage for the new Linux operator phrases
   - `AGENTS.md` updated to reflect current serving-contract state
 - Root causes investigated:
+  - Even after the canonical resolvers were added, `/ask` still finalized responses differently across controlled, graph, ReAct, and grounded paths
+  - That meant routing logic was cleaner, but payload persistence and result-shape behavior could still drift branch by branch
+  - The serving contract needed one final normalization layer, not just one resolver layer
   - The main `/ask` route still had duplicated execution/response logic for single-question and multi-question handling
   - Controlled responses and grounded-knowledge fallback were being resolved in parallel but separately, which made the serving contract harder to trust and harder to extend
   - There was also duplicate persistence behavior in the final knowledge path
@@ -347,12 +410,68 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - Some Linux tools assumed a systemd host, but AVA currently runs inside a non-systemd container
   - `inspect_process` surfaced raw `ps` failure text instead of turning it into a user-facing diagnosis
 - Outcome verified:
+  - Live `/ask` shape remains consistent after response finalization refactor:
+    - multi-query -> `type: "multi"` with results array
+    - operational command -> `type: "command"` with `result`
+    - knowledge query -> `type: "knowledge"` without `result`
+  - Verified live after rebuild:
+    - `show running processes, show listening ports, check ssh failures`
+    - `look for suspicious activity`
+    - `what should I investigate on this host`
+    - `what is kubernetes`
+  - Regression suite still passes with 207 checks after the finalization refactor
   - Live `/ask` behavior still works after the structural unification:
     - `show running processes, show listening ports, check ssh failures` -> `type: "multi"` with 3 results
     - `look for suspicious activity` -> command path
     - `what should I investigate on this host` -> `tool:assess_host_risk`
     - `what is kubernetes` -> knowledge path
   - Regression suite remains green with 207 checks after the unification refactor
+  - Suspicious-activity and host-risk assessments now have a bounded model-assisted reasoning layer on top of live signals
+  - That reasoning layer is constrained by:
+    - fixed JSON schema
+    - validated severities/confidence
+    - validated next-action allowlists
+    - deterministic rule-based fallback when the model is unavailable or drifts
+  - This keeps safety/policy hardcoded while allowing Qwen to synthesize the strongest combined investigation story from current evidence
+  - The bounded reasoner now only runs when there is a real combined story to explain:
+    - suspicious path: multiple signal categories must align
+    - host-risk path: vulnerability posture must coincide with runtime drift
+  - This prevents fake “correlated assessment” text when AVA only sees one category of risk
+  - Linux/operator metadata now explicitly carries control-plane disclosure fields:
+    - `runtime_scope`
+    - `assessment_mode`
+    - `compliance_note`
+    - normalized `source`
+    - `route_source`
+    - `investigation_plan`
+  - Command cards now surface those controls to the user so AVA states what surface it inspected and whether the result came from deterministic logic or bounded reasoning
+  - Live checks now confirm:
+    - `what should I investigate on this host` -> `runtime_scope=container_runtime_mixed`, `assessment_mode=deterministic`
+    - `look for suspicious activity` -> `runtime_scope=container_runtime_observed`, `assessment_mode=deterministic`
+    - `inspect service nginx` -> `runtime_scope=container_runtime_limited` with an explicit compliance note about missing host systemd truth
+    - `what should I investigate on this host` -> `source=operational_route_deterministic`
+    - `look for suspicious activity` -> `source=operational_route_bounded_classifier`
+    - `run date` -> `source=direct_raw_command`
+    - `look for suspicious activity` -> `route_source=operational_route_bounded_classifier`, `assessment_mode=deterministic`, `runtime_scope=container_runtime_observed`
+  - AVA no longer exposes legacy source labels like `ask_operational` or `ask_operational_llm_fallback` in live command metadata
+  - `route_source` now makes execution-entry provenance explicit so `source`/`assessment_mode` no longer have to carry overlapping meaning in the user’s head
+  - AVA now emits a bounded `investigation_plan` for analysis-heavy operator results when a next diagnostic step can be justified from live facts
+  - Live verification now confirms:
+    - `what should I investigate on this host` can return a structured next diagnostic step with:
+      - `step`
+      - `rationale`
+      - `expected_signal`
+      - `priority`
+    - `what is kubernetes` still stays on the knowledge path with no command result payload
+  - Planner filtering now rejects environment-limited steps before selection:
+    - in container-limited contexts with `systemd_unavailable`, it no longer chooses `check failed services` or service inspection as the next best diagnostic step
+  - Live verification now shows:
+    - `what should I investigate on this host` -> `investigation_plan.step=scan my system for vulnerabilities`
+  - Regression suite now passes with 222 checks after environment-aware planning refinement
+  - Live checks after rebuild now show:
+    - `look for suspicious activity` -> no correlated assessment when only normal/self-runtime signals are present
+    - `what should I investigate on this host` -> `primary_concern` only when there is vulnerability exposure but no drift story
+    - `what is kubernetes` -> still clean knowledge path
   - `py_compile` passed and AVA rebuilt successfully after the refactor
   - `what should I investigate on this host` now routes to `tool:assess_host_risk`
   - That response includes both:
@@ -403,15 +522,24 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - Keep deterministic/self/security paths invisible and consistent for the user
   - Expand coverage without reintroducing stitched-together routing behavior
   - Keep new capabilities flowing through the canonical controlled-query and grounded-knowledge resolvers
+  - Keep payload construction and history recording flowing through canonical response finalizers instead of branch-specific response code
   - Shift AVA from “tool wrapper” toward operator intelligence by ranking findings, correlating aligned signals across domains, naming the top concern, and recommending the next best action
   - Reduce meaningless approval prompts when the user intent is diagnostic or operational but underspecified
   - Keep model reasoning constrained to classification/correlation tasks instead of letting it own execution truth
+  - Add real intelligence only where AVA can validate and contain it; do not let reasoning paths bypass the hard safety cage
+  - Treat “reasoning” as synthesis across evidence, not rewording a single signal more confidently
+  - Make inspection scope and reasoning provenance explicit instead of implied, so AVA cannot silently overclaim what it knows
+  - Keep provenance labels canonical and stable so audits do not depend on legacy internal path names
+  - Separate route provenance from assessment provenance so AVA can say both how a request was routed and how the result was produced
+  - Keep next-step planning bounded to an allowlist and live evidence; do not let the planner become a freeform command generator
+  - Penalize or remove already-known dead-end steps before asking the planner so AVA optimizes for information gain, not just semantic plausibility
 - Next steps:
   - Improve the weakest knowledge-answer cases
   - Expand the hybrid classifier carefully to additional high-value operational phrasings without replacing deterministic safety/identity routes
   - Expand host-risk reasoning further into process/service inspection outputs so AVA can escalate from “top risk” to “likely root cause path”
-  - Normalize result schema further across command, knowledge, multi, and analysis-heavy paths so UI rendering does not depend on path-specific assumptions
-  - Tighten approval/state handling around the remaining non-canonical branches such as command graph and ReAct if they continue to coexist
+  - Push bounded model reasoning deeper into investigation planning before expanding any more phrase-level routing
+  - Normalize the remaining edge-case schemas outside `/ask` if they bypass the canonical response finalizers
+  - Tighten approval/state handling around command graph and ReAct if they continue to coexist as separate execution engines
   - Expand baseline/history-aware comparisons further to high-risk processes and service health over time (process ancestry, unusual CPU bursts)
   - Add richer service/process remediation guidance tied to actual findings
   - Add richer remediation actions from findings beyond package prompts, including stronger service/process follow-ups
