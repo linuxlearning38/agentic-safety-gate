@@ -75,7 +75,7 @@ services:
       OLLAMA_HOST:         http://host.docker.internal:11434
       AVA_HOST_PROC:       /host/proc
       FLASK_ENV:           production
-      WEBHOOK_SECRET:      ${WEBHOOK_SECRET:-ava-webhook-2026}
+      WEBHOOK_SECRET:      ${WEBHOOK_SECRET:-}
       DB_PATH:             ${DB_PATH:-/data/ava.db}
 
     extra_hosts:

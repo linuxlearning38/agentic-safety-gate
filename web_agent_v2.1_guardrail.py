@@ -126,9 +126,15 @@ LLM_WARMUP_PROMPT = os.getenv("LLM_WARMUP_PROMPT", "Reply with only: ready")
 MEMORY_PATH = os.getenv("MEMORY_PATH", "/home/manoj/ava-data/ava_memory.json")
 
 # Phase 5B: Webhook auth secret
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "ava-webhook-2026")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+if not WEBHOOK_SECRET:
+    logger.warning("[Webhook] WEBHOOK_SECRET is not set. /webhook is disabled until a secret is configured.")
 _warmup_started = False
 _warmup_lock = threading.Lock()
+
+
+def _api_error(message: str = "Internal server error", status: int = 500, code: str = "internal_error"):
+    return jsonify({"error": message, "code": code}), status
 
 def load_memory():
     try:
@@ -2984,7 +2990,7 @@ def generate_response(query, context, confidence=None, prior_messages=None):
 
     except Exception as e:
         logger.error(f"LLM error: {e}")
-        return f"Error generating response: {str(e)}"
+        return "I could not generate a response right now. Please try again or use a more specific operational check."
 
 # Routes
 # ── Auth Endpoints ────────────────────────────────────────────────────────────
@@ -3622,6 +3628,10 @@ def webhook():
     Auth: X-Webhook-Secret header (no JWT required).
     """
     # Auth
+    if not WEBHOOK_SECRET:
+        logger.warning("[Webhook] Rejected request because WEBHOOK_SECRET is not configured")
+        return jsonify({"status": "error", "message": "Webhook endpoint is disabled"}), 503
+
     provided_secret = request.headers.get("X-Webhook-Secret", "")
     if provided_secret != WEBHOOK_SECRET:
         logger.warning(f"[Webhook] Invalid secret from {request.remote_addr}")
@@ -3676,7 +3686,7 @@ def webhook():
 
     except Exception as e:
         logger.error(f"[Webhook] Error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        return jsonify({"status": "error", "message": "Webhook processing failed"}), 500
 
 
 @app.route('/heal', methods=['POST'])
@@ -3724,7 +3734,7 @@ def manual_heal():
 
     except Exception as e:
         logger.error(f"[/heal] Error: {e}")
-        return jsonify({"error": str(e)}), 500
+        return _api_error("Healing request failed")
 
 
 @app.route('/healing/history', methods=['GET'])
@@ -3735,7 +3745,8 @@ def healing_history():
         history = healer.get_healing_history(20)
         return jsonify({"history": history, "total": len(history)})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"[/healing/history] Error: {e}")
+        return _api_error("Healing history is unavailable")
 
 
 @app.route('/upload', methods=['POST'])
@@ -3857,7 +3868,7 @@ File content:
         
     except Exception as e:
         logger.error(f"Error in upload endpoint: {e}")
-        return jsonify({'error': 'Failed to analyze file', 'details': str(e)}), 500
+        return _api_error("Failed to analyze file")
 
 @app.route('/history', methods=['GET'])
 @jwt_required()
@@ -3866,7 +3877,8 @@ def get_history():
         history = load_history()
         return jsonify({'history': history[-50:], 'total': len(history)})
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error loading history endpoint: {e}")
+        return _api_error("History is unavailable")
 
 @app.route('/stats', methods=['GET'])
 @jwt_required()
@@ -3919,7 +3931,7 @@ def execute_approved_route():
 
     except Exception as e:
         logger.error(f"Error in execute_approved: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _api_error("Approved command execution failed")
 
 
 @app.route('/tools', methods=['GET'])
@@ -3943,7 +3955,7 @@ def list_tools_route():
         })
     except Exception as e:
         logger.error(f"Error listing tools: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _api_error("Tool list is unavailable")
 
 
 @app.route('/tools/<tool_name>/run', methods=['POST'])
@@ -3990,7 +4002,7 @@ def run_tool_route(tool_name):
 
     except Exception as e:
         logger.error(f"Error running tool {tool_name}: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _api_error("Tool execution failed")
 
 
 @app.route('/react/run', methods=['POST'])
@@ -4044,7 +4056,7 @@ def react_run_route():
 
     except Exception as e:
         logger.error(f"Error in react_run: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _api_error("ReAct execution failed")
 
 
 # ── Day 7: Incident Report Endpoints ─────────────────────────────────────────
@@ -4065,7 +4077,7 @@ def list_reports():
         })
     except Exception as e:
         logger.error(f"[Reports] list error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _api_error("Reports are unavailable")
 
 
 @app.route('/reports/stats', methods=['GET'])
@@ -4079,7 +4091,7 @@ def reports_stats():
         return jsonify(get_reports_stats())
     except Exception as e:
         logger.error(f"[Reports] stats error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _api_error("Report statistics are unavailable")
 
 
 @app.route('/reports/<report_id>', methods=['GET'])
@@ -4096,7 +4108,7 @@ def get_report(report_id):
         return jsonify(report)
     except Exception as e:
         logger.error(f"[Reports] get error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _api_error("Report is unavailable")
 
 
 @app.route('/rate-limit/status', methods=['GET'])
@@ -4154,6 +4166,7 @@ def rate_limit_exceeded_handler(e):
 
 
 @app.route('/security/stats', methods=['GET'])
+@require_admin
 def get_security_stats_route():
     """Get security statistics for dashboard"""
     try:
@@ -4188,9 +4201,10 @@ def get_security_stats_route():
         
     except Exception as e:
         logger.error(f"Error getting security stats: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _api_error("Security statistics are unavailable")
 
 @app.route('/security/audit', methods=['GET'])
+@require_admin
 def get_audit_log_route():
     """Get audit log entries"""
     try:
@@ -4210,7 +4224,7 @@ def get_audit_log_route():
         
     except Exception as e:
         logger.error(f"Error getting audit log: {e}")
-        return jsonify({'error': str(e)}), 500
+        return _api_error("Security audit log is unavailable")
 
 # HTML Template
 HTML_TEMPLATE = r'''

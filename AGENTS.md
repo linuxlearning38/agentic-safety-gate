@@ -149,7 +149,35 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-20 Asia/Calcutta (Fix #6.7)
   - 2026-04-20 Asia/Calcutta (Fix #7.2)
   - 2026-04-20 Asia/Calcutta (Fix #7.2 live verification hardening)
+  - 2026-04-20 Asia/Calcutta (pre-pen-test hardening)
 - Latest changes made:
+  - Completed pre-penetration-test hardening for known application-layer findings:
+    - Removed the hardcoded webhook secret fallback; `WEBHOOK_SECRET` now defaults to empty and `/webhook` is disabled until an explicit secret is configured
+    - Removed the matching docker-compose fallback so deployments no longer silently use `ava-webhook-2026`
+    - Added admin authentication to `/security/stats` and `/security/audit`; unauthenticated calls now return 401 while authenticated admin calls still return 200
+    - Replaced raw `str(e)` API responses in sensitive routes with generic user-facing errors while preserving server-side logging
+    - Replaced raw LLM exception text in `generate_response` with a generic retry message
+    - Verified this is policy-level hardening, not question-answer hardcoding: no default secrets, no unauthenticated internal security telemetry, no exception detail leaks
+    - Static verification after hardening:
+      - `py_compile`: PASS
+      - `tests/intelligence_regression.py`: PASS
+      - `tests/hybrid_retrieval_regression.py`: PASS
+      - `tests/ava_benchmark_suite.py`: PASS
+    - Live verification after rebuild:
+      - `/health`: OK
+      - unauthenticated `/security/stats`: 401
+      - unauthenticated `/security/audit?count=1`: 401
+      - authenticated admin `/security/stats`: 200
+      - authenticated admin `/security/audit?count=1`: 200
+      - default webhook secret `ava-webhook-2026`: rejected because webhook is disabled without configured secret
+      - `tests/ava_e2e_live_test.py`: 8/8 passing
+      - `tests/ava_live_100_question_test.py`: 100/100 passing
+    - Remaining pre-professional-pen-test items are container and resilience hardening, not answer-quality fixes:
+      - Docker socket blast radius needs a read-only/proxy design or explicit local-only risk acceptance
+      - Compose should drop Linux capabilities and use a read-only filesystem where compatible
+      - Redis/Postgres/OPA/Vault host port exposure should be scoped to localhost/internal networks
+      - Rate limiting should use shared Redis-backed storage instead of per-worker memory
+      - Audit logs need integrity protection if they are used as security evidence
   - Completed Fix #7.2 live verification hardening after full `/ask` testing:
     - Root cause found during live 100-question run: host service/systemd inspection could raise `PermissionError` when probing inaccessible `/host/proc/1/root/...` paths
     - Fixed `control/host_telemetry.py` to use permission-safe path existence checks so inaccessible host paths are treated as unavailable/limited truth surfaces instead of crashing `/ask`
