@@ -59,6 +59,11 @@ TROUBLESHOOTING_TOPIC_PATTERNS = {
     "pod_network": ["pod network", "pod networking", "network policy", "cni"],
     "dns_failure": ["dns failure", "dns issue", "dns problem", "dns resolution", "coredns", "service discovery"],
     "tls_certificate": ["tls certificate", "tls cert", "certificate issue", "certificate error", "ssl certificate", "cert expiry", "certificate expiry"],
+    "redis_incident": ["redis latency", "redis timeout", "redis down", "redis incident", "redis memory", "redis evicted", "redis eviction", "redis blocked clients", "redis connection"],
+    "postgres_incident": ["postgres latency", "postgres timeout", "postgres down", "postgres incident", "postgres lock", "postgres locks", "postgres connection", "postgres replication", "postgres wal", "postgres disk", "postgresql lock", "postgresql replication"],
+    "terraform_drift": ["terraform drift", "state drift", "terraform state drift", "terraform plan drift", "infrastructure drift", "drifted resource"],
+    "service_mesh_traffic": ["service mesh", "istio traffic", "istio routing", "istio mtls", "mtls issue", "envoy route", "virtualservice", "destinationrule", "sidecar injection"],
+    "cicd_failure": ["ci/cd failure", "cicd failure", "pipeline failure", "pipeline failed", "build failed", "deployment pipeline", "jenkins failed", "github actions failed", "gitlab pipeline failed"],
     "service_down": ["service is down", "service down", "unreachable", "can't connect", "cannot connect", "timeout"],
     "generic": ["error", "failed", "failing", "not working", "broken", "troubleshoot", "debug", "fix", "issue", "problem"],
 }
@@ -226,6 +231,7 @@ def classify_definition_topic(normalized_query: str) -> str | None:
 
 def is_action_style_query(normalized_query: str) -> bool:
     q = f" {(normalized_query or '').lower().strip()} "
+    q = q.replace("terraform ", "terraform_")
     return any(marker in q for marker in ACTION_STYLE_MARKERS)
 
 

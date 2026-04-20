@@ -438,6 +438,41 @@ def build_troubleshooting_plan(route, evidence) -> AnswerPlan:
             "**Low-risk fix:** Renew or rotate the certificate through the normal issuer path, update the referenced TLS secret, fix hostname/SAN mismatch, or restore the correct CA bundle; verify with a non-destructive handshake check.\n"
             "**Unsafe shortcuts to avoid:** Do not disable TLS verification, publish private keys, or replace ingress secrets blindly without confirming the chain and rollback path."
         ),
+        "redis_incident": (
+            "**Confirm symptom:** Identify whether Redis is showing latency, timeouts, memory pressure, evictions, replication lag, blocked clients, or role/failover changes.\n"
+            "**Inspect evidence:** Check `INFO` sections for memory, clients, persistence, replication, CPU, evicted keys, rejected connections, blocked clients, slowlog entries, hot keys, network errors, and recent config or deploy changes.\n"
+            "**Likely cause:** Redis incidents commonly come from maxmemory pressure, eviction churn, slow commands, hot keys, connection storms, persistence fork pressure, replica lag, or network instability.\n"
+            "**Low-risk fix:** Reduce hot-key/load pressure, fix client pooling and timeouts, remove slow commands, tune maxmemory only after confirming memory evidence, and fail over only after replica health is verified.\n"
+            "**Unsafe shortcuts to avoid:** Do not run FLUSHALL, disable persistence, kill Redis, or force failover before preserving evidence and confirming replica safety."
+        ),
+        "postgres_incident": (
+            "**Confirm symptom:** Capture the exact error, latency window, affected database, lock/wait symptoms, connection count, replication state, disk/WAL pressure, and recent schema or deploy changes.\n"
+            "**Inspect evidence:** Check active sessions, wait events, locks, slow queries, query plans, connection pool saturation, autovacuum state, table/index bloat, replication lag, disk usage, and WAL growth.\n"
+            "**Likely cause:** PostgreSQL incidents often come from lock contention, a bad query plan, exhausted connections, disk or WAL pressure, vacuum lag, replica lag, or a migration holding locks.\n"
+            "**Low-risk fix:** Cancel only the specific unsafe query when evidence supports it, reduce connection storms through the pooler, free disk/WAL pressure, fix the query/index after plan validation, or tune autovacuum with a rollback plan.\n"
+            "**Unsafe shortcuts to avoid:** Do not drop or truncate data, kill PostgreSQL, run VACUUM FULL during peak traffic, or restart the database before preserving evidence and confirming impact."
+        ),
+        "terraform_drift": (
+            "**Confirm symptom:** Determine whether drift appears in a refresh-only plan, a normal plan, a failed apply, or a resource changed manually outside Terraform.\n"
+            "**Inspect evidence:** Review workspace, backend, state lock, provider credentials, recent manual console changes, imported resources, provider default changes, lifecycle `ignore_changes`, and the exact planned add/change/destroy actions.\n"
+            "**Likely cause:** Terraform drift usually comes from manual changes, stale or wrong state, provider/API default changes, wrong workspace or variables, partial applies, or unmanaged resources that need import/adoption.\n"
+            "**Low-risk fix:** Use a reviewed refresh-only plan to identify drift, import intentional resources, revert accidental manual changes, correct workspace/variables, and apply only after the plan is reviewed and approved.\n"
+            "**Unsafe shortcuts to avoid:** Do not run blind apply or destroy, edit state by hand, delete state files, or remove locks unless the lock is proven stale and the team agrees."
+        ),
+        "service_mesh_traffic": (
+            "**Confirm symptom:** Identify the failing source, destination, namespace, route, HTTP/gRPC status, mTLS mode, sidecar injection state, and whether traffic fails before or after Envoy.\n"
+            "**Inspect evidence:** Check sidecar presence, Envoy routes/clusters/listeners, VirtualService, DestinationRule, Gateway, Service endpoints, AuthorizationPolicy, PeerAuthentication, certificates, and mesh control-plane health.\n"
+            "**Likely cause:** Service mesh traffic failures usually come from route-match errors, subset/version mismatch, mTLS policy mismatch, missing sidecars, authorization denies, stale Envoy config, cert issues, or endpoint readiness problems.\n"
+            "**Low-risk fix:** Correct the narrow route or subset rule, restore sidecar injection, align mTLS policy with the workload, roll back the mesh config change, and verify with a small canary request path.\n"
+            "**Unsafe shortcuts to avoid:** Do not disable mTLS globally, add broad allow-all policies, delete mesh policies blindly, or restart the whole mesh before isolating the failing hop."
+        ),
+        "cicd_failure": (
+            "**Confirm symptom:** Identify the failing pipeline, stage, job, commit, artifact/image tag, environment, error message, and whether the failure is build, test, scan, publish, or deploy.\n"
+            "**Inspect evidence:** Review job logs, test reports, dependency/cache changes, secret and permission scope, scanner output, registry authentication, artifact immutability, deploy events, and rollback status.\n"
+            "**Likely cause:** CI/CD failures commonly come from broken dependencies, stale caches, flaky or failing tests, missing secrets, expired credentials, registry auth, scan/policy gates, invalid image tags, or deployment health failures.\n"
+            "**Low-risk fix:** Fix the failing stage, pin or restore the dependency, update scoped secrets, rebuild an immutable artifact, roll back a bad deploy, and retry only after the failure is identified as transient.\n"
+            "**Unsafe shortcuts to avoid:** Do not disable tests or security scans, force-push over evidence, redeploy unknown artifacts, or bypass approvals just to make the pipeline green."
+        ),
         "service_down": (
             "**Confirm symptom:** Identify the failing URL/service, affected users, error code, timeout behavior, and whether the failure is internal, ingress, or external.\n"
             "**Inspect evidence:** Check service endpoints, pod readiness, ingress/load balancer health, DNS resolution, recent deployments, dependency health, and NetworkPolicy.\n"

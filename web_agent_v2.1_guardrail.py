@@ -2835,11 +2835,15 @@ _COMMON_GROUNDING_TERMS = {
     "container", "containers", "deployment", "deployments", "docker",
     "certificate", "coredns", "crashloopbackoff", "describe", "explain", "failing", "failure", "failures",
     "health", "ingress", "investigate", "issue", "issues", "kubernetes", "liveness", "oomkilled",
+    "artifact", "artifacts", "build", "cache", "cicd", "contention", "database", "destinationrule",
+    "drift", "envoy", "eviction", "evictions", "istio", "latency", "locks", "mtls",
     "mitigation", "network", "networking", "namespace", "namespaces",
     "operator", "orchestration", "pattern", "patterns", "platform",
-    "practical", "readiness", "remediation", "request", "requests", "safely",
-    "service", "services", "system", "systems", "terraform", "tls", "traffic",
-    "troubleshoot", "troubleshooting", "workload", "workloads",
+    "pipeline", "postgres", "postgresql", "practical", "readiness", "redis",
+    "registry", "remediation", "replication", "request", "requests", "safely",
+    "scan", "service", "services", "sidecar", "slowlog", "state", "system", "systems",
+    "terraform", "timeouts", "tls", "traffic", "troubleshoot", "troubleshooting",
+    "virtualservice", "workload", "workloads",
 }
 
 

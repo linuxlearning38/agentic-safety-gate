@@ -497,6 +497,26 @@ def main():
         ns["_route_query"]("My pod network is failing").topic == "pod_network",
     )
     check(
+        "redis incident route is specific",
+        ns["_route_query"]("How do I investigate Redis latency?").topic == "redis_incident",
+    )
+    check(
+        "postgres incident route is specific",
+        ns["_route_query"]("How do I investigate Postgres lock contention?").topic == "postgres_incident",
+    )
+    check(
+        "terraform drift route is specific",
+        ns["_route_query"]("How should I handle Terraform state drift?").topic == "terraform_drift",
+    )
+    check(
+        "service mesh traffic route is specific",
+        ns["_route_query"]("How do I debug Istio service mesh traffic?").topic == "service_mesh_traffic",
+    )
+    check(
+        "cicd failure route is specific",
+        ns["_route_query"]("How do I debug a CI/CD pipeline failure?").topic == "cicd_failure",
+    )
+    check(
         "self name route is controlled",
         ns["_route_query"]("what is your name").intent == "ava_self",
     )
@@ -941,7 +961,32 @@ def main():
     tls_remediation = ns["_resolve_troubleshooting_response"]("How do I fix TLS certificate issues?")
     check("tls remediation is staged", all(marker in tls_remediation["response"] for marker in ["Confirm symptom", "Inspect evidence", "Low-risk fix", "Unsafe shortcuts"]))
     check("tls remediation blocks unsafe shortcut language", "Do not disable TLS verification" in tls_remediation["response"] and "private keys" in tls_remediation["response"])
-    unsafe_remediation_text = "\n".join([troubleshooting_resolved["response"], crashloop_remediation["response"], dns_remediation["response"], tls_remediation["response"]]).lower()
+    redis_remediation = ns["_resolve_troubleshooting_response"]("How do I investigate Redis latency?")
+    check("redis remediation is staged", all(marker in redis_remediation["response"] for marker in ["Confirm symptom", "Inspect evidence", "Likely cause", "Low-risk fix", "Unsafe shortcuts"]))
+    check("redis remediation preserves safety", "Do not run FLUSHALL" in redis_remediation["response"] and "replica health is verified" in redis_remediation["response"])
+    postgres_remediation = ns["_resolve_troubleshooting_response"]("How do I investigate Postgres lock contention?")
+    check("postgres remediation is staged", all(marker in postgres_remediation["response"] for marker in ["Confirm symptom", "Inspect evidence", "Likely cause", "Low-risk fix", "Unsafe shortcuts"]))
+    check("postgres remediation preserves data safety", "Do not drop or truncate data" in postgres_remediation["response"] and "specific unsafe query" in postgres_remediation["response"])
+    terraform_remediation = ns["_resolve_troubleshooting_response"]("How should I handle Terraform state drift?")
+    check("terraform drift remediation is staged", all(marker in terraform_remediation["response"] for marker in ["Confirm symptom", "Inspect evidence", "Likely cause", "Low-risk fix", "Unsafe shortcuts"]))
+    check("terraform drift remediation avoids blind apply", "Do not run blind apply or destroy" in terraform_remediation["response"] and "refresh-only plan" in terraform_remediation["response"])
+    mesh_remediation = ns["_resolve_troubleshooting_response"]("How do I debug Istio service mesh traffic?")
+    check("service mesh remediation is staged", all(marker in mesh_remediation["response"] for marker in ["Confirm symptom", "Inspect evidence", "Likely cause", "Low-risk fix", "Unsafe shortcuts"]))
+    check("service mesh remediation avoids broad mTLS bypass", "Do not disable mTLS globally" in mesh_remediation["response"] and "failing hop" in mesh_remediation["response"])
+    cicd_remediation = ns["_resolve_troubleshooting_response"]("How do I debug a CI/CD pipeline failure?")
+    check("cicd remediation is staged", all(marker in cicd_remediation["response"] for marker in ["Confirm symptom", "Inspect evidence", "Likely cause", "Low-risk fix", "Unsafe shortcuts"]))
+    check("cicd remediation preserves gates", "Do not disable tests or security scans" in cicd_remediation["response"] and "retry only after" in cicd_remediation["response"])
+    unsafe_remediation_text = "\n".join([
+        troubleshooting_resolved["response"],
+        crashloop_remediation["response"],
+        dns_remediation["response"],
+        tls_remediation["response"],
+        redis_remediation["response"],
+        postgres_remediation["response"],
+        terraform_remediation["response"],
+        mesh_remediation["response"],
+        cicd_remediation["response"],
+    ]).lower()
     check("remediation templates do not emit destructive commands", all(cmd not in unsafe_remediation_text for cmd in ["rm -rf", "kubectl delete", "mkfs", "chmod -r 777", "curl evil"]))
     check("controlled troubleshooting strips blog noise", troubleshooting_resolved["sources_used"] == 2)
     architecture_resolved = ns["_resolve_architecture_response"]("Explain Netflix architecture with Zuul, Kafka, Cassandra, EVCache")

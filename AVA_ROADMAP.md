@@ -209,6 +209,54 @@ Diagram answers should include domain-specific nodes, not generic placeholders.
 - Live diagram checks pass.
 - Existing diagrams remain valid.
 
+### Fix #6.5: Deep DevOps Incident Knowledge Pack
+
+#### Problem
+
+AVA still needs stronger grounded operator guidance for deeper incident domains that are common in production but not covered by the first remediation templates.
+
+#### Desired Behavior
+
+For questions like:
+
+- `How do I investigate Redis latency?`
+- `How do I investigate Postgres lock contention?`
+- `How should I handle Terraform state drift?`
+- `How do I debug Istio service mesh traffic?`
+- `How do I debug a CI/CD pipeline failure?`
+
+AVA should return a practical staged answer with:
+
+- Confirm symptom.
+- Inspect evidence.
+- Likely cause.
+- Low-risk fix.
+- Unsafe shortcuts to avoid.
+
+#### Scope
+
+- Add controlled troubleshooting topics for Redis, PostgreSQL, Terraform drift, service mesh/Istio, and CI/CD failures.
+- Add deterministic AVA-owned runbooks for those topics.
+- Keep answers advisory-only; no action execution and no approval bypass.
+- Keep hardcoded safety and weak-evidence fallback intact.
+
+#### Tests
+
+- Each incident query routes to a specific troubleshooting topic.
+- Each answer includes staged operator sections.
+- Redis guidance warns against destructive cache/data actions.
+- PostgreSQL guidance warns against data loss and blind restarts.
+- Terraform drift guidance warns against blind apply/destroy and state editing.
+- Service mesh guidance warns against broad mTLS/policy bypass.
+- CI/CD guidance warns against disabling tests/scans or bypassing approvals.
+
+#### Exit Criteria
+
+- Targeted regression tests pass.
+- Full intelligence regression passes.
+- Hybrid retrieval and benchmark suites still pass.
+- Live spot checks show deterministic incident answers.
+
 ## Phase 2: Host Truth Phase
 
 ### Goal
@@ -398,4 +446,3 @@ Reason:
 - Current work is verified and should be saved.
 - Weak-evidence fallback prevents fake confidence.
 - It improves product trust without expanding host permissions.
-
