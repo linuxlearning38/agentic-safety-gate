@@ -60,6 +60,15 @@ FUNCTIONS = {
     "_answer_ava_self_query",
     "_should_direct_unknown_to_llm",
     "_resolve_general_unknown_response",
+    "_resolve_grounded_knowledge_query",
+    "score_context_confidence",
+    "_apply_confidence_rules",
+    "_should_use_weak_evidence_fallback",
+    "_build_weak_evidence_fallback",
+    "_context_to_text",
+    "_specific_query_terms",
+    "_has_unsupported_specific_terms",
+    "is_weak_response",
     "_core_definition_terms",
     "_seed_definition_chunks",
     "split_multi_query",
@@ -89,6 +98,9 @@ CONSTANTS = {
     "_FOLLOW_UP_EXECUTION_MARKERS",
     "_FOLLOW_UP_NEXT_STEP_MARKERS",
     "_CORE_DEVOPS_DEFINITION_BLOCKS",
+    "_CONFIDENCE_STOP_WORDS",
+    "_WEAK_EVIDENCE_FALLBACK",
+    "_COMMON_GROUNDING_TERMS",
 }
 
 CLASSES = {
@@ -957,6 +969,71 @@ def main():
     check("controlled configmap definition response is grounded", "configmap" in configmap_resolved["response"].lower() and "configuration data" in configmap_resolved["response"].lower())
     general_resolved = ns["_resolve_general_unknown_response"]("What is machine learning?")
     check("controlled general response uses direct llm path", "machine learning" in general_resolved["response"].lower() and general_resolved["sources_used"] == 0)
+    unrelated_context = [
+        "A cooking article about tomatoes and olive oil.",
+        "A travel note about train schedules and hotel bookings.",
+    ]
+    check(
+        "unrelated retrieval scores low confidence",
+        ns["score_context_confidence"](unrelated_context, "My Kubernetes pod network is failing with frobnicator drift") == "low",
+    )
+    check(
+        "weak evidence fallback triggers for low-confidence devops query",
+        ns["_should_use_weak_evidence_fallback"](
+            "My Kubernetes pod network is failing with frobnicator drift",
+            "troubleshooting",
+            "low",
+            unrelated_context,
+        ) is True,
+    )
+    weak_fallback = ns["_build_weak_evidence_fallback"](
+        "My Kubernetes pod network is failing with frobnicator drift",
+        "troubleshooting",
+        "low",
+        unrelated_context,
+    )
+    check("weak evidence fallback is explicit", weak_fallback.startswith(ns["_WEAK_EVIDENCE_FALLBACK"]))
+    check("weak evidence fallback avoids fake confidence", "based on general devops knowledge" not in weak_fallback.lower())
+    check(
+        "unsupported specific terms are detected",
+        ns["_has_unsupported_specific_terms"](
+            "Describe service mesh frobnicator drift mitigation",
+            ["Service mesh traffic policy and sidecar routing documentation."],
+        ) is True,
+    )
+    check(
+        "supported specific terms are accepted",
+        ns["_has_unsupported_specific_terms"](
+            "Describe service mesh frobnicator drift mitigation",
+            ["A service mesh frobnicator drift mitigation pattern should compare intended and observed mesh state."],
+        ) is False,
+    )
+    unknown_definition = ns["_resolve_definition_response"]("Explain Kubernetes frobnicator drift remediation")
+    check("definition with unsupported specific term falls back", unknown_definition["response"].startswith(ns["_WEAK_EVIDENCE_FALLBACK"]))
+    check("definition fallback reports low confidence", unknown_definition["confidence"] == "low")
+    unknown_troubleshooting = ns["_resolve_troubleshooting_response"]("How do I safely fix zarglebop failure in container networking?")
+    check("troubleshooting with unsupported specific term falls back", unknown_troubleshooting["response"].startswith(ns["_WEAK_EVIDENCE_FALLBACK"]))
+    check("troubleshooting fallback reports low confidence", unknown_troubleshooting["confidence"] == "low")
+    original_query_kb = ns.get("query_knowledge_base")
+    original_generate = ns.get("generate_response")
+    original_update_memory = ns.get("update_memory_issue")
+    original_is_technical = ns.get("is_technical_query")
+    ns["query_knowledge_base"] = lambda query, query_intent=None: unrelated_context
+    ns["generate_response"] = lambda *args, **kwargs: "Unsupported but confident Kubernetes tuning answer."
+    ns["update_memory_issue"] = lambda *args, **kwargs: None
+    ns["is_technical_query"] = lambda query: True
+    grounded_weak = ns["_resolve_grounded_knowledge_query"]("My Kubernetes pod network is failing with frobnicator drift")
+    check("grounded weak evidence returns fallback", grounded_weak["response"].startswith(ns["_WEAK_EVIDENCE_FALLBACK"]))
+    check("grounded weak evidence does not use hallucinated answer", "unsupported but confident" not in grounded_weak["response"].lower())
+    check("grounded weak evidence remains low confidence", grounded_weak["confidence"] == "low")
+    if original_query_kb is not None:
+        ns["query_knowledge_base"] = original_query_kb
+    if original_generate is not None:
+        ns["generate_response"] = original_generate
+    if original_update_memory is not None:
+        ns["update_memory_issue"] = original_update_memory
+    if original_is_technical is not None:
+        ns["is_technical_query"] = original_is_technical
 
     wrapped = '{"issue_type":"definition","command":"","risk_level":"","rollback":"","action_taken":"Readiness probe checks readiness. Liveness probe checks health."}'
     check("wrapper detected", ns["_looks_like_invalid_json_wrapper"](wrapped) is True)

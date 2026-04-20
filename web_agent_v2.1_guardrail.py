@@ -1409,7 +1409,15 @@ def _resolve_troubleshooting_response(query):
     route = _route_query(query)
     if route.intent != "troubleshooting":
         return None
-    evidence = select_troubleshooting_evidence(route, _retrieve_troubleshooting_chunks(query))
+    raw_chunks = _retrieve_troubleshooting_chunks(query)
+    if _has_unsupported_specific_terms(query, raw_chunks):
+        return {
+            "response": _build_weak_evidence_fallback(query, route.intent, "low", raw_chunks),
+            "confidence": "low",
+            "sources_used": len(raw_chunks),
+            "topic": route.topic,
+        }
+    evidence = select_troubleshooting_evidence(route, raw_chunks)
     plan = build_troubleshooting_plan(route, evidence)
     return {
         "response": compose_controlled_response(plan),
@@ -1786,7 +1794,15 @@ def _resolve_definition_response(query):
     route = _route_query(query)
     if route.intent != "definition":
         return None
-    evidence = select_definition_evidence(route, _retrieve_definition_chunks(query))
+    raw_chunks = _retrieve_definition_chunks(query)
+    if _has_unsupported_specific_terms(query, raw_chunks):
+        return {
+            "response": _build_weak_evidence_fallback(query, route.intent, "low", raw_chunks),
+            "confidence": "low",
+            "sources_used": len(raw_chunks),
+            "topic": route.topic,
+        }
+    evidence = select_definition_evidence(route, raw_chunks)
     plan = build_definition_plan(route, evidence)
     return {
         "response": compose_controlled_response(plan),
@@ -1957,6 +1973,19 @@ def _resolve_grounded_knowledge_query(query, *, prior_messages=None):
     context = query_knowledge_base(query, query_intent=query_intent)
     confidence = score_context_confidence(context, query)
     confidence = _apply_confidence_rules(confidence, context, query)
+
+    if _should_use_weak_evidence_fallback(query, query_intent, confidence, context):
+        response = _build_weak_evidence_fallback(query, query_intent, confidence, context)
+        return {
+            "type": "knowledge",
+            "intent": "knowledge",
+            "response": response,
+            "confidence": "low",
+            "sources_used": len(context),
+            "context": context,
+            "query_intent": query_intent,
+        }
+
     response = generate_response(query, context, confidence=confidence, prior_messages=prior_messages)
     if query_intent != "healing_incident" and _looks_like_invalid_json_wrapper(response):
         response = _repair_definition_wrapper(response)
@@ -1982,6 +2011,10 @@ def _resolve_grounded_knowledge_query(query, *, prior_messages=None):
             context = retry_context
             confidence = retry_confidence
             logger.info("[FAILSAFE] Retry complete")
+
+    if _should_use_weak_evidence_fallback(query, query_intent, confidence, context, response=response):
+        response = _build_weak_evidence_fallback(query, query_intent, confidence, context)
+        confidence = "low"
 
     if is_technical_query(query) and not is_weak_response(response):
         update_memory_issue(query, response[:200])
@@ -2757,6 +2790,79 @@ def _apply_confidence_rules(confidence: str, context: list, query: str) -> str:
         return confidence  # healer already sets this correctly
 
     return confidence
+
+
+_WEAK_EVIDENCE_FALLBACK = "I do not have enough grounded evidence to answer this confidently."
+
+
+def _should_use_weak_evidence_fallback(query, query_intent, confidence, context, response=None):
+    """Prevent low-evidence DevOps answers from being filled in by model guesswork."""
+    if query_intent in {"ava_self", "healing_incident"}:
+        return False
+    if query_intent in {"general", "general_qwen", "unknown"} and _should_direct_unknown_to_llm(query):
+        return False
+    if _has_unsupported_specific_terms(query, context):
+        return True
+    if confidence != "low":
+        return False
+    if response and is_weak_response(response):
+        return True
+    return True
+
+
+def _build_weak_evidence_fallback(query, query_intent, confidence, context):
+    next_steps = [
+        "Share the exact component, error message, log line, or platform involved.",
+        "Ask AVA to run a live diagnostic if this is about the current system.",
+        "Use verified runtime facts instead of relying on weak retrieved chunks.",
+    ]
+    return (
+        f"{_WEAK_EVIDENCE_FALLBACK}\n\n"
+        "What I can do safely:\n"
+        + "\n".join(f"- {step}" for step in next_steps)
+    )
+
+
+_COMMON_GROUNDING_TERMS = {
+    "architecture", "application", "applications", "cluster", "clusters",
+    "container", "containers", "deployment", "deployments", "docker",
+    "crashloopbackoff", "describe", "explain", "failing", "failure", "failures",
+    "health", "ingress", "kubernetes", "liveness", "oomkilled",
+    "mitigation", "network", "networking", "namespace", "namespaces",
+    "operator", "orchestration", "pattern", "patterns", "platform",
+    "practical", "readiness", "remediation", "request", "requests",
+    "service", "services", "system", "systems", "terraform", "traffic",
+    "troubleshoot", "troubleshooting", "workload", "workloads",
+}
+
+
+def _context_to_text(context):
+    parts = []
+    for item in context or []:
+        if hasattr(item, "content"):
+            parts.append(str(getattr(item, "content", "")))
+        else:
+            parts.append(str(item))
+    return "\n".join(parts).lower()
+
+
+def _specific_query_terms(query):
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{6,}", query.lower())
+    return [
+        token
+        for token in tokens
+        if token not in _CONFIDENCE_STOP_WORDS and token not in _COMMON_GROUNDING_TERMS
+    ]
+
+
+def _has_unsupported_specific_terms(query, context):
+    specific_terms = _specific_query_terms(query)
+    if not specific_terms:
+        return False
+    context_text = _context_to_text(context)
+    if not context_text:
+        return True
+    return any(term not in context_text for term in specific_terms)
 
 
 _CONFIDENCE_PREFIXES = {

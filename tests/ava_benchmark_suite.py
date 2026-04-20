@@ -49,6 +49,10 @@ FUNCTIONS = {
     "_answer_ava_self_query",
     "_should_direct_unknown_to_llm",
     "_resolve_general_unknown_response",
+    "_context_to_text",
+    "_specific_query_terms",
+    "_has_unsupported_specific_terms",
+    "_build_weak_evidence_fallback",
     "_core_definition_terms",
     "_seed_definition_chunks",
     "detect_query_intent",
@@ -62,6 +66,9 @@ CONSTANTS = {
     "_FOLLOW_UP_EXECUTION_MARKERS",
     "_FOLLOW_UP_NEXT_STEP_MARKERS",
     "_CORE_DEVOPS_DEFINITION_BLOCKS",
+    "_CONFIDENCE_STOP_WORDS",
+    "_COMMON_GROUNDING_TERMS",
+    "_WEAK_EVIDENCE_FALLBACK",
 }
 
 CLASSES = {
