@@ -42,6 +42,7 @@ ARCHITECTURE_TOPIC_PATTERNS = {
     "external": [
         "architecture", "request flow", "data flow", "system design",
         "topology", "deployment flow", "sequence flow", "component flow",
+        "pipeline flow", "terraform flow", "ingress flow", "plan apply",
     ],
 }
 

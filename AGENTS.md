@@ -181,6 +181,17 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
       - `What causes OOMKilled in Kubernetes?`
       - `How do I investigate Kubernetes DNS failure?`
       - `How do I fix TLS certificate issues?`
+  - Completed Fix #6.4 architecture answer quality:
+    - Added deterministic architecture flow templates for Kubernetes ingress request flow, CI/CD pipeline flow, and Terraform plan/apply/state/drift workflow
+    - Each known architecture answer now includes components/roles, request flow, data flow, failure points, and operational checks instead of generic retrieved-text summaries
+    - Added deterministic Mermaid diagrams for the same known flows so known DevOps diagrams do not fall back to generic `Application Service` / `Data Store` placeholders
+    - Expanded architecture routing for `pipeline flow`, `terraform flow`, `ingress flow`, and `plan apply` phrasing
+    - Added regression coverage for architecture text quality, domain-specific diagram nodes, and generic-fallback avoidance
+    - Rebuilt AVA and verified container live spot checks:
+      - `Explain Kubernetes ingress request flow`
+      - `Draw Kubernetes ingress request flow diagram`
+      - `Explain CI/CD pipeline flow`
+      - `Draw Terraform plan apply state drift flow diagram`
   - Completed first Fix #6 RAG/knowledge-quality hardening for core DevOps definitions:
     - Added deterministic seeded definition blocks for core DevOps terms in `web_agent_v2.1_guardrail.py`
     - Current seeded terms: Kubernetes, Docker, Terraform, Helm, Linux, Pod, Deployment, Kubernetes Service, ConfigMap, Ingress, readiness probe, liveness probe, OOMKilled, CrashLoopBackOff, namespace, PVC, Dockerfile, kubeconfig
