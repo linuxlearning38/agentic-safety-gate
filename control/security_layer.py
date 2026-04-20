@@ -3,7 +3,10 @@
 # Integrates with Phase 1 Control System
 
 from datetime import datetime
+import hashlib
+import hmac
 import json
+import os
 from pathlib import Path
 
 from control.runtime_paths import get_runtime_path
@@ -188,6 +191,101 @@ def detect_threat_patterns(cmd):
 def _security_log():
     return get_runtime_path("SECURITY_AUDIT_PATH", "security_audit.json")
 
+
+def _integrity_key() -> str:
+    return os.getenv("AUDIT_INTEGRITY_KEY", os.getenv("JWT_SECRET_KEY", "")).strip()
+
+
+def _canonical_audit_payload(entry: dict) -> str:
+    payload = dict(entry)
+    payload.pop("entry_hash", None)
+    payload.pop("integrity", None)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _digest_entry(entry: dict) -> str:
+    payload = _canonical_audit_payload(entry).encode("utf-8")
+    key = _integrity_key()
+    if key:
+        return hmac.new(key.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _entry_hash(entry: dict) -> str:
+    if isinstance(entry, dict):
+        if entry.get("entry_hash"):
+            return str(entry["entry_hash"])
+        integrity = entry.get("integrity")
+        if isinstance(integrity, dict) and integrity.get("entry_hash"):
+            return str(integrity["entry_hash"])
+        return _digest_entry(entry)
+    return ""
+
+
+def _seal_entry(entry: dict, previous_entry: dict | None) -> dict:
+    previous_hash = _entry_hash(previous_entry) if previous_entry else ""
+    sealed = dict(entry)
+    sealed["prev_hash"] = previous_hash
+    sealed["integrity"] = {
+        "algorithm": "hmac-sha256" if _integrity_key() else "sha256",
+        "key_source": "AUDIT_INTEGRITY_KEY" if os.getenv("AUDIT_INTEGRITY_KEY", "").strip() else ("JWT_SECRET_KEY" if os.getenv("JWT_SECRET_KEY", "").strip() else "none"),
+        "schema_version": 1,
+    }
+    sealed["entry_hash"] = _digest_entry(sealed)
+    return sealed
+
+
+def verify_audit_log_integrity(entries: list[dict] | None = None) -> dict:
+    """
+    Verify the audit hash chain. Legacy entries without entry_hash are allowed
+    but counted as unsealed so the UI can report the remaining evidence gap.
+    """
+    if entries is None:
+        try:
+            with open(_security_log(), "r") as f:
+                entries = json.load(f)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "verified_entries": 0,
+                "unsealed_entries": 0,
+                "error": f"audit log unavailable: {exc}",
+            }
+
+    if not isinstance(entries, list):
+        return {"ok": False, "verified_entries": 0, "unsealed_entries": 0, "error": "audit log is not a list"}
+
+    previous_hash = ""
+    verified = 0
+    unsealed = 0
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            return {"ok": False, "verified_entries": verified, "unsealed_entries": unsealed, "error": f"entry {index} is not an object"}
+
+        if not entry.get("entry_hash"):
+            unsealed += 1
+            previous_hash = _digest_entry(entry)
+            continue
+
+        if entry.get("prev_hash", "") != previous_hash:
+            return {"ok": False, "verified_entries": verified, "unsealed_entries": unsealed, "error": f"entry {index} previous hash mismatch"}
+
+        expected_hash = _digest_entry(entry)
+        if not hmac.compare_digest(str(entry.get("entry_hash", "")), expected_hash):
+            return {"ok": False, "verified_entries": verified, "unsealed_entries": unsealed, "error": f"entry {index} hash mismatch"}
+
+        verified += 1
+        previous_hash = str(entry["entry_hash"])
+
+    return {
+        "ok": True,
+        "verified_entries": verified,
+        "unsealed_entries": unsealed,
+        "algorithm": "hmac-sha256" if _integrity_key() else "sha256",
+        "keyed": bool(_integrity_key()),
+    }
+
+
 def security_audit_log(event_type, cmd, query, risk_analysis, threats, decision):
     """
     Log security events for audit and analysis
@@ -195,10 +293,13 @@ def security_audit_log(event_type, cmd, query, risk_analysis, threats, decision)
     entry = {
         "timestamp": datetime.now().isoformat(),
         "event_type": event_type,  # "suggested", "blocked", "approved", "executed"
+        "cmd": cmd,
         "command": cmd,
         "query": query,
         "risk_level": risk_analysis["risk"],
+        "risk_analysis": risk_analysis,
         "blast_radius": risk_analysis["blast_radius"],
+        "threats": threats,
         "threats_detected": threats,
         "decision": decision,
         "user": "manoj"  # Could be dynamic
@@ -216,7 +317,8 @@ def security_audit_log(event_type, cmd, query, risk_analysis, threats, decision)
         logs = []
     
     # Append and save
-    logs.append(entry)
+    previous_entry = logs[-1] if logs else None
+    logs.append(_seal_entry(entry, previous_entry))
     
     security_log = _security_log()
     security_log.parent.mkdir(parents=True, exist_ok=True)

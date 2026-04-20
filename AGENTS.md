@@ -152,7 +152,40 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-20 Asia/Calcutta (pre-pen-test hardening)
   - 2026-04-20 Asia/Calcutta (zero-trust perimeter hardening)
   - 2026-04-20 Asia/Calcutta (read-only root filesystem hardening)
+  - 2026-04-20 Asia/Calcutta (audit integrity hardening)
 - Latest changes made:
+  - Completed audit log integrity hardening:
+    - Added tamper-evident hash chaining for new security audit entries in `control/security_layer.py`
+    - New audit entries now include:
+      - `prev_hash`
+      - `entry_hash`
+      - `integrity.algorithm`
+      - `integrity.key_source`
+      - `integrity.schema_version`
+    - Integrity sealing uses `AUDIT_INTEGRITY_KEY` when set, falls back to `JWT_SECRET_KEY` when present, and never hardcodes an integrity secret
+    - Added `verify_audit_log_integrity()` for API/CLI verification
+    - Kept compatibility fields (`cmd`, `command`, `risk_analysis`, `threats`) so existing UI/CLI readers can still consume audit entries
+    - Updated `control/security_review.py`:
+      - uses runtime audit path instead of hardcoded `/mnt/i/ai-lab/security_audit.json`
+      - includes integrity status in stats/dashboard
+      - adds `verify-integrity` command
+    - Updated `/security/stats` to include `audit_integrity`
+    - Updated `/security/posture` to report audit integrity as a live control
+    - Added `tests/audit_integrity_regression.py` to verify:
+      - hash presence
+      - previous-hash chaining
+      - HMAC mode with configured key
+      - fresh-chain verification
+      - tamper detection
+    - Verification:
+      - `py_compile`: PASS
+      - `tests/audit_integrity_regression.py`: PASS
+      - `tests/security_hardening_regression.py`: PASS
+      - live `/health`: PASS
+      - `tests/ava_e2e_live_test.py`: 8/8 PASS
+      - live `python -m control.security_review verify-integrity`: PASS (`ok: true`, keyed HMAC, legacy entries counted as unsealed)
+    - Remaining limitation:
+      - Audit storage is tamper-evident, not append-only. A full filesystem compromise can still delete the audit file. Append-only remote storage or database-backed immutable audit is still a future hardening item.
   - Completed read-only root filesystem compatibility hardening:
     - Enabled `read_only: true` for the AVA container in `docker-compose.yml`
     - Kept explicit writable boundaries:
