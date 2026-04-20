@@ -151,8 +151,31 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-20 Asia/Calcutta (Fix #7.2 live verification hardening)
   - 2026-04-20 Asia/Calcutta (pre-pen-test hardening)
   - 2026-04-20 Asia/Calcutta (zero-trust perimeter hardening)
+  - 2026-04-20 Asia/Calcutta (read-only root filesystem hardening)
 - Latest changes made:
-  - In progress: zero-trust perimeter hardening for the remaining pre-professional-pen-test gaps:
+  - Completed read-only root filesystem compatibility hardening:
+    - Enabled `read_only: true` for the AVA container in `docker-compose.yml`
+    - Kept explicit writable boundaries:
+      - `/data` for SQLite, history, memory, approval queue, execution log, security audit log, whitelist, and reports
+      - `/tmp` tmpfs for Gunicorn logs, Lynis report/log files, Trivy cache, Python cache prefix, and temporary files
+    - Added `PYTHONDONTWRITEBYTECODE=1` and `PYTHONPYCACHEPREFIX=/tmp/pycache` so Python does not try to write bytecode under `/app`
+    - Moved incident reports away from `/mnt/i/ai-lab/reports` defaults to `AVA_REPORTS_DIR`, with compose using `/data/ava_reports`
+    - Moved Lynis report/log paths to env-configurable `/tmp` paths instead of `/var/log`
+    - Added posture reporting for the read-only root control in `/security/posture`
+    - Updated `tests/security_hardening_regression.py` to lock:
+      - `read_only: true`
+      - mutable runtime artifact paths under `/data` or `/tmp`
+      - posture reporting for read-only root
+    - Verification after enabling read-only root:
+      - `py_compile`: PASS
+      - `tests/security_hardening_regression.py`: PASS
+      - `docker compose config --quiet`: PASS
+      - live `/health`: PASS
+      - Docker inspect: `ReadonlyRootfs=true`, `RestartCount=0`, `Health=healthy`
+      - live write boundary probe: `/app` write blocked, `/data` write allowed, `/tmp` write allowed
+      - live `/security/posture`: read-only root control reports PASS
+      - `tests/ava_e2e_live_test.py`: 8/8 PASS
+  - Completed zero-trust perimeter hardening for the remaining pre-professional-pen-test gaps:
     - AVA should not be described as "perfect zero trust"; the target is measurable zero-trust controls with reduced blast radius and regression coverage
     - Added Redis-backed Flask-Limiter storage via `RATELIMIT_STORAGE_URI` / `AVA_RATE_LIMIT_STORAGE_URI`, defaulting to `redis://redis:6379/0` using the Compose service DNS name
     - Added `redis==5.2.1` to runtime dependencies so Flask-Limiter can use Redis storage

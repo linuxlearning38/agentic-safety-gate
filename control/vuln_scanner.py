@@ -15,6 +15,7 @@ import json
 import shutil
 import logging
 import re
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -25,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]
 TOP_FINDINGS_LIMIT = 10   # max CVEs to include in summary (full list in report file)
-LYNIS_REPORT_PATH = Path("/tmp/lynis-report.dat")
-LYNIS_LOG_PATH    = Path("/var/log/lynis.log")
+LYNIS_REPORT_PATH = Path(os.getenv("LYNIS_REPORT_PATH", "/tmp/lynis-report.dat"))
+LYNIS_LOG_PATH    = Path(os.getenv("LYNIS_LOG_PATH", "/tmp/lynis.log"))
 SCAN_TIMEOUT      = 300   # 5 min max for any scan
 
 # ─── Tool Availability Check ─────────────────────────────────────────────────
@@ -202,10 +203,14 @@ def scan_lynis(use_sudo: bool = True) -> dict:
     cmd = []
     if use_sudo:
         cmd = ["sudo", "lynis", "audit", "system",
-               "--quick", "--quiet", "--no-colors", "--cronjob", "--report-file", "/tmp/lynis-report.dat"]
+               "--quick", "--quiet", "--no-colors", "--cronjob",
+               "--report-file", str(LYNIS_REPORT_PATH),
+               "--log-file", str(LYNIS_LOG_PATH)]
     else:
         cmd = ["lynis", "audit", "system",
-               "--quick", "--quiet", "--no-colors"]
+               "--quick", "--quiet", "--no-colors",
+               "--report-file", str(LYNIS_REPORT_PATH),
+               "--log-file", str(LYNIS_LOG_PATH)]
 
     logger.info(f"[Lynis] Starting system audit (sudo={use_sudo})")
     started_at = datetime.now(timezone.utc).isoformat()
