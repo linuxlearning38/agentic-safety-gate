@@ -308,7 +308,7 @@ def main():
     troubleshooting_queries = [
         ("What causes OOMKilled in Kubernetes?", "oomkilled", "memory limit"),
         ("My nginx pod is CrashLoopBackOff", "crashloopbackoff", "CrashLoopBackOff"),
-        ("My service is down", "service_down", "service being down usually means"),
+        ("My service is down", "service_down", "traffic is usually not reaching"),
     ]
     for query, topic, expected in troubleshooting_queries:
         route = ns["_route_query"](query)

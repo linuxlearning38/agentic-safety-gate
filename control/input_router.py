@@ -56,6 +56,8 @@ TROUBLESHOOTING_TOPIC_PATTERNS = {
     "imagepullbackoff": ["imagepullbackoff", "image pull backoff", "image pull error"],
     "pending": [" pending", "containercreating", "container creating"],
     "pod_network": ["pod network", "pod networking", "network policy", "cni"],
+    "dns_failure": ["dns failure", "dns issue", "dns problem", "dns resolution", "coredns", "service discovery"],
+    "tls_certificate": ["tls certificate", "tls cert", "certificate issue", "certificate error", "ssl certificate", "cert expiry", "certificate expiry"],
     "service_down": ["service is down", "service down", "unreachable", "can't connect", "cannot connect", "timeout"],
     "generic": ["error", "failed", "failing", "not working", "broken", "troubleshoot", "debug", "fix", "issue", "problem"],
 }

@@ -170,6 +170,17 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
       - `My nginx pod is CrashLoopBackOff` stays high-confidence troubleshooting
       - `Explain Netflix architecture with Zuul, Kafka, Cassandra, EVCache` stays high-confidence architecture
       - `What is machine learning?` still routes to direct general Qwen
+  - Completed Fix #6.3 deeper DevOps remediation answers:
+    - Upgraded controlled troubleshooting answers for OOMKilled, CrashLoopBackOff, pod network failures, service down, Kubernetes DNS failures, and TLS certificate issues into staged operator runbooks
+    - Each high-value remediation answer now follows: confirm symptom, inspect evidence, identify likely cause, suggest low-risk fix, warn about unsafe shortcuts
+    - Added first-class troubleshooting topics for `dns_failure` and `tls_certificate` in `control/input_router.py`
+    - Preserved advisory-only behavior; remediation text does not execute actions and does not emit destructive commands
+    - Added regression coverage for staged OOMKilled/CrashLoopBackOff/DNS/TLS remediation and unsafe-shortcut prevention
+    - Rebuilt AVA and verified live spot checks:
+      - `How do I safely fix CrashLoopBackOff?`
+      - `What causes OOMKilled in Kubernetes?`
+      - `How do I investigate Kubernetes DNS failure?`
+      - `How do I fix TLS certificate issues?`
   - Completed first Fix #6 RAG/knowledge-quality hardening for core DevOps definitions:
     - Added deterministic seeded definition blocks for core DevOps terms in `web_agent_v2.1_guardrail.py`
     - Current seeded terms: Kubernetes, Docker, Terraform, Helm, Linux, Pod, Deployment, Kubernetes Service, ConfigMap, Ingress, readiness probe, liveness probe, OOMKilled, CrashLoopBackOff, namespace, PVC, Dockerfile, kubeconfig
