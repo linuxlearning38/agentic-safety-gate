@@ -192,6 +192,12 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
       - `Draw Kubernetes ingress request flow diagram`
       - `Explain CI/CD pipeline flow`
       - `Draw Terraform plan apply state drift flow diagram`
+  - Completed Fix #6.5 deep DevOps incident knowledge pack:
+    - Added first-class controlled troubleshooting topics for Redis incidents, PostgreSQL incidents, Terraform state drift, service mesh/Istio traffic failures, and CI/CD pipeline failures
+    - Added deterministic staged operator runbooks for each topic using the same contract: confirm symptom, inspect evidence, likely cause, low-risk fix, unsafe shortcuts to avoid
+    - Preserved advisory-only behavior; these answers do not execute commands, bypass approvals, or let Qwen improvise remediation actions
+    - Expanded grounding common terms so known incident domains do not incorrectly fall into weak-evidence fallback while invented/unsupported terms still do
+    - Added regression coverage for routing, staged answer quality, and unsafe-shortcut warnings for all five incident domains
   - Completed Fix #7.1 host telemetry read-only bridge:
     - Added `control/host_telemetry.py` to read OS, memory, process, and listening-port facts from a configured read-only proc mount
     - Added low-risk `check_host_telemetry` tool in `control/tool_registry.py`
