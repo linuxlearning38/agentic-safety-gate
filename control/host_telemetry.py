@@ -6,6 +6,7 @@ from typing import Any, Dict, List
 
 HOST_PROC = Path(os.getenv("AVA_HOST_PROC", "/host/proc"))
 CONTAINER_PROC = Path("/proc")
+HOST_ROOT = Path(os.getenv("AVA_HOST_ROOT", "/host/proc/1/root"))
 
 
 def _read_text(path: Path, limit: int = 65536) -> str:
@@ -188,6 +189,93 @@ def collect_host_telemetry() -> Dict[str, Any]:
         "auth_logs": _auth_summary(),
         "package_state": _package_summary(),
     }
+
+
+def detect_host_systemd() -> Dict[str, Any]:
+    proc_root, runtime_scope = _proc_root()
+    if runtime_scope != "host_observed":
+        return {
+            "available": False,
+            "runtime_scope": "container_observed",
+            "environment_note": "host_proc_unavailable",
+            "detail": "AVA does not have the read-only host proc mount needed to inspect host service-manager facts.",
+        }
+
+    try:
+        pid1_comm = _read_text(proc_root / "1" / "comm", limit=256).strip()
+    except Exception:
+        pid1_comm = ""
+
+    has_systemd_tree = any(
+        path.exists()
+        for path in (
+            HOST_ROOT / "run/systemd/system",
+            HOST_ROOT / "etc/systemd/system",
+            HOST_ROOT / "usr/lib/systemd/system",
+            HOST_ROOT / "lib/systemd/system",
+        )
+    )
+    if pid1_comm == "systemd" or has_systemd_tree:
+        return {
+            "available": True,
+            "runtime_scope": "host_observed",
+            "environment_note": "host_systemd_detected",
+            "pid1": pid1_comm or "unknown",
+            "host_root": str(HOST_ROOT),
+            "detail": "Host systemd evidence is visible through the read-only host proc bridge.",
+        }
+
+    return {
+        "available": False,
+        "runtime_scope": "host_observed_limited",
+        "environment_note": "host_systemd_unavailable",
+        "pid1": pid1_comm or "unknown",
+        "host_root": str(HOST_ROOT),
+        "detail": "Host proc is visible, but PID 1/systemd evidence is not available through the read-only bridge.",
+    }
+
+
+def inspect_host_service_unit(service: str) -> Dict[str, Any]:
+    systemd = detect_host_systemd()
+    service = (service or "").strip()
+    unit_name = service if service.endswith(".service") else f"{service}.service"
+    result: Dict[str, Any] = {
+        "available": systemd.get("available") is True,
+        "runtime_scope": systemd.get("runtime_scope", "container_observed"),
+        "environment_note": systemd.get("environment_note", "host_systemd_unknown"),
+        "service": service,
+        "unit": unit_name,
+        "host_root": str(HOST_ROOT),
+        "unit_found": False,
+        "unit_paths": [],
+        "unit_preview": "",
+        "detail": systemd.get("detail", ""),
+    }
+    if not result["available"]:
+        return result
+
+    candidates = [
+        HOST_ROOT / "etc/systemd/system" / unit_name,
+        HOST_ROOT / "run/systemd/system" / unit_name,
+        HOST_ROOT / "usr/lib/systemd/system" / unit_name,
+        HOST_ROOT / "lib/systemd/system" / unit_name,
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        result["unit_found"] = True
+        result["unit_paths"].append(str(path))
+        try:
+            preview_lines = [
+                line
+                for line in _read_text(path, limit=8192).splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ][:20]
+            result["unit_preview"] = "\n".join(preview_lines)
+        except Exception as exc:
+            result["unit_preview"] = f"Unit file exists but could not be read: {exc}"
+        break
+    return result
 
 
 def format_host_telemetry(snapshot: Dict[str, Any]) -> str:
