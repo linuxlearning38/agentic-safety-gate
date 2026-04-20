@@ -70,6 +70,14 @@ def scan_trivy(image: str, severity_filter: Optional[str] = None) -> dict:
         "--quiet",
         "--timeout", "5m",
     ]
+    if is_fs:
+        cmd += [
+            "--skip-dirs", "/proc",
+            "--skip-dirs", "/sys",
+            "--skip-dirs", "/dev",
+            "--skip-dirs", "/run",
+            "--skip-dirs", "/host/proc",
+        ]
     if severity_filter:
         cmd += ["--severity", severity_filter.upper()]
     cmd.append(image)
@@ -100,7 +108,10 @@ def scan_trivy(image: str, severity_filter: Optional[str] = None) -> dict:
     try:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        return _error_result("parse_failed", f"Could not parse Trivy JSON output: {proc.stdout[:200]}")
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        detail = stdout[:200] or stderr[:300] or "empty Trivy output"
+        return _error_result("parse_failed", f"Could not parse Trivy JSON output: {detail}")
 
     return _parse_trivy_json(data, image, scan_type, started_at)
 

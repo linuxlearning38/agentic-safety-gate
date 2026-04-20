@@ -14,8 +14,15 @@ def _read_text(path: Path, limit: int = 65536) -> str:
         return handle.read(limit).decode("utf-8", errors="replace")
 
 
+def _path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def _proc_root() -> tuple[Path, str]:
-    if (HOST_PROC / "1" / "status").exists() and (HOST_PROC / "net").exists():
+    if _path_exists(HOST_PROC / "1" / "status") and _path_exists(HOST_PROC / "net"):
         return HOST_PROC, "host_observed"
     return CONTAINER_PROC, "container_observed"
 
@@ -72,7 +79,7 @@ def _os_summary(proc_root: Path) -> Dict[str, Any]:
 
 
 def _process_summary(proc_root: Path, limit: int = 8) -> Dict[str, Any]:
-    if not proc_root.exists():
+    if not _path_exists(proc_root):
         return {"available": False, "error": f"proc root not found: {proc_root}", "processes": []}
     processes = []
     for pid_path in sorted(proc_root.iterdir(), key=lambda path: int(path.name) if path.name.isdigit() else 10**12):
@@ -108,7 +115,7 @@ def _decode_ip_port(value: str) -> str:
 
 def _socket_inode_pids(proc_root: Path) -> Dict[str, List[int]]:
     mapping: Dict[str, List[int]] = {}
-    if not proc_root.exists():
+    if not _path_exists(proc_root):
         return mapping
     for pid_path in proc_root.iterdir():
         if not pid_path.name.isdigit():
@@ -129,13 +136,13 @@ def _socket_inode_pids(proc_root: Path) -> Dict[str, List[int]]:
 
 
 def _listening_ports(proc_root: Path, limit: int = 12) -> Dict[str, Any]:
-    if not proc_root.exists():
+    if not _path_exists(proc_root):
         return {"available": False, "error": f"proc root not found: {proc_root}", "listeners": []}
     inode_pids = _socket_inode_pids(proc_root)
     listeners = []
     for relative in ("net/tcp", "net/tcp6"):
         path = _proc_file(proc_root, relative)
-        if not path.exists():
+        if not _path_exists(path):
             continue
         try:
             rows = _read_text(path).splitlines()[1:]
@@ -207,7 +214,7 @@ def detect_host_systemd() -> Dict[str, Any]:
         pid1_comm = ""
 
     has_systemd_tree = any(
-        path.exists()
+        _path_exists(path)
         for path in (
             HOST_ROOT / "run/systemd/system",
             HOST_ROOT / "etc/systemd/system",
@@ -261,7 +268,7 @@ def inspect_host_service_unit(service: str) -> Dict[str, Any]:
         HOST_ROOT / "lib/systemd/system" / unit_name,
     ]
     for path in candidates:
-        if not path.exists():
+        if not _path_exists(path):
             continue
         result["unit_found"] = True
         result["unit_paths"].append(str(path))

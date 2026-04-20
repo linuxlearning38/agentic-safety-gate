@@ -734,6 +734,15 @@ def test_fix67_architecture_answer_consistency(ns):
 def test_fix72_host_service_inspection_truth_surface(tool_registry):
     import control.host_telemetry as host_telemetry
 
+    class DeniedPath:
+        def exists(self):
+            raise PermissionError("permission denied")
+
+    check(
+        "fix72: permission-denied host paths are treated as unavailable",
+        host_telemetry._path_exists(DeniedPath()) is False,
+    )
+
     original_host_proc = host_telemetry.HOST_PROC
     original_host_root = host_telemetry.HOST_ROOT
     original_which = tool_registry.shutil.which
