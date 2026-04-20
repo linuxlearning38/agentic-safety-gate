@@ -406,16 +406,18 @@ def build_troubleshooting_plan(route, evidence) -> AnswerPlan:
             "**Unsafe shortcuts to avoid:** Do not delete/recreate pods as the fix; it hides evidence. Do not disable probes permanently or restart workloads repeatedly without reading previous logs."
         ),
         "imagepullbackoff": (
-            "**Root Cause:** `ImagePullBackOff` means Kubernetes could not pull the container image and is backing off before retrying.\n"
-            "**Fix:** Verify the image name and tag, confirm the registry is reachable, and ensure the pod has valid image pull credentials if the registry is private.\n"
-            "**Why this works:** The pod cannot start until the image is fetched successfully, so fixing the image reference or authentication removes the startup blocker.\n"
-            "**Watch out for:** A mutable tag can hide the real issue. Confirm the exact image digest or expected tag during rollback and redeploy."
+            "**Confirm symptom:** Identify whether the failure is `ImagePullBackOff` or `ErrImagePull`, note the exact image reference, registry host, and whether this affects one pod or many.\n"
+            "**Inspect evidence:** Check pod events for the exact pull error (wrong tag, auth failure, registry unreachable), confirm the image name/tag exists in the registry, and review imagePullSecrets on the pod and service account.\n"
+            "**Likely cause:** `ImagePullBackOff` usually comes from a misspelled image tag, missing or expired registry credential, a private registry with no imagePullSecret, or the registry itself being unreachable from the cluster.\n"
+            "**Low-risk fix:** Correct the image reference or tag, update or re-create the imagePullSecret with valid credentials and link it to the service account, verify registry reachability from a node, then trigger a new rollout.\n"
+            "**Unsafe shortcuts to avoid:** Do not set `imagePullPolicy: Never` to skip the pull without verifying the image exists locally on every node; it will silently fail on new nodes or after node replacements."
         ),
         "pending": (
-            "**Root Cause:** A pod in `Pending` has not been scheduled or cannot start because the cluster is still missing resources, volumes, or other required dependencies.\n"
-            "**Fix:** Check scheduler events, resource requests, node availability, PVC binding, taints, tolerations, and admission policy failures.\n"
-            "**Why this works:** `Pending` is usually a placement or dependency problem, so the durable fix comes from the scheduler events and missing prerequisite.\n"
-            "**Watch out for:** Low cluster capacity can make `Pending` look intermittent. Check quotas and autoscaler behavior before changing only the pod spec."
+            "**Confirm symptom:** Confirm the pod has been in `Pending` for more than a few seconds and note the output of `kubectl describe pod` events — particularly scheduler and binding messages.\n"
+            "**Inspect evidence:** Check resource requests vs. node allocatable capacity, PVC binding status, node taints/tolerations, affinity/anti-affinity rules, admission webhook rejections, and any namespace resource quotas.\n"
+            "**Likely cause:** `Pending` pods are most often caused by insufficient CPU/memory on available nodes, an unbound PVC, a taint with no matching toleration, failed admission, or cluster autoscaler lag on scale-up.\n"
+            "**Low-risk fix:** Free up node capacity or adjust resource requests, fix the PVC StorageClass/binding, add the required toleration, resolve the admission webhook rejection, or wait for autoscaler to provision a node before retrying.\n"
+            "**Unsafe shortcuts to avoid:** Do not remove resource requests or set very low values to force scheduling; that can cause OOMKilled or CPU throttling on the same or other pods sharing the node."
         ),
         "pod_network": (
             "**Confirm symptom:** Identify whether the failure is Pod-to-Pod, Pod-to-Service, Service-to-Pod, DNS lookup, ingress, or egress traffic.\n"

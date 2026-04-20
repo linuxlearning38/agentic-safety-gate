@@ -634,6 +634,102 @@ def test_fix66_no_destructive_suggestions_in_runbooks(ns):
     )
 
 
+def test_fix67_troubleshooting_answer_consistency(ns):
+    FIVE_STAGE_MARKERS = [
+        "**Confirm symptom:**",
+        "**Inspect evidence:**",
+        "**Likely cause:**",
+        "**Low-risk fix:**",
+        "**Unsafe shortcuts to avoid:**",
+    ]
+    topics = [
+        ("oomkilled", "my pod is OOMKilled"),
+        ("crashloopbackoff", "pod is crashloopbackoff"),
+        ("imagepullbackoff", "pod imagepullbackoff failing"),
+        ("pending", "pod is pending"),
+        ("pod_network", "pod network failure"),
+        ("dns_failure", "dns failure in kubernetes cluster"),
+        ("tls_certificate", "tls certificate error on ingress"),
+        ("redis_incident", "how do I troubleshoot Redis latency issues"),
+        ("postgres_incident", "troubleshoot Postgres replication issues"),
+        ("terraform_drift", "terraform drift remediation steps"),
+        ("service_mesh_traffic", "istio traffic troubleshooting"),
+        ("cicd_failure", "cicd pipeline failure troubleshooting"),
+        ("service_down", "service is down"),
+    ]
+    for topic, query in topics:
+        result = ns["_resolve_troubleshooting_response"](query)
+        assert result is not None, f"fix67: {topic} returned None"
+        response = result["response"]
+        for marker in FIVE_STAGE_MARKERS:
+            check(
+                f"fix67: {topic} answer has '{marker}'",
+                marker in response,
+            )
+
+
+def test_fix67_definition_answer_consistency(ns):
+    definition_queries = [
+        "what is kubernetes",
+        "what is docker",
+        "what is helm",
+        "what is terraform",
+        "what is a pod",
+        "what is a deployment",
+        "what is a configmap",
+        "what is ingress",
+        "what is a namespace",
+        "what is a pvc",
+    ]
+    TROUBLESHOOTING_MARKERS = [
+        "**Confirm symptom:**",
+        "**Inspect evidence:**",
+        "**Likely cause:**",
+        "**Low-risk fix:**",
+        "**Unsafe shortcuts to avoid:**",
+    ]
+    for query in definition_queries:
+        result = ns["_resolve_definition_response"](query)
+        assert result is not None, f"fix67: definition '{query}' returned None"
+        response = result["response"]
+        check(
+            f"fix67: definition '{query}' does not contain troubleshooting markers",
+            not any(m in response for m in TROUBLESHOOTING_MARKERS),
+        )
+        check(
+            f"fix67: definition '{query}' response is non-empty",
+            len(response.strip()) > 20,
+        )
+
+
+def test_fix67_architecture_answer_consistency(ns):
+    FLOW_MARKERS = ["**Request Flow:**", "**Data Flow:**"]
+    TROUBLESHOOTING_MARKERS = [
+        "**Confirm symptom:**",
+        "**Inspect evidence:**",
+        "**Likely cause:**",
+        "**Low-risk fix:**",
+        "**Unsafe shortcuts to avoid:**",
+    ]
+    arch_queries = [
+        "explain kubernetes ingress architecture",
+        "explain cicd pipeline architecture",
+        "explain terraform workflow architecture",
+    ]
+    for query in arch_queries:
+        result = ns["_resolve_architecture_response"](query)
+        assert result is not None, f"fix67: architecture '{query}' returned None"
+        response = result["response"]
+        check(
+            f"fix67: architecture '{query}' contains a flow marker",
+            any(m in response for m in FLOW_MARKERS),
+        )
+        check(
+            f"fix67: architecture '{query}' does not contain troubleshooting markers",
+            not any(m in response for m in TROUBLESHOOTING_MARKERS),
+        )
+
+
 def main():
     sys.path.insert(0, str(SOURCE.parent))
     ns = load_helpers()
@@ -1464,6 +1560,11 @@ def main():
     test_fix66_unsupported_deep_topic_falls_back_honestly(ns)
     test_fix66_deep_topic_source_ranking_preserved(ns)
     test_fix66_no_destructive_suggestions_in_runbooks(ns)
+
+    # ── Fix #6.7: Knowledge answer consistency ────────────────────────────────
+    test_fix67_troubleshooting_answer_consistency(ns)
+    test_fix67_definition_answer_consistency(ns)
+    test_fix67_architecture_answer_consistency(ns)
 
     print("\nIntelligence regression tests passed.")
 
