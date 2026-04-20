@@ -4196,6 +4196,11 @@ def security_posture_route():
                 "detail": "New audit entries are hash-chained; set AUDIT_INTEGRITY_KEY for dedicated HMAC sealing.",
             },
             {
+                "name": "Action decisions pass through OPA",
+                "status": "pass" if os.getenv("AVA_OPA_ACTION_POLICY_ENABLED", "true").lower() == "true" else "warn",
+                "detail": os.getenv("OPA_ACTION_POLICY_URL", "http://opa:8181/v1/data/ava/authz/decision"),
+            },
+            {
                 "name": "Autonomous monitor is opt-in",
                 "status": "pass" if not monitor_enabled else "warn",
                 "detail": "disabled" if not monitor_enabled else "enabled",
@@ -4228,7 +4233,6 @@ def security_posture_route():
             "remaining_gaps": [
                 "No mTLS or signed command protocol for future remote agents yet.",
                 "Audit storage is tamper-evident, not append-only; filesystem compromise can still delete the log.",
-                "OPA is present, but not every action is policy-decided through OPA yet.",
             ],
             "recommended_next_ui_actions": [
                 "verify my system",

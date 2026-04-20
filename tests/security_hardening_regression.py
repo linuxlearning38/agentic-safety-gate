@@ -138,6 +138,14 @@ def main() -> int:
             and "'audit_integrity': verify_audit_log_integrity(audit_log)" in app,
         ),
         check(
+            "action execution is backed by OPA policy",
+            "AVA_OPA_ACTION_POLICY_ENABLED: \"true\"" in compose
+            and "OPA_ACTION_POLICY_URL: http://opa:8181/v1/data/ava/authz/decision" in compose
+            and "ava_actions.rego" in "\n".join(path.name for path in (ROOT / "policies").glob("*.rego"))
+            and "_opa_action_decision" in _read(ROOT / "control" / "secure_executor.py")
+            and '"Action decisions pass through OPA"' in app,
+        ),
+        check(
             "autonomous monitor/healer is opt-in for zero-trust mode",
             'AVA_MONITOR_ENABLED", "false"' in app
             and 'AVA_MONITOR_ENABLED: "false"' in compose,
