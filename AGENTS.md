@@ -156,7 +156,49 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-20 Asia/Calcutta (OPA-backed action policy)
   - 2026-04-21 Asia/Calcutta (signed command envelope foundation)
   - 2026-04-21 Asia/Calcutta (signed command replay prevention foundation)
+  - 2026-04-21 Asia/Calcutta (agent identity foundation)
 - Latest changes made:
+  - Completed agent identity foundation for future remote agents:
+    - Added `control/agent_identity.py`
+    - Added `AgentIdentityRegistry`
+    - Agents get generated per-agent tokens; only SHA-256 token hashes are stored
+    - Agent records include:
+      - `agent_id`
+      - `name`
+      - `scopes`
+      - `token_hash`
+      - `cert_fingerprint`
+      - `metadata`
+      - `issued_at`
+      - `revoked`
+    - Validation enforces:
+      - known agent ID
+      - non-revoked state
+      - token hash match
+      - required scope
+      - optional certificate fingerprint binding
+    - Compose configures:
+      - `AVA_AGENT_IDENTITY_REGISTRY_PATH=/data/agent_identities.json`
+      - `AVA_AGENT_MTLS_REQUIRED=false`
+    - `/security/posture` now reports:
+      - `Agent identity registry is configured`
+      - `Remote-agent mTLS enforcement is active`
+      - `agent_identity_registry_configured`
+      - `agent_mtls_required`
+    - Added `tests/agent_identity_regression.py`
+    - Updated `tests/security_hardening_regression.py` to lock the identity registry and mTLS-foundation posture
+    - Verification:
+      - `py_compile`: PASS
+      - `tests/agent_identity_regression.py`: PASS
+      - `tests/security_hardening_regression.py`: PASS
+      - `docker compose config --quiet`: PASS
+      - live `/health`: PASS
+      - `tests/ava_e2e_live_test.py`: 8/8 PASS
+      - Docker inspect: `RestartCount=0`, `Health=healthy`, `ReadonlyRootfs=true`
+      - live `/security/posture`: agent identity registry reports PASS at `/data/agent_identities.json`
+      - live `/security/posture`: remote-agent mTLS enforcement reports WARN because no remote-agent transport is active
+    - Remaining limitation:
+      - This is an identity foundation only. There is still no remote-agent API, no live mTLS handshake enforcement, and no fleet-agent execution transport.
   - Completed signed command replay prevention foundation:
     - Added `CommandReplayCache` to `control/signed_commands.py`
     - Added `consume_signed_command(...)` so future remote agents can verify and consume a signed command before execution
