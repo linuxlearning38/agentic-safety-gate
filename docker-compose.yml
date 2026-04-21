@@ -115,6 +115,7 @@ services:
       DOCKER_HOST:         http://docker-socket-proxy:2375
       AVA_OPA_ACTION_POLICY_ENABLED: "true"
       OPA_ACTION_POLICY_URL: http://opa:8181/v1/data/ava/authz/decision
+      AVA_COMMAND_SIGNING_KEY: ${AVA_COMMAND_SIGNING_KEY:-}
 
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -154,7 +154,47 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-20 Asia/Calcutta (read-only root filesystem hardening)
   - 2026-04-20 Asia/Calcutta (audit integrity hardening)
   - 2026-04-20 Asia/Calcutta (OPA-backed action policy)
+  - 2026-04-21 Asia/Calcutta (signed command envelope foundation)
 - Latest changes made:
+  - Completed signed command envelope foundation for future remote agents:
+    - Added `control/signed_commands.py`
+    - Command envelopes are signed with HMAC-SHA256 using `AVA_COMMAND_SIGNING_KEY`
+    - Envelopes include:
+      - `command_id`
+      - `issuer`
+      - `target`
+      - `action`
+      - `payload`
+      - `issued_at`
+      - `expires_at`
+      - `nonce`
+      - `algorithm`
+      - `signature`
+    - Verification fails closed for:
+      - missing signing key
+      - missing required fields
+      - expired command
+      - unsupported algorithm
+      - tampered payload/signature
+    - `hmac.compare_digest` is used for signature comparison
+    - Compose exposes `AVA_COMMAND_SIGNING_KEY: ${AVA_COMMAND_SIGNING_KEY:-}` without any hardcoded fallback
+    - `/security/posture` now reports `Signed command envelope is available`
+    - `/security/posture` also reports `command_signing_configured`
+    - Current default is intentionally `warn` because no signing key is configured in local compose
+    - Added `tests/signed_command_regression.py`
+    - Updated `tests/security_hardening_regression.py` to lock the no-hardcoded-secret behavior
+    - Verification:
+      - `py_compile`: PASS
+      - `tests/signed_command_regression.py`: PASS
+      - `tests/security_hardening_regression.py`: PASS
+      - `docker compose config --quiet`: PASS
+      - live `/health`: PASS
+      - `tests/ava_e2e_live_test.py`: 8/8 PASS
+      - Docker inspect: `RestartCount=0`, `Health=healthy`, `ReadonlyRootfs=true`
+      - live `/security/posture`: signed-command control reports WARN because `AVA_COMMAND_SIGNING_KEY` is not configured
+    - Remaining limitation:
+      - This is the cryptographic envelope foundation only. Remote agent transport, mTLS identity enforcement, and fleet-agent execution enforcement are not implemented yet.
+      - Replay prevention still needs an agent-side nonce/command-id cache when remote agents are introduced.
   - Completed OPA-backed action policy enforcement:
     - Added `policies/ava_actions.rego`
     - Added mandatory OPA action decision calls in `control/secure_executor.py`
