@@ -4159,6 +4159,8 @@ def security_posture_route():
         webhook_secret_configured = bool(os.getenv("WEBHOOK_SECRET", "").strip())
         command_signing_configured = bool(os.getenv("AVA_COMMAND_SIGNING_KEY", "").strip())
         command_replay_cache_configured = bool(os.getenv("AVA_COMMAND_REPLAY_CACHE_PATH", "").strip())
+        agent_identity_registry_configured = bool(os.getenv("AVA_AGENT_IDENTITY_REGISTRY_PATH", "").strip())
+        agent_mtls_required = os.getenv("AVA_AGENT_MTLS_REQUIRED", "false").lower() == "true"
         monitor_enabled = os.getenv("AVA_MONITOR_ENABLED", "false").lower() == "true"
         warmup_enabled = os.getenv("LLM_WARMUP_ENABLED", "false").lower() == "true"
 
@@ -4217,6 +4219,16 @@ def security_posture_route():
                 "detail": os.getenv("AVA_COMMAND_REPLAY_CACHE_PATH", "not configured"),
             },
             {
+                "name": "Agent identity registry is configured",
+                "status": "pass" if agent_identity_registry_configured else "warn",
+                "detail": os.getenv("AVA_AGENT_IDENTITY_REGISTRY_PATH", "not configured"),
+            },
+            {
+                "name": "Remote-agent mTLS enforcement is active",
+                "status": "pass" if agent_mtls_required else "warn",
+                "detail": "enabled" if agent_mtls_required else "foundation only; no remote-agent transport is active",
+            },
+            {
                 "name": "Autonomous monitor is opt-in",
                 "status": "pass" if not monitor_enabled else "warn",
                 "detail": "disabled" if not monitor_enabled else "enabled",
@@ -4237,6 +4249,8 @@ def security_posture_route():
             "webhook_enabled": webhook_secret_configured,
             "command_signing_configured": command_signing_configured,
             "command_replay_cache_configured": command_replay_cache_configured,
+            "agent_identity_registry_configured": agent_identity_registry_configured,
+            "agent_mtls_required": agent_mtls_required,
             "autonomous_monitor_enabled": monitor_enabled,
             "llm_warmup_enabled": warmup_enabled,
             "runtime_paths": {
@@ -4249,7 +4263,7 @@ def security_posture_route():
             },
             "controls": controls,
             "remaining_gaps": [
-                "No remote agent transport or mTLS identity enforcement yet.",
+                "No remote agent transport or active mTLS handshake enforcement yet.",
                 "Signed command envelopes exist, but fleet-agent enforcement is not implemented until remote agents are added.",
                 "Audit storage is tamper-evident, not append-only; filesystem compromise can still delete the log.",
             ],
