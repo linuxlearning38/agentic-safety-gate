@@ -29,6 +29,7 @@ TOP_FINDINGS_LIMIT = 10   # max CVEs to include in summary (full list in report 
 LYNIS_REPORT_PATH = Path(os.getenv("LYNIS_REPORT_PATH", "/tmp/lynis-report.dat"))
 LYNIS_LOG_PATH    = Path(os.getenv("LYNIS_LOG_PATH", "/tmp/lynis.log"))
 SCAN_TIMEOUT      = 300   # 5 min max for any scan
+TRIVY_SCAN_TIMEOUT = int(os.getenv("AVA_TRIVY_SCAN_TIMEOUT_SECONDS", "45"))
 
 # ─── Tool Availability Check ─────────────────────────────────────────────────
 
@@ -69,7 +70,7 @@ def scan_trivy(image: str, severity_filter: Optional[str] = None) -> dict:
         "trivy", scan_type,
         "--format", "json",
         "--quiet",
-        "--timeout", "5m",
+        "--timeout", f"{TRIVY_SCAN_TIMEOUT}s",
     ]
     if is_fs:
         cmd += [
@@ -91,10 +92,10 @@ def scan_trivy(image: str, severity_filter: Optional[str] = None) -> dict:
             cmd,
             capture_output=True,
             text=True,
-            timeout=SCAN_TIMEOUT,
+            timeout=TRIVY_SCAN_TIMEOUT + 5,
         )
     except subprocess.TimeoutExpired:
-        return _error_result("timeout", f"Trivy scan timed out after {SCAN_TIMEOUT}s")
+        return _error_result("timeout", f"Trivy scan timed out after {TRIVY_SCAN_TIMEOUT}s")
     except FileNotFoundError:
         return _error_result("trivy_not_installed", "Trivy binary not found")
     except Exception as e:

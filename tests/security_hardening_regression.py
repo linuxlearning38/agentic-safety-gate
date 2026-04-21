@@ -122,6 +122,7 @@ def main() -> int:
             and "SECURITY_AUDIT_LOG:  /data/security_audit.json" in compose
             and "WHITELIST_PATH:      /data/control_whitelist.json" in compose
             and "AVA_REPORTS_DIR:     /data/ava_reports" in compose
+            and 'AVA_TRIVY_SCAN_TIMEOUT_SECONDS: "45"' in compose
             and "LYNIS_LOG_PATH:      /tmp/lynis.log" in compose
             and "PYTHONDONTWRITEBYTECODE: \"1\"" in compose,
         ),

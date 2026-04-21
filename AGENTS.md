@@ -157,7 +157,42 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-21 Asia/Calcutta (signed command envelope foundation)
   - 2026-04-21 Asia/Calcutta (signed command replay prevention foundation)
   - 2026-04-21 Asia/Calcutta (agent identity foundation)
+  - 2026-04-21 Asia/Calcutta (rigorous test gate and bounded vulnerability scan hardening)
 - Latest changes made:
+  - Completed rigorous current-state verification and bounded vulnerability scan hardening:
+    - Ran a broad regression/live verification gate before adding more product architecture
+    - Initial `tests/ava_live_100_question_test.py` result was 98/100:
+      - `what should I investigate on this host` timed out
+      - `scan my system for vulnerabilities` timed out
+    - Root cause:
+      - both paths call the runtime Trivy filesystem scan
+      - Trivy was allowed to run for 300 seconds while interactive `/ask` clients had shorter request budgets
+      - local Trivy can also fail while downloading/parsing the vulnerability DB, especially in local/offline environments
+    - Fixed `control/vuln_scanner.py`:
+      - added `AVA_TRIVY_SCAN_TIMEOUT_SECONDS`
+      - compose sets `AVA_TRIVY_SCAN_TIMEOUT_SECONDS=45`
+      - Trivy CLI `--timeout` now uses the bounded interactive timeout
+      - subprocess timeout is bounded to the Trivy timeout plus a small grace window
+    - Fixed `control/tool_registry.py`:
+      - runtime vulnerability scan timeout now returns a controlled metadata result instead of hanging the API/UI
+      - Trivy dependency/DB/parse failures now return a controlled metadata result instead of generic command failure
+      - incomplete scan responses explicitly say CVE posture is unknown and no CVE absence should be inferred
+      - host-risk assessment can include incomplete vulnerability scan state without timing out
+    - Added `tests/vulnerability_scan_timeout_regression.py`
+    - Updated `tests/security_hardening_regression.py` to lock the bounded Trivy timeout config
+    - Verification:
+      - `py_compile`: PASS
+      - `tests/vulnerability_scan_timeout_regression.py`: PASS
+      - `tests/security_hardening_regression.py`: PASS
+      - `tests/intelligence_regression.py`: PASS
+      - `docker compose config --quiet`: PASS
+      - rebuild: PASS
+      - focused live checks:
+        - `what should I investigate on this host`: returned in ~50s, success=true
+        - `scan my system for vulnerabilities`: returned in ~45s, success=true with `scan_status=parse_failed` when local Trivy DB download failed
+      - `tests/ava_live_100_question_test.py`: 100/100 PASS after the fix
+    - Remaining limitation:
+      - Local Trivy DB/network availability still controls whether CVE findings are produced. AVA now handles that honestly and within request budget, but it does not magically provide CVE results when the scanner DB is unavailable.
   - Completed agent identity foundation for future remote agents:
     - Added `control/agent_identity.py`
     - Added `AgentIdentityRegistry`
