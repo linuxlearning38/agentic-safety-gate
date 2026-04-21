@@ -116,6 +116,7 @@ services:
       AVA_OPA_ACTION_POLICY_ENABLED: "true"
       OPA_ACTION_POLICY_URL: http://opa:8181/v1/data/ava/authz/decision
       AVA_COMMAND_SIGNING_KEY: ${AVA_COMMAND_SIGNING_KEY:-}
+      AVA_COMMAND_REPLAY_CACHE_PATH: /data/command_replay_cache.json
 
     extra_hosts:
       - "host.docker.internal:host-gateway"

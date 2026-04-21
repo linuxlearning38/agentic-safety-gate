@@ -155,7 +155,33 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
   - 2026-04-20 Asia/Calcutta (audit integrity hardening)
   - 2026-04-20 Asia/Calcutta (OPA-backed action policy)
   - 2026-04-21 Asia/Calcutta (signed command envelope foundation)
+  - 2026-04-21 Asia/Calcutta (signed command replay prevention foundation)
 - Latest changes made:
+  - Completed signed command replay prevention foundation:
+    - Added `CommandReplayCache` to `control/signed_commands.py`
+    - Added `consume_signed_command(...)` so future remote agents can verify and consume a signed command before execution
+    - Replay cache keys hash `command_id:nonce` with SHA-256 instead of storing raw command IDs/nonces
+    - Replay cache prunes expired entries during consumption
+    - Replay cache can operate in memory for tests or as a JSON file using `AVA_COMMAND_REPLAY_CACHE_PATH`
+    - Compose configures `AVA_COMMAND_REPLAY_CACHE_PATH=/data/command_replay_cache.json`
+    - `/security/posture` now reports `Signed command replay cache is configured`
+    - `/security/posture` now reports `command_replay_cache_configured`
+    - Added regression coverage for:
+      - first consumption succeeds
+      - repeated command ID + nonce is rejected as replayed
+      - different signed command still succeeds
+      - replay cache does not store raw command ID or nonce
+    - Verification:
+      - `py_compile`: PASS
+      - `tests/signed_command_regression.py`: PASS
+      - `tests/security_hardening_regression.py`: PASS
+      - `docker compose config --quiet`: PASS
+      - live `/health`: PASS
+      - `tests/ava_e2e_live_test.py`: 8/8 PASS
+      - Docker inspect: `RestartCount=0`, `Health=healthy`, `ReadonlyRootfs=true`
+      - live `/security/posture`: replay cache control reports PASS at `/data/command_replay_cache.json`
+    - Remaining limitation:
+      - This is still a protocol foundation. Remote agent transport, mTLS identity enforcement, and fleet-agent execution enforcement are not implemented yet.
   - Completed signed command envelope foundation for future remote agents:
     - Added `control/signed_commands.py`
     - Command envelopes are signed with HMAC-SHA256 using `AVA_COMMAND_SIGNING_KEY`
@@ -194,7 +220,6 @@ The user goal is that AVA feels like one assistant with one brain. Internal subs
       - live `/security/posture`: signed-command control reports WARN because `AVA_COMMAND_SIGNING_KEY` is not configured
     - Remaining limitation:
       - This is the cryptographic envelope foundation only. Remote agent transport, mTLS identity enforcement, and fleet-agent execution enforcement are not implemented yet.
-      - Replay prevention still needs an agent-side nonce/command-id cache when remote agents are introduced.
   - Completed OPA-backed action policy enforcement:
     - Added `policies/ava_actions.rego`
     - Added mandatory OPA action decision calls in `control/secure_executor.py`

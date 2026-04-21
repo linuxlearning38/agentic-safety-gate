@@ -148,10 +148,16 @@ def main() -> int:
         check(
             "signed command envelope foundation has no hardcoded secret",
             "AVA_COMMAND_SIGNING_KEY: ${AVA_COMMAND_SIGNING_KEY:-}" in compose
+            and "AVA_COMMAND_REPLAY_CACHE_PATH: /data/command_replay_cache.json" in compose
             and '"Signed command envelope is available"' in app
+            and '"Signed command replay cache is configured"' in app
             and '"command_signing_configured": command_signing_configured' in app
+            and '"command_replay_cache_configured": command_replay_cache_configured' in app
             and "fleet-agent enforcement is not implemented" in app
             and "AVA_COMMAND_SIGNING_KEY" in _read(ROOT / "control" / "signed_commands.py")
+            and "AVA_COMMAND_REPLAY_CACHE_PATH" in _read(ROOT / "control" / "signed_commands.py")
+            and "consume_signed_command" in _read(ROOT / "control" / "signed_commands.py")
+            and "CommandReplayCache" in _read(ROOT / "control" / "signed_commands.py")
             and "hmac.compare_digest" in _read(ROOT / "control" / "signed_commands.py")
             and "expires_at" in _read(ROOT / "control" / "signed_commands.py")
             and "signature" in _read(ROOT / "control" / "signed_commands.py")

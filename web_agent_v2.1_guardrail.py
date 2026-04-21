@@ -4158,6 +4158,7 @@ def security_posture_route():
         docker_host = os.getenv("DOCKER_HOST", "")
         webhook_secret_configured = bool(os.getenv("WEBHOOK_SECRET", "").strip())
         command_signing_configured = bool(os.getenv("AVA_COMMAND_SIGNING_KEY", "").strip())
+        command_replay_cache_configured = bool(os.getenv("AVA_COMMAND_REPLAY_CACHE_PATH", "").strip())
         monitor_enabled = os.getenv("AVA_MONITOR_ENABLED", "false").lower() == "true"
         warmup_enabled = os.getenv("LLM_WARMUP_ENABLED", "false").lower() == "true"
 
@@ -4211,6 +4212,11 @@ def security_posture_route():
                 ),
             },
             {
+                "name": "Signed command replay cache is configured",
+                "status": "pass" if command_replay_cache_configured else "warn",
+                "detail": os.getenv("AVA_COMMAND_REPLAY_CACHE_PATH", "not configured"),
+            },
+            {
                 "name": "Autonomous monitor is opt-in",
                 "status": "pass" if not monitor_enabled else "warn",
                 "detail": "disabled" if not monitor_enabled else "enabled",
@@ -4230,6 +4236,7 @@ def security_posture_route():
             "docker_access": "proxy" if docker_host else "local_socket_fallback",
             "webhook_enabled": webhook_secret_configured,
             "command_signing_configured": command_signing_configured,
+            "command_replay_cache_configured": command_replay_cache_configured,
             "autonomous_monitor_enabled": monitor_enabled,
             "llm_warmup_enabled": warmup_enabled,
             "runtime_paths": {
