@@ -4157,6 +4157,7 @@ def security_posture_route():
     try:
         docker_host = os.getenv("DOCKER_HOST", "")
         webhook_secret_configured = bool(os.getenv("WEBHOOK_SECRET", "").strip())
+        command_signing_configured = bool(os.getenv("AVA_COMMAND_SIGNING_KEY", "").strip())
         monitor_enabled = os.getenv("AVA_MONITOR_ENABLED", "false").lower() == "true"
         warmup_enabled = os.getenv("LLM_WARMUP_ENABLED", "false").lower() == "true"
 
@@ -4201,6 +4202,15 @@ def security_posture_route():
                 "detail": os.getenv("OPA_ACTION_POLICY_URL", "http://opa:8181/v1/data/ava/authz/decision"),
             },
             {
+                "name": "Signed command envelope is available",
+                "status": "pass" if command_signing_configured else "warn",
+                "detail": (
+                    "AVA_COMMAND_SIGNING_KEY is configured; future remote-agent jobs can be signed and verified."
+                    if command_signing_configured
+                    else "Signing module is present, but AVA_COMMAND_SIGNING_KEY is not configured."
+                ),
+            },
+            {
                 "name": "Autonomous monitor is opt-in",
                 "status": "pass" if not monitor_enabled else "warn",
                 "detail": "disabled" if not monitor_enabled else "enabled",
@@ -4215,10 +4225,11 @@ def security_posture_route():
         posture = {
             "mode": "zero-trust-aligned local hardening",
             "perfect_zero_trust": False,
-            "summary": "AVA is hardened for local/personal penetration testing, but enterprise zero-trust still needs signed agents, mTLS, policy-backed fleet actions, and tamper-resistant audit storage.",
+            "summary": "AVA is hardened for local/personal penetration testing, but enterprise zero-trust still needs remote-agent enforcement, mTLS, policy-backed fleet actions, and tamper-resistant audit storage.",
             "rate_limit_storage": RATE_LIMIT_STORAGE_URI,
             "docker_access": "proxy" if docker_host else "local_socket_fallback",
             "webhook_enabled": webhook_secret_configured,
+            "command_signing_configured": command_signing_configured,
             "autonomous_monitor_enabled": monitor_enabled,
             "llm_warmup_enabled": warmup_enabled,
             "runtime_paths": {
@@ -4231,7 +4242,8 @@ def security_posture_route():
             },
             "controls": controls,
             "remaining_gaps": [
-                "No mTLS or signed command protocol for future remote agents yet.",
+                "No remote agent transport or mTLS identity enforcement yet.",
+                "Signed command envelopes exist, but fleet-agent enforcement is not implemented until remote agents are added.",
                 "Audit storage is tamper-evident, not append-only; filesystem compromise can still delete the log.",
             ],
             "recommended_next_ui_actions": [

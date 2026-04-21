@@ -146,6 +146,18 @@ def main() -> int:
             and '"Action decisions pass through OPA"' in app,
         ),
         check(
+            "signed command envelope foundation has no hardcoded secret",
+            "AVA_COMMAND_SIGNING_KEY: ${AVA_COMMAND_SIGNING_KEY:-}" in compose
+            and '"Signed command envelope is available"' in app
+            and '"command_signing_configured": command_signing_configured' in app
+            and "fleet-agent enforcement is not implemented" in app
+            and "AVA_COMMAND_SIGNING_KEY" in _read(ROOT / "control" / "signed_commands.py")
+            and "hmac.compare_digest" in _read(ROOT / "control" / "signed_commands.py")
+            and "expires_at" in _read(ROOT / "control" / "signed_commands.py")
+            and "signature" in _read(ROOT / "control" / "signed_commands.py")
+            and "test-only-command-signing-key" not in _read(ROOT / "control" / "signed_commands.py"),
+        ),
+        check(
             "autonomous monitor/healer is opt-in for zero-trust mode",
             'AVA_MONITOR_ENABLED", "false"' in app
             and 'AVA_MONITOR_ENABLED: "false"' in compose,
