@@ -1366,11 +1366,17 @@ def _check_updates(args: Dict) -> Dict:
 def _scan_host_vulnerabilities(args: Dict) -> Dict:
     tools = check_vuln_tools()
     if not tools.get("trivy"):
-        return _fail("Trivy is not installed. Install Trivy to scan the runtime filesystem for CVEs.", "trivy filesystem /")
+        return _incomplete_vulnerability_scan_result(
+            "trivy_not_installed",
+            "Trivy is not installed. Install Trivy to scan the runtime filesystem for CVEs.",
+        )
 
     result = scan_trivy("/", severity_filter="CRITICAL,HIGH")
     if result.get("status") != "success":
-        return _fail(result.get("error", "Trivy scan failed"), "trivy filesystem /")
+        return _incomplete_vulnerability_scan_result(
+            str(result.get("error_code") or "scanner_error"),
+            result.get("message") or result.get("error", "Trivy scan failed"),
+        )
 
     summary = result.get("summary", {})
     findings = result.get("top_findings", [])
@@ -1468,6 +1474,52 @@ def _scan_host_vulnerabilities(args: Dict) -> Dict:
                 "prompt": "install security updates",
             },
         }, runtime_scope="container_runtime_filesystem", compliance_note="CVE findings are based on the runtime filesystem AVA can inspect here, not an external host or fleet."),
+    )
+
+
+def _incomplete_vulnerability_scan_result(scan_status: str, message: str) -> Dict:
+    is_timeout = scan_status == "timeout"
+    title = (
+        "Runtime vulnerability scan did not complete within the interactive budget"
+        if is_timeout
+        else "Runtime vulnerability scan could not complete because the scanner dependency failed"
+    )
+    next_action = (
+        "Retry the vulnerability scan during a quieter maintenance window."
+        if is_timeout
+        else "Refresh Trivy's vulnerability database or verify scanner network access, then retry the scan."
+    )
+    evidence = [
+        message,
+        "The request returned a controlled result instead of letting the AVA API/UI hang.",
+    ]
+    primary_concern = _concern_metadata(
+        title=title,
+        severity="medium",
+        evidence=evidence,
+        next_action=next_action,
+        confidence="high",
+    )
+    return _metadata_result(
+        "\n".join([
+            "Runtime filesystem vulnerability scan did not complete.",
+            f"Reason: {message}",
+            "",
+            "[Primary Concern]",
+            f"- {primary_concern['title']}",
+            "- Why it matters: CVE posture remains unknown until a scan completes.",
+            f"- Next action: {primary_concern['next_action']}",
+        ]),
+        "trivy filesystem /",
+        _with_control_metadata({
+            "inspection_type": "vulnerability_scan",
+            "scan_status": scan_status,
+            "summary": {},
+            "top_findings": [],
+            "primary_concern": primary_concern,
+            "remediation_candidates": [],
+            "broad_remediation": None,
+        }, runtime_scope="container_runtime_filesystem", compliance_note="CVE scan did not complete in this environment; no CVE absence should be inferred."),
     )
 
 

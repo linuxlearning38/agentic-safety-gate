@@ -107,6 +107,7 @@ services:
       AVA_REPORTS_DIR:     /data/ava_reports
       HOME:                /tmp
       TRIVY_CACHE_DIR:     /tmp/trivy-cache
+      AVA_TRIVY_SCAN_TIMEOUT_SECONDS: "45"
       LYNIS_REPORT_PATH:   /tmp/lynis-report.dat
       LYNIS_LOG_PATH:      /tmp/lynis.log
       PYTHONDONTWRITEBYTECODE: "1"
