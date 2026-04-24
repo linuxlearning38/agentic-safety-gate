@@ -51,3 +51,7 @@ scan_output.txt
 security_audit.json
 docs/
 .env
+
+# Runtime data (should never be tracked)
+.ava-data/
+approval_queue.json
