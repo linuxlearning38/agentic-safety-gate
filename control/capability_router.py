@@ -307,6 +307,32 @@ def route_capability(query: str) -> CapabilityMatch | None:
     ):
         return None
 
+    # Self/runtime introspection phrasing should stay on the AVA self path.
+    if re.search(r"\bwhat\b.*\bdocker\b.*\bcontainers\b.*\bports\b.*\brunning\b", q):
+        return None
+
+    # Stateful update/install actions must stay in approval-aware operational routing,
+    # not low-risk package posture inspection.
+    if any(phrase in q for phrase in (
+        "install security updates",
+        "apply security updates",
+        "patch my system",
+        "patch the system",
+        "install package updates",
+        "apply package updates",
+        "update my system",
+    )):
+        return None
+
+    # Process-stop requests are state-changing and must be handled as guarded actions.
+    if re.search(r"\b(?:stop|kill|terminate)\s+(?:the\s+)?(?:suspicious\s+)?process\s+\d+\b", q):
+        return None
+
+    # Definition prompts like "what is a Kubernetes service" should stay in
+    # knowledge routing, not service-inspection tooling.
+    if re.match(r"\bwhat\s+is\s+(?:an?\s+)?[a-z0-9._-]+\s+service\b", q):
+        return None
+
     query_tokens = _tokens(q)
     best: tuple[float, Capability, dict[str, Any], tuple[str, ...]] | None = None
     for capability in CAPABILITIES:

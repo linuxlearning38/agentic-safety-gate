@@ -463,7 +463,10 @@ def _command_response_text(result: dict) -> str:
 
 
 def _is_compound_dangerous_request(query: str) -> bool:
-    q = f" {_normalize_user_query(query).lower()} "
+    q_plain = _normalize_user_query(query).lower().strip()
+    q_plain = re.sub(r"[?!.:,;]+", " ", q_plain)
+    q_plain = re.sub(r"\s+", " ", q_plain).strip()
+    q = f" {q_plain} "
     dangerous_markers = (
         " rm -rf ", " delete ", " drain ", " drop ", " truncate ",
         " shutdown ", " wipe ", " destroy ", " format ",
@@ -501,12 +504,14 @@ def _is_learning_query(q: str) -> bool:
 
 def _is_single_destructive_request(query: str) -> bool:
     q_raw   = (query or "").strip()
-    q_plain = _normalize_user_query(q_raw).lower().strip()
+    q_learning = _normalize_user_query(q_raw).lower().strip()
+    q_plain = re.sub(r"[?!.:,;]+", " ", q_learning)
+    q_plain = re.sub(r"\s+", " ", q_plain).strip()
     q_action = re.sub(r"^(?:please\s+|run\s+|execute\s+|can you\s+|could you\s+)", "", q_plain).strip()
     q       = f" {q_plain} "   # padded for word-boundary substring matching
 
     # Learning queries are informational — user wants to understand, not execute
-    if _is_learning_query(q_plain):
+    if _is_learning_query(q_learning):
         return False
 
     # ── 1. Legacy patterns (preserved exactly) ────────────────────────────────
@@ -1097,6 +1102,13 @@ def extract_operational_tool_request(query: str) -> dict | None:
     namespace_match = re.search(r"\b(?:in|from|for)\s+namespace\s+([a-z0-9-]+)\b", lower)
     namespace = namespace_match.group(1) if namespace_match else "default"
 
+    # Keep AVA self/runtime inventory prompts on controlled self-routing.
+    if lower in {
+        "what docker containers and ports are you running",
+        "what containers and ports are you running",
+    }:
+        return None
+
     if lower in {"docker ps", "docker ps -a"} or any(phrase in lower for phrase in (
         "are there any containers running", "are containers up", "which containers are alive",
         "container list", "docker ps output", "show container list", "list container inventory",
@@ -1306,7 +1318,8 @@ def extract_operational_tool_request(query: str) -> dict | None:
     )
     if inspect_service_match:
         service_name = inspect_service_match.group(1) or inspect_service_match.group(2)
-        return {"tool_name": "inspect_service", "tool_args": {"service": service_name}}
+        if service_name and service_name not in {"my", "the", "this", "that"}:
+            return {"tool_name": "inspect_service", "tool_args": {"service": service_name}}
 
     service_status_match = re.search(
         r"\b([a-z0-9][a-z0-9._-]*)\s+(?:service\s+status|health)\b|"
@@ -3619,6 +3632,7 @@ def get_ava_introduction():
 ### Security Model
 
 - Local-first runtime (no cloud dependency for normal operation).
+- Reasoning model: Qwen2.5 14B via Ollama.
 - JWT authentication + RBAC.
 - OPA policy enforcement.
 - Tamper-evident audit trail for security review.

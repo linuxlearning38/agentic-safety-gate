@@ -63,6 +63,12 @@ def main():
 
     check("non-devops query ignored", router.route_capability("write a poem about clouds") is None)
     check("restart docker service defers to approval routing", router.route_capability("restart docker service") is None)
+    check("install security updates defers to approval routing", router.route_capability("install security updates") is None)
+    check("apply security updates defers to approval routing", router.route_capability("apply security updates") is None)
+    check("stop process 1234 defers to approval routing", router.route_capability("stop process 1234") is None)
+    check("kill process 1234 defers to approval routing", router.route_capability("kill process 1234") is None)
+    check("kubernetes service definition defers to knowledge routing", router.route_capability("what is a kubernetes service") is None)
+    check("docker containers and ports introspection defers to ava_self routing", router.route_capability("what docker containers and ports are you running") is None)
 
     print("[PASS] capability router regression complete")
 
