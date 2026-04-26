@@ -28,7 +28,7 @@ AVA v1.0 consolidates previously shipped capabilities and includes the following
 
 - Single-host deployment (multi-server in roadmap)
 - Local LLM only (no cloud AI integration)
-- VirtualBox bridge requires manual Windows setup
+- Approval execution follows local security review flow for guarded actions
 
 ## In Active Development (Not in v1.0)
 
@@ -36,6 +36,10 @@ AVA v1.0 consolidates previously shipped capabilities and includes the following
 - v2.0: nginx auto-bootstrap
 - v2.0: Full unattended install
 - v3.0: Multi-server fleet management
+
+Provisioning code is preserved on branch:
+
+- `provisioning-v0.1-experimental`
 
 ## Migration Notes
 
