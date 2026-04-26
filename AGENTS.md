@@ -57,4 +57,5 @@ Run before closing major serving changes:
 - `tests/capability_router_regression.py`
 - `tests/security_hardening_regression.py`
 - `tests/ava_e2e_live_test.py`
+- `tests/ava_500_robust_audit.py`
 
