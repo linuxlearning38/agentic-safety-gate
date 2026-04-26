@@ -17,7 +17,7 @@ import time
 import logging
 import threading
 from datetime import datetime
-from control.secure_executor import execute_command_secure, execute_tool_safe, execute_approved_command
+from control.secure_executor import execute_command_secure, execute_tool_safe
 from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
@@ -51,7 +51,6 @@ from control.incident_reporter import (
     report_tool_execution,
     report_graph_execution,
     report_react_execution,
-    report_approved_execution,
     get_recent_reports,
     get_report_by_id,
     get_reports_stats,
@@ -61,6 +60,18 @@ from control.auth import init_jwt, verify_credentials, require_admin, make_token
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_limiter.errors import RateLimitExceeded
+from control.security_layer import security_audit_log
+from control.infra_intent import (
+    classify_infrastructure_intent,
+    compose_infrastructure_plan,
+    render_infrastructure_plan,
+)
+from control.capability_router import route_capability
+from control.approval_routes import register_approval_routes
+from control.provisioning_routes import register_provisioning_routes
+from control.guest_access import build_guest_access_contract, merge_guest_access_with_metadata
+from control.provisioning_jobs import attach_approval, create_job, set_guest_access, transition_job
+from control.unattended_install import build_unattended_install_contract
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -108,6 +119,8 @@ limiter = Limiter(
     swallow_errors=True,
 )
 logger.info(f"[RateLimit] Flask-Limiter initialised — default: 30 req/min per user, storage={RATE_LIMIT_STORAGE_URI}")
+register_approval_routes(app, require_admin, limiter)
+register_provisioning_routes(app, require_admin, limiter)
 
 
 @app.before_request
@@ -137,6 +150,44 @@ _warmup_lock = threading.Lock()
 
 def _api_error(message: str = "Internal server error", status: int = 500, code: str = "internal_error"):
     return jsonify({"error": message, "code": code}), status
+
+def _audit_security_notification(
+    event_type: str,
+    summary: str,
+    detail: str = "",
+    risk: str = "high",
+    threat_type: str | None = None,
+    decision: str | None = None,
+):
+    """
+    Write user-visible security notification events into the same tamper-evident
+    audit stream that powers the Security dashboard.
+    """
+    try:
+        threat = threat_type or event_type
+        risk_analysis = {
+            "risk": risk,
+            "blast_radius": "auth_surface" if "auth" in event_type or "token" in event_type else "application_surface",
+            "description": detail or summary,
+            "matched_pattern": event_type,
+        }
+        threats = [{
+            "type": threat,
+            "severity": risk,
+            "description": detail or summary,
+            "indicator": event_type,
+        }]
+        source = request.remote_addr if request else "unknown"
+        security_audit_log(
+            event_type=event_type,
+            cmd=summary,
+            query=f"{detail} source={source} path={getattr(request, 'path', '')}",
+            risk_analysis=risk_analysis,
+            threats=threats,
+            decision=decision or event_type,
+        )
+    except Exception as exc:
+        logger.warning(f"[SecurityNotify] Failed to write audit event '{event_type}': {exc}")
 
 def load_memory():
     try:
@@ -229,10 +280,19 @@ db.init_db()
 
 # Phase 5C: background health monitor
 from control.monitor import start_monitor
+from control.provisioning_monitor_runner import start_installer_monitor_loop, monitor_loop_enabled
 if os.getenv("AVA_MONITOR_ENABLED", "false").lower() == "true":
     start_monitor()
 else:
     logger.info("[Monitor] Background health monitor disabled by default; set AVA_MONITOR_ENABLED=true to enable.")
+
+if monitor_loop_enabled():
+    start_installer_monitor_loop()
+else:
+    logger.info(
+        "[ProvisioningMonitor] Background installer monitor disabled by default; "
+        "set AVA_INSTALLER_MONITOR_LOOP_ENABLED=true to enable."
+    )
 
 # Command whitelist - expanded for server management
 ALLOWED_COMMANDS = [
@@ -257,15 +317,20 @@ BLOCKED_PATHS = [
 ]
 
 # Stats
-_blogs_count = 0
-try:
-    _blogs_col = chroma_client.get_collection("devops_blogs_v1")
-    _blogs_count = _blogs_col.count()
-except:
-    pass
+def _compute_total_chunks() -> int:
+    """Return total chunks across all Chroma collections in the active store."""
+    try:
+        return sum(col.count() for col in chroma_client.list_collections())
+    except Exception:
+        try:
+            return int(collection.count())
+        except Exception:
+            return 0
+
 
 STATS = {
-    'total_chunks': collection.count() + _blogs_count,
+    # Source of truth for KB size displayed in /about and AVA self-description.
+    'total_chunks': _compute_total_chunks(),
     'repos': 5,
     'model': 'Qwen 2.5 14B',
     'opa_enabled': True,
@@ -427,23 +492,37 @@ def _is_compound_dangerous_request(query: str) -> bool:
     return hits >= 2
 
 
+def _has_shell_control_syntax(query: str) -> bool:
+    q = _normalize_user_query(query).lower()
+    return bool(re.search(r"(;|&&|\|\||`|\$\(|>\s*/|>>\s*/|\|\s*(?:sh|bash|powershell)\b)", q))
+
+
 _LEARNING_PREFIXES = (
     "how ", "how do ", "how to ", "how can ", "how would ", "how does ",
     "what ", "what is ", "what are ", "what does ", "what would ", "what happens ",
     "why ", "why does ", "why would ", "why is ",
     "explain ", "tell me about ", "describe ", "can you explain",
     "could you explain", "show me how", "walk me through",
+    "teach me ", "teach me about ", "please explain", "please explain:",
 )
 
 
 def _is_learning_query(q: str) -> bool:
     """Return True when the query is asking to learn, not requesting execution."""
-    return any(q.startswith(prefix) for prefix in _LEARNING_PREFIXES)
+    normalized = _normalize_user_query(q).strip().lower()
+    for prefix in ("please explain:", "please explain", "please tell me", "can you explain", "could you explain"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):].strip(" :")
+            if normalized:
+                return True
+            break
+    return any(normalized.startswith(prefix) for prefix in _LEARNING_PREFIXES)
 
 
 def _is_single_destructive_request(query: str) -> bool:
     q_raw   = (query or "").strip()
     q_plain = _normalize_user_query(q_raw).lower().strip()
+    q_action = re.sub(r"^(?:please\s+|run\s+|execute\s+|can you\s+|could you\s+)", "", q_plain).strip()
     q       = f" {q_plain} "   # padded for word-boundary substring matching
 
     # Learning queries are informational — user wants to understand, not execute
@@ -465,6 +544,8 @@ def _is_single_destructive_request(query: str) -> bool:
 
     # ── 2. Mass deletion ──────────────────────────────────────────────────────
     if "delete all " in q_plain:
+        return True
+    if any(phrase in q_plain for phrase in ("wipe all docker containers", "kill every process", "remove all secrets", "destroy /boot")):
         return True
     if " delete " in q and " --all" in q:
         return True
@@ -506,6 +587,10 @@ def _is_single_destructive_request(query: str) -> bool:
             return True
         if re.search(r"echo\b.*>\s*" + re.escape(critical_file), q_plain):
             return True
+        if "echo" in q_plain and f"into {critical_file}" in q_plain:
+            return True
+        if any(verb in q_plain for verb in ("overwrite", "empty", "destroy")) and critical_file in q_plain:
+            return True
     if "> /boot/" in q_plain:
         return True
 
@@ -522,9 +607,11 @@ def _is_single_destructive_request(query: str) -> bool:
         return True
 
     # ── 7. System control ─────────────────────────────────────────────────────
-    for cmd in ("shutdown", "halt", "poweroff", "reboot -f", "init 0", "init 6", "kill -9 -1", "killall5"):
+    for cmd in ("shutdown", "halt", "poweroff", "reboot", "reboot -f", "init 0", "init 6", "kill -9 -1", "killall5"):
         if (
-            q_plain == cmd
+            q_action == cmd
+            or q_action.startswith(f"{cmd} ")
+            or q_plain == cmd
             or q_plain.startswith(f"{cmd} ")
             or q_plain.endswith(f" {cmd}")
             or f" {cmd} " in q
@@ -562,6 +649,36 @@ def _resolve_direct_action_query(query: str) -> dict | None:
             "Destructive infrastructure or database requests are blocked by policy.",
             "destructive_request",
         )
+        _audit_security_notification(
+            "blocked_destructive_request",
+            _normalize_user_query(query),
+            "Deterministic pre-execution destructive request block.",
+            risk="critical",
+            threat_type="destructive_request",
+            decision="blocked",
+        )
+        return {
+            "kind": "command",
+            "result": blocked_result,
+            "response": _command_response_text(blocked_result),
+        }
+
+    if _has_shell_control_syntax(query) and looks_like_operational_request(query):
+        blocked_result = _blocked_action_result(
+            query,
+            "Compound shell-like operational requests are blocked by policy. Ask for one action at a time.",
+            "compound_shell_control_request",
+            blast_radius="high",
+        )
+        blocked_result["risk"] = "high"
+        _audit_security_notification(
+            "blocked_compound_shell_request",
+            _normalize_user_query(query),
+            "Blocked shell-control syntax in an operational request before tool/classifier routing.",
+            risk="high",
+            threat_type="compound_shell_control_request",
+            decision="blocked",
+        )
         return {
             "kind": "command",
             "result": blocked_result,
@@ -577,18 +694,223 @@ def _resolve_direct_action_query(query: str) -> dict | None:
             "confidence": "high",
         }
 
-    explicit_command = extract_explicit_command_request(query)
-    if explicit_command:
-        result = execute_tool_safe(
-            "raw_command",
-            {"command": explicit_command},
+    infrastructure_intent = classify_infrastructure_intent(query)
+    if infrastructure_intent:
+        if infrastructure_intent.capability == "virtualbox.list_vms":
+            exec_result = execute_tool_safe(
+                "list_virtualbox_vms",
+                {},
+                query=query,
+                source="ask_infrastructure_bridge",
+            )
+            return {
+                "kind": "command",
+                "result": exec_result,
+                "response": _command_response_text(exec_result),
+                "metadata": {
+                    "infrastructure_intent": infrastructure_intent.to_dict(),
+                },
+            }
+
+        if infrastructure_intent.capability == "virtualbox.vm_status":
+            if infrastructure_intent.missing:
+                return {
+                    "kind": "knowledge",
+                    "response": "I can inspect a VirtualBox VM, but I need the VM name. Example: inspect VM ava-ubuntu-01.",
+                    "confidence": "high",
+                    "metadata": {
+                        "infrastructure_intent": infrastructure_intent.to_dict(),
+                    },
+                }
+            exec_result = execute_tool_safe(
+                "inspect_virtualbox_vm",
+                {"name": infrastructure_intent.vm_name},
+                query=query,
+                source="ask_infrastructure_bridge",
+            )
+            return {
+                "kind": "command",
+                "result": exec_result,
+                "response": _command_response_text(exec_result),
+                "metadata": {
+                    "infrastructure_intent": infrastructure_intent.to_dict(),
+                },
+            }
+
+        if infrastructure_intent.capability == "virtualbox.delete_preview":
+            if infrastructure_intent.missing:
+                return {
+                    "kind": "knowledge",
+                    "response": "I can generate a safe delete preview, but I need the VM name. Example: delete vm ava-web-01.",
+                    "confidence": "high",
+                    "metadata": {
+                        "infrastructure_intent": infrastructure_intent.to_dict(),
+                    },
+                }
+            exec_result = execute_tool_safe(
+                "preview_delete_virtualbox_vm",
+                {
+                    "name": infrastructure_intent.vm_name,
+                    "reason": _normalize_user_query(query)[:240],
+                },
+                query=query,
+                source="ask_infrastructure_preview",
+            )
+            return {
+                "kind": "command",
+                "result": exec_result,
+                "response": _command_response_text(exec_result),
+                "metadata": {
+                    "infrastructure_intent": infrastructure_intent.to_dict(),
+                },
+            }
+
+        if (
+            infrastructure_intent.capability == "infra.provision_linux_server"
+            and infrastructure_intent.provider == "virtualbox"
+            and not infrastructure_intent.missing
+        ):
+            guest_access_contract = build_guest_access_contract(str(infrastructure_intent.vm_name or "unknown"))
+            install_contract = build_unattended_install_contract(
+                vm_name=str(infrastructure_intent.vm_name or "unknown"),
+                os_family=str(infrastructure_intent.os_family or "ubuntu"),
+                provider=str(infrastructure_intent.provider or "virtualbox"),
+            )
+            job = create_job(
+                vm_name=str(infrastructure_intent.vm_name or "unknown"),
+                role=str(infrastructure_intent.role or "base-linux"),
+                provider=str(infrastructure_intent.provider),
+                resources={
+                    "cpu": int(infrastructure_intent.cpu),
+                    "memory_mb": int(infrastructure_intent.memory_mb),
+                    "disk_gb": int(infrastructure_intent.disk_gb),
+                },
+                network=str(infrastructure_intent.network),
+                storage_root=str(infrastructure_intent.storage_root),
+                iso_path=infrastructure_intent.iso_path,
+                guest_access=guest_access_contract.to_dict(),
+                install_contract=install_contract.to_dict(),
+                query=query,
+            )
+            autostart_after_create = (
+                os.getenv("AVA_VIRTUALBOX_AUTOSTART_AFTER_CREATE", "true").strip().lower() == "true"
+                and bool(install_contract.enabled)
+                and bool(install_contract.ready)
+            )
+            exec_result = execute_tool_safe(
+                "create_virtualbox_vm",
+                {
+                    "name": infrastructure_intent.vm_name,
+                    "os_family": infrastructure_intent.os_family,
+                    "cpu": infrastructure_intent.cpu,
+                    "memory_mb": infrastructure_intent.memory_mb,
+                    "disk_gb": infrastructure_intent.disk_gb,
+                    "network": infrastructure_intent.network,
+                    "vm_root": infrastructure_intent.storage_root,
+                    "iso_path": infrastructure_intent.iso_path or os.getenv("AVA_VIRTUALBOX_DEFAULT_ISO_PATH", "").strip(),
+                    "ssh_host_port": int(guest_access_contract.ssh_port),
+                    "autoinstall_seed_iso_path": install_contract.seed_iso_path if install_contract.ready else "",
+                    "autostart_after_create": autostart_after_create,
+                },
+                query=query,
+                source="ask_infrastructure_bridge",
+            )
+            status = str(exec_result.get("status") or "").strip().lower()
+            if status == "approval_required":
+                approval_id = str(exec_result.get("approval_id") or "").strip()
+                if approval_id:
+                    attach_approval(str(job.get("job_id")), approval_id)
+                else:
+                    transition_job(
+                        str(job.get("job_id")),
+                        "approval_pending",
+                        error_summary="approval_required_without_approval_id",
+                    )
+            elif status == "success":
+                transition_job(str(job.get("job_id")), "creating")
+                metadata = exec_result.get("metadata") if isinstance(exec_result.get("metadata"), dict) else {}
+                merged_guest_access = merge_guest_access_with_metadata(guest_access_contract.to_dict(), metadata)
+                set_guest_access(str(job.get("job_id")), merged_guest_access)
+                transition_job(
+                    str(job.get("job_id")),
+                    "created",
+                    verification_result={"vm_created": True, "status": "created"},
+                    error_summary="",
+                )
+                if install_contract.enabled or install_contract.requires_manual_installer:
+                    vm_started = bool(metadata.get("vm_started"))
+                    pending_reason = (
+                        "manual_installer_required"
+                        if install_contract.requires_manual_installer
+                        else ("unattended_install_in_progress" if vm_started else "unattended_install_waiting_for_start")
+                    )
+                    transition_job(
+                        str(job.get("job_id")),
+                        "installer_pending",
+                        verification_result={
+                            "vm_created": True,
+                            "status": "installer_pending",
+                            "reason": pending_reason,
+                            "vm_started": vm_started,
+                            "missing": install_contract.missing,
+                        },
+                        error_summary=pending_reason,
+                    )
+            else:
+                transition_job(
+                    str(job.get("job_id")),
+                    "failed",
+                    verification_result={"vm_created": False, "status": status or "failed"},
+                    error_summary=str(exec_result.get("error") or exec_result.get("reason") or "provisioning_execution_failed"),
+                )
+            return {
+                "kind": "command",
+                "result": exec_result,
+                "response": _command_response_text(exec_result),
+                "metadata": {
+                    "infrastructure_intent": infrastructure_intent.to_dict(),
+                    "provisioning_job": job,
+                    "guest_access_contract": guest_access_contract.to_dict(),
+                    "install_contract": install_contract.to_dict(),
+                },
+            }
+
+        infrastructure_plan = compose_infrastructure_plan(infrastructure_intent)
+        return {
+            "kind": "knowledge",
+            "response": render_infrastructure_plan(infrastructure_plan),
+            "confidence": infrastructure_intent.confidence,
+            "metadata": {
+                "infrastructure_intent": infrastructure_intent.to_dict(),
+                "infrastructure_plan": infrastructure_plan.to_dict(),
+            },
+        }
+
+    capability_match = route_capability(query)
+    if capability_match:
+        if capability_match.missing:
+            return {
+                "kind": "knowledge",
+                "response": capability_match.clarification,
+                "confidence": capability_match.confidence,
+                "metadata": {
+                    "capability_match": capability_match.to_dict(),
+                },
+            }
+
+        exec_result = execute_tool_safe(
+            capability_match.tool_name,
+            capability_match.tool_args,
             query=query,
-            source="ask_command",
+            source="ask_capability_router",
         )
         return {
             "kind": "command",
-            "result": result,
-            "response": _command_response_text(result),
+            "result": exec_result,
+            "response": _command_response_text(exec_result),
+            "metadata": {
+                "capability_match": capability_match.to_dict(),
+            },
         }
 
     operational_tool = extract_operational_tool_request(query)
@@ -611,6 +933,24 @@ def _resolve_direct_action_query(query: str) -> dict | None:
             "kind": "knowledge",
             "response": operational_clarification,
             "confidence": "high",
+        }
+
+    # Raw command fallback runs after structured natural-language mapping.
+    # This prevents phrases like "docker daemon status" or "which containers
+    # are up" from being treated as arbitrary shell commands when AVA already
+    # has safer structured tools for the same intent.
+    explicit_command = extract_explicit_command_request(query)
+    if explicit_command:
+        result = execute_tool_safe(
+            "raw_command",
+            {"command": explicit_command},
+            query=query,
+            source="ask_command",
+        )
+        return {
+            "kind": "command",
+            "result": result,
+            "response": _command_response_text(result),
         }
 
     llm_operational = _classify_operational_intent_with_llm(query)
@@ -680,6 +1020,7 @@ def looks_like_operational_request(query: str) -> bool:
     action_terms = (
         "show", "check", "list", "get", "restart", "scale", "describe",
         "scan", "inspect", "tail", "view", "display", "run", "execute",
+        "patch", "verify", "assess", "hunt",
     )
     target_terms = (
         "disk", "memory", "pod", "pods", "node", "nodes", "service", "services",
@@ -687,8 +1028,13 @@ def looks_like_operational_request(query: str) -> bool:
         "kubernetes", "cluster", "logs", "log", "status", "health", "image",
         "process", "processes", "port", "ports", "update", "updates", "package",
         "packages", "security", "auth", "ssh", "vulnerability", "vulnerabilities",
-        "cve", "cves", "suspicious",
+        "cve", "cves", "suspicious", "system", "host", "runtime", "daemon",
+        "risk", "compromised", "listeners", "sockets", "patch", "patches",
+        "pid", "fix",
     )
+
+    if re.search(r"(;|&&|\|\||`|\$\(|>\s*/|>>\s*/|\|\s*(?:sh|bash|powershell)\b)", q):
+        return any(term in q for term in target_terms)
 
     first_word = q.split()[0]
     if first_word not in action_terms:
@@ -701,14 +1047,13 @@ def _is_vague_diagnostic_query(query: str) -> bool:
     q = _normalize_user_query(query).strip().lower()
     if not q:
         return False
+    q = re.sub(r"^(?:ava please|please|can you|could you|ava|quickly)\s+", "", q).strip()
+    q = re.sub(r"\s+please$", "", q).strip(" ?!.")
 
     if extract_operational_tool_request(q):
         return False
     if extract_operational_clarification(q):
         return False
-    if q.startswith(_LEARNING_PREFIXES):
-        return False
-
     exact_matches = {
         "find problems",
         "find issues",
@@ -718,14 +1063,51 @@ def _is_vague_diagnostic_query(query: str) -> bool:
         "check things",
         "something is wrong",
         "something broke",
+        "something seems off",
+        "something is off",
+        "things are weird",
+        "system feels slow",
+        "host feels wrong",
+        "not sure what is wrong",
+        "please investigate",
+        "investigate",
+        "give me a safe check plan",
+        "where should we start",
+        "what looks unhealthy",
+        "find the issue",
+        "find the root issue",
+        "system is acting strange",
+        "machine is acting strange",
+        "server feels unhealthy",
+        "look safely",
+        "what should ava inspect first",
+        "give me safe diagnostics",
+        "check everything",
+        "can you check everything",
         "look for issues",
         "diagnose",
         "troubleshoot",
+        "look around",
+        "what is broken",
+        "what's broken",
+        "what is wrong",
+        "what's wrong",
+        "is this healthy",
+        "what should i check",
+        "what should i investigate",
     }
     if q in exact_matches:
         return True
 
-    return q in {"what is wrong", "what's wrong"} or q.startswith("what is wrong ") or q.startswith("what's wrong ")
+    if q.startswith(_LEARNING_PREFIXES):
+        return False
+
+    return (
+        q in {"what is wrong", "what's wrong", "what broken", "what check"}
+        or q.startswith("what is wrong ")
+        or q.startswith("what's wrong ")
+        or q.startswith("not sure what is wrong")
+    )
 
 
 def _build_vague_diagnostic_clarification() -> str:
@@ -914,9 +1296,40 @@ def extract_operational_tool_request(query: str) -> dict | None:
         return None
 
     lower = q.lower()
+    lower = re.sub(r"^(?:ava please|please|can you|could you|right now|now|ava|quickly)\s+", "", lower).strip()
+    lower = re.sub(r"^(?:can you|could you)\s+", "", lower).strip()
+    lower = re.sub(r"\s+for this host$", "", lower).strip()
+    lower = re.sub(r"\s+now$", "", lower).strip()
+    lower = re.sub(r"\s+please$", "", lower).strip(" ?!.")
+
+    # Do not extract a safe-looking structured tool from a compound shell-like
+    # request. The full request must be handled by the direct-action safety path.
+    if re.search(r"(;|&&|\|\||`|\$\(|>\s*/|>>\s*/|\|\s*(?:sh|bash|powershell)\b)", lower):
+        return None
 
     namespace_match = re.search(r"\b(?:in|from|for)\s+namespace\s+([a-z0-9-]+)\b", lower)
     namespace = namespace_match.group(1) if namespace_match else "default"
+
+    if lower in {"docker ps", "docker ps -a"} or any(phrase in lower for phrase in (
+        "are there any containers running", "are containers up", "which containers are alive",
+        "container list", "docker ps output", "show container list", "list container inventory",
+        "container inventory", "running container inventory", "what is running in docker",
+        "docker workload list", "show docker workloads", "list docker workloads",
+        "container overview", "what containers exist", "show containers present",
+        "containers currently active", "docker running list", "docker active containers",
+    )):
+        return {"tool_name": "list_containers", "tool_args": {}}
+
+    if lower == "docker info" or any(phrase in lower for phrase in (
+        "docker daemon ok", "docker engine ok", "container runtime ok",
+        "is the container runtime alive", "is the docker daemon alive",
+        "docker ps equivalent", "docker info equivalent", "docker engine summary",
+        "container runtime summary", "daemon status for docker", "docker runtime health",
+        "container engine health", "do we have docker access", "can ava reach docker",
+        "docker connectivity check", "docker socket proxy status", "container daemon status",
+        "docker runtime check", "runtime check for docker", "docker availability",
+    )):
+        return {"tool_name": "check_docker", "tool_args": {}}
 
     scale_match = re.search(
         r"\bscale\s+(?:the\s+)?deployment\s+(?!to\b)([a-z0-9][a-z0-9._-]*)\s+(?:to\s+)?(\d+)\s+replicas?\b",
@@ -993,12 +1406,31 @@ def extract_operational_tool_request(query: str) -> dict | None:
             "tool_args": {"service": "docker"},
         }
 
-    if any(phrase in lower for phrase in ("show disk usage", "check disk usage", "list disk usage", "disk usage", "check disk")):
+    if any(phrase in lower for phrase in (
+        "show disk usage", "check disk usage", "list disk usage", "disk usage", "check disk",
+        "disk space check", "how much disk is used", "show filesystem usage",
+        "check storage usage", "disk health quick check", "show df summary",
+        "storage pressure check", "inspect disk capacity",
+        "disk pressure", "storage pressure", "disk free space", "storage free space",
+        "filesystem capacity", "filesystem pressure", "disk capacity report",
+        "storage capacity report", "df style summary", "disk utilization",
+        "storage utilization", "do we have disk space", "is disk full",
+        "disk fullness check", "volume capacity", "filesystem headroom",
+        "storage headroom", "root filesystem check", "disk room left",
+    )):
         return {"tool_name": "check_disk", "tool_args": {}}
 
     if any(phrase in lower for phrase in (
         "show memory usage", "check memory usage", "memory usage", "check memory",
         "check my memory", "show my memory", "memory status", "ram usage", "check ram",
+        "memory pressure check", "inspect memory", "check free memory", "memory health",
+        "current memory usage", "show memory headroom",
+        "memory pressure", "ram pressure", "memory headroom", "ram headroom",
+        "free memory", "available memory", "memory availability", "ram availability",
+        "memory capacity", "ram capacity", "memory utilization", "ram utilization",
+        "is memory low", "do we have memory", "host memory summary",
+        "memory quick check", "ram quick check", "memory room left", "available ram",
+        "memory state",
     )):
         return {"tool_name": "check_memory", "tool_args": {}}
 
@@ -1010,50 +1442,111 @@ def extract_operational_tool_request(query: str) -> dict | None:
         return {"tool_name": "check_host_telemetry", "tool_args": {}}
 
     if any(phrase in lower for phrase in (
-        "verify my system", "check my system", "verify system", "system check",
+        "verify my system", "check my system", "verify system", "run system verification", "system verification", "system check",
         "check system health", "system health", "what's wrong with my system",
         "what is wrong with my system", "diagnose my system", "inspect my system",
+        "run health check", "verify this host", "check host baseline",
+        "local system verification", "run baseline diagnostics",
+        "host overview", "system overview", "machine overview", "give me local health",
+        "overall local health", "local diagnostics", "run diagnostics",
+        "health summary", "basic health summary", "quick health check",
+        "is this host ok", "host readiness check", "system readiness check",
+        "local readiness", "baseline health", "baseline overview",
+        "check machine health", "show machine health", "overall system state",
+        "current host state",
     )):
         return {"tool_name": "verify_system", "tool_args": {}}
 
     if any(phrase in lower for phrase in (
-        "check docker", "show docker status", "docker status", "verify docker",
+        "check docker", "show docker status", "docker status", "verify docker", "docker health", "docker daemon health", "hows my docker health", "how is my docker health",
         "is my docker running", "is docker running", "is my docker running correctly",
         "docker daemon is not responding", "docker not responding", "check my docker",
-        "is docker healthy",
+        "is docker healthy", "docker daemon status", "check docker runtime",
+        "is docker available", "how is docker doing", "docker engine health",
+        "check container runtime",
     )):
         return {"tool_name": "check_docker", "tool_args": {}}
 
-    if any(phrase in lower for phrase in ("show running containers", "list running containers", "show containers", "list containers")):
+    if any(phrase in lower for phrase in (
+        "show running containers", "list running containers", "show containers", "list containers",
+        "show all containers", "show me all containers", "what containers are running",
+        "container status", "docker containers", "show docker containers",
+        "what are exposed containers", "exposed containers", "list all containers",
+        "which containers are up", "display container inventory",
+    )):
         return {"tool_name": "list_containers", "tool_args": {}}
 
     if any(phrase in lower for phrase in (
-        "show running processes", "show processes", "check processes", "list processes",
+        "show running processes", "list running processes", "show processes", "check processes", "list processes",
         "top processes", "show top processes", "show unusual processes",
     )):
         return {"tool_name": "check_processes", "tool_args": {}}
 
     if any(phrase in lower for phrase in (
         "show listening ports", "check listening ports", "show open ports", "check open ports",
-        "list open ports", "list listening ports", "which ports are open",
+        "list open ports", "list listening ports", "which ports are open", "which ports are listening", "show exposed ports", "what ports are exposed", "exposed ports",
+        "list listening sockets", "display listening ports", "network listeners",
+        "port exposure check", "inspect network ports", "show socket listeners",
+        "are any ports open", "any exposed ports", "which sockets are open",
+        "list sockets", "who is listening on ports", "what is listening",
+        "network exposure", "listener inventory", "tcp listeners",
+        "show tcp listeners", "socket inventory", "open socket list",
+        "host network exposure", "ports listening right now", "ports listening right",
+        "services listening on ports", "what services are exposed",
+        "show network exposure", "external listener check", "port listener review",
+        "network bind review",
     )):
         return {"tool_name": "check_listening_ports", "tool_args": {}}
 
     if any(phrase in lower for phrase in (
         "show failed services", "check failed services", "failed services", "which services failed",
+        "failed service review", "systemd failed units", "show broken services",
+        "service failure check", "review failed units", "any services down",
+        "failed daemon check",
+        "any failed services", "do i have failed services", "failed units",
+        "broken units", "systemd failures", "systemd unit failures",
+        "services not healthy", "services in failed state", "daemons failed",
+        "failed daemon list", "what services are broken", "which daemons failed",
+        "unit failure review", "service failure review", "systemd failed list",
+        "broken service list", "service health failures", "daemon health failures",
+        "show unhealthy services", "service failure inventory",
     )):
         return {"tool_name": "check_failed_services", "tool_args": {}}
 
     inspect_service_match = re.search(
-        r"\b(?:inspect|investigate|check)\s+(?:the\s+)?service\s+([a-z0-9][a-z0-9._-]*)\b",
+        r"\b(?:inspect|investigate|check)\s+(?:the\s+)?service\s+([a-z0-9][a-z0-9._-]*)\b|\b(?:inspect|investigate|check)\s+([a-z0-9][a-z0-9._-]*)\s+service\b",
         lower,
     )
     if inspect_service_match:
-        return {"tool_name": "inspect_service", "tool_args": {"service": inspect_service_match.group(1)}}
+        service_name = inspect_service_match.group(1) or inspect_service_match.group(2)
+        return {"tool_name": "inspect_service", "tool_args": {"service": service_name}}
+
+    service_status_match = re.search(
+        r"\b([a-z0-9][a-z0-9._-]*)\s+(?:service\s+status|health)\b|"
+        r"\bis\s+([a-z0-9][a-z0-9._-]*)\s+running\b|"
+        r"\b(?:check|inspect)\s+([a-z0-9][a-z0-9._-]*)\s+daemon\b|"
+        r"\bservice\s+status\s+for\s+([a-z0-9][a-z0-9._-]*)\b|"
+        r"\bstatus\s+of\s+service\s+([a-z0-9][a-z0-9._-]*)\b|"
+        r"\bis\s+service\s+([a-z0-9][a-z0-9._-]*)\s+healthy\b",
+        lower,
+    )
+    if service_status_match:
+        service_name = next((group for group in service_status_match.groups() if group), None)
+        if service_name and service_name not in {"my", "the", "this", "that"}:
+            if service_name == "docker":
+                return {"tool_name": "check_docker", "tool_args": {}}
+            return {"tool_name": "inspect_service", "tool_args": {"service": service_name}}
 
     if any(phrase in lower for phrase in (
-        "check auth failures", "show auth failures", "check login failures", "show login failures",
-        "check ssh failures", "show ssh failures", "failed logins",
+        "check auth events", "show auth events", "auth events", "show authentication events", "check authentication events", "check auth failures", "show auth failures", "check login failures", "show login failures", "login attempts",
+        "check ssh failures", "show ssh failures", "ssh failures", "failed logins",
+        "failed login review", "login failure check", "authentication pressure",
+        "any failed logins", "login failures today", "ssh login failures",
+        "authentication failures", "auth failure review", "check logins",
+        "login audit", "ssh auth review", "failed ssh attempts", "who failed login",
+        "failed authentication events", "password failure review", "auth pressure check",
+        "ssh brute force check", "bad login check", "show failed auth",
+        "review authentication logs", "login security review", "auth log quick check",
     )):
         return {"tool_name": "check_auth_events", "tool_args": {}}
 
@@ -1066,6 +1559,16 @@ def extract_operational_tool_request(query: str) -> dict | None:
     if any(phrase in lower for phrase in (
         "check for updates", "show updates", "show package updates", "check package updates",
         "show security updates", "check security updates", "what packages need updates",
+        "does this host need patching", "patch posture check", "package update status",
+        "security patch review", "available security fixes", "update exposure check",
+        "host patch status",
+        "do i need updates", "do i need security updates", "patch status",
+        "security patch status", "update status", "package patch status",
+        "missing patches", "missing security patches", "security fix status",
+        "package fix status", "host update status", "package maintenance status",
+        "show missing updates", "show missing patches", "available package fixes",
+        "available host updates", "package exposure", "security update exposure",
+        "update readiness", "patch readiness",
     )):
         return {"tool_name": "check_updates", "tool_args": {}}
 
@@ -1073,6 +1576,13 @@ def extract_operational_tool_request(query: str) -> dict | None:
         "assess host risk", "assess my host risk", "overall host risk",
         "what should i investigate on this host", "what is the biggest risk on this system",
         "summarize host risk", "show host risk",
+        "what is the biggest risk", "top risk", "primary concern", "main concern",
+        "what matters most", "what should i fix first", "rank my risks",
+        "prioritize host risks", "risk priority", "host risk summary",
+        "operator risk summary", "risk triage", "what is urgent",
+        "what needs attention first", "highest risk item", "risk ranking",
+        "show primary concern", "tell me the main issue", "what should i do first",
+        "risk-based next step",
     )):
         return {"tool_name": "assess_host_risk", "tool_args": {}}
 
@@ -1094,13 +1604,28 @@ def extract_operational_tool_request(query: str) -> dict | None:
         "scan my system for vulnerabilities", "scan the system for vulnerabilities",
         "show cves affecting this host", "show cves on this host", "check vulnerabilities",
         "check cves", "scan host vulnerabilities", "vulnerability scan",
+        "scan cves", "cve scan", "vulnerability review", "host cve review",
+        "runtime cve scan", "image vulnerability scan", "container vulnerability scan",
+        "security vulnerability scan", "check for cves", "find vulnerabilities",
+        "find cves", "local vulnerability review", "risk scan", "trivy scan",
+        "run trivy", "bounded cve scan", "package vulnerability scan",
+        "vulnerability posture", "scan runtime vulnerabilities", "host vuln scan",
     )):
         return {"tool_name": "scan_host_vulnerabilities", "tool_args": {}}
 
     if any(phrase in lower for phrase in (
-        "is anything suspicious", "is anything suspicious on this system", "check suspicious activity",
+        "is anything suspicious", "is anything suspicious on this system", "look for suspicious activity", "hunt suspicious activity", "security review", "is our system under threat", "is my system under threat", "check suspicious activity",
         "review recent security events", "inspect suspicious activity", "check for suspicious activity",
-        "is my system suspicious",
+        "is my system suspicious", "anything suspicious", "look for compromise indicators",
+        "check suspicious behavior", "threat review", "security posture check",
+        "investigate suspicious activity",
+        "am i compromised", "do we look compromised", "compromise check",
+        "intrusion check", "threat hunt", "quick threat hunt", "incident check",
+        "breach check", "check for malware indicators", "look for persistence",
+        "review suspicious signals", "security anomaly check",
+        "detect suspicious indicators", "is this box compromised",
+        "attack indicator review", "show security anomalies", "look for backdoors",
+        "host compromise review", "unexpected activity check", "run local threat review",
     )):
         return {"tool_name": "check_suspicious_activity", "tool_args": {}}
 
@@ -1115,13 +1640,15 @@ def extract_operational_tool_request(query: str) -> dict | None:
         }
 
     inspect_process_match = re.search(
-        r"\b(?:inspect|investigate|check)\s+(?:the\s+)?process\s+(\d+)\b",
+        r"\b(?:inspect|investigate|check|show)\s+(?:the\s+)?(?:process|pid)\s+(\d+)\b|"
+        r"\b(?:process|pid)\s+(\d+)\s+details\b",
         lower,
     )
     if inspect_process_match:
+        pid_value = inspect_process_match.group(1) or inspect_process_match.group(2)
         return {
             "tool_name": "inspect_process",
-            "tool_args": {"pid": int(inspect_process_match.group(1))},
+            "tool_args": {"pid": int(pid_value)},
         }
 
     if any(phrase in lower for phrase in ("show pod status", "check pod status", "list pods", "get pods", "show pods")):
@@ -1171,6 +1698,8 @@ def extract_operational_clarification(query: str) -> str | None:
     q = _normalize_text(query).strip().lower()
     if not q:
         return None
+    q = re.sub(r"^(?:ava please|please|can you|could you|ava|quickly)\s+", "", q).strip()
+    q = re.sub(r"\s+please$", "", q).strip(" ?!.")
 
     if re.search(r"\bscale\s+(?:the\s+)?deployment\s+to\s+\d+\s+replicas?\b", q):
         return "I can queue a deployment scale action, but I need the deployment name. Example: scale deployment nginx to 5 replicas."
@@ -1178,26 +1707,35 @@ def extract_operational_clarification(query: str) -> str | None:
     if re.search(r"\brollback\s+(?:my\s+|the\s+)?deployment\b", q):
         return "I can queue a deployment rollback, but I need the deployment name. Example: rollback deployment nginx."
 
-    if "restart my service" in q or "restart the service" in q:
+    if q in {"restart service", "restart the service"} or "restart my service" in q or "restart the service" in q:
         return "I can queue a service restart, but I need the service name. Example: restart service docker."
 
     if q in {"restart my pod", "restart the pod", "restart deployment"}:
         return "I can queue a deployment restart, but I need the deployment name. Example: restart the pod nginx."
 
-    if q in {"show me pod logs", "show pod logs", "get pod logs", "check pod logs"}:
+    if q in {"show me pod logs", "show my pod logs", "show pod logs", "get pod logs", "check pod logs", "show logs for pod", "tail pod logs"}:
         return "I can fetch pod logs, but I need the pod name. Example: show me pod logs for nginx-7d8b49557c-abc12."
 
-    if q in {"check my service", "check service", "show my service", "show service"}:
-        return "I can check a service, but I need the service name. Example: check service api-gateway."
+    if q in {"check my service", "check service", "show my service", "show service", "inspect my service", "check service status", "service health"}:
+        return "I can check a service, but I need the specific service name. Example: check service api-gateway."
 
     if q in {"restart my deployment", "restart the deployment"}:
         return "I can queue a deployment restart, but I need the deployment name. Example: restart deployment nginx."
 
-    if q in {"stop suspicious process", "stop process", "kill process", "terminate process"}:
+    if q in {"stop suspicious process", "stop process", "kill process", "terminate process", "inspect process", "check process", "stop that process", "inspect pid"}:
         return "I can queue a process stop action, but I need the PID. Example: stop suspicious process 4321."
 
-    if q in {"patch package", "update package", "upgrade package"}:
+    if q in {"patch package", "update package", "upgrade package", "patch this package"}:
         return "I can queue a package patch action, but I need the package name. Example: patch package openssl."
+
+    if q in {"describe pod"}:
+        return "I can describe a pod, but I need the pod name. Example: describe pod nginx-7d8b49557c-abc12."
+
+    if q in {"scale this deployment"}:
+        return "I can queue a deployment scale action, but I need the deployment name. Example: scale deployment nginx to 5 replicas."
+
+    if q in {"rollback this deployment"}:
+        return "I can queue a deployment rollback, but I need the deployment name. Example: rollback deployment nginx."
 
     if "show me the result" in q and "restart" in q and not re.search(r"\brestart\b.+\b(?:docker|service|pod|deployment)\s+[a-z0-9._-]+\b", q):
         return "I can queue the restart, but I need the exact target first. Example: restart service docker."
@@ -1890,6 +2428,7 @@ def _resolve_controlled_query(query, *, controlled_route=None, prior_messages=No
             "response": direct_action["response"],
             "confidence": direct_action.get("confidence", "high"),
             "sources_used": 0,
+            "metadata": direct_action.get("metadata", {}),
         }
 
     if controlled_route.intent == "troubleshooting":
@@ -2097,7 +2636,7 @@ def _finalize_resolved_payload(query, resolved, elapsed):
         time_taken=f"{elapsed:.2f}s",
         **{
             key: resolved[key]
-            for key in ("healing", "action_taken", "graph_used", "steps_run", "react_trace")
+            for key in ("healing", "action_taken", "graph_used", "steps_run", "react_trace", "metadata")
             if key in resolved
         }
     )
@@ -2191,7 +2730,18 @@ def _extract_query_entities(query):
 
 def _diagram_entities_from_text(*texts):
     combined = "\n".join(_normalize_text(text) for text in texts if text)
-    return _extract_query_entities(combined)
+    entities = _extract_query_entities(combined)
+    if entities:
+        return entities
+    fallback = _extract_diagram_entities(combined)
+    if fallback:
+        return fallback
+    q = combined.lower()
+    if _is_ava_self_architecture_query(q):
+        return ["ava-agent", "redis", "postgresql", "docker"]
+    if "web" in q and ("db" in q or "database" in q) and "cache" in q:
+        return ["nginx", "postgres", "redis"]
+    return []
 
 _KNOWN_DIAGRAM_TECH = [
     "zuul", "kafka", "cassandra", "evcache", "eureka", "ribbon",
@@ -3094,10 +3644,26 @@ def auth_login():
         password = data.get("password", "")
 
         if not username or not password:
+            _audit_security_notification(
+                "auth_failure",
+                "missing login credentials",
+                "Login request omitted username or password.",
+                risk="medium",
+                threat_type="invalid_login",
+                decision="blocked",
+            )
             return jsonify({"error": "username and password are required"}), 400
 
         user = verify_credentials(username, password)
         if not user:
+            _audit_security_notification(
+                "auth_failure",
+                f"failed login for user '{username}'",
+                "Invalid username/password pair submitted to /auth/login.",
+                risk="medium",
+                threat_type="invalid_login",
+                decision="blocked",
+            )
             return jsonify({"error": "Invalid credentials"}), 401
 
         token = make_token(user["username"], user["role"])
@@ -3113,6 +3679,14 @@ def auth_login():
 
     except Exception as e:
         logger.error(f"[Auth] Login error: {e}")
+        _audit_security_notification(
+            "auth_failure",
+            "malformed login request",
+            "Login request could not be parsed or processed.",
+            risk="medium",
+            threat_type="malformed_login",
+            decision="blocked",
+        )
         return jsonify({"error": "Login failed"}), 500
 
 
@@ -3236,7 +3810,9 @@ def is_meta_question(query):
 
 def get_ava_introduction():
     """Return AVA's self-introduction"""
-    return """I'm **AVA** (Automated Virtual Assistant) - a specialized local DevOps AI agent running entirely on your machine.
+    chunk_count = int(STATS.get('total_chunks') or 0)
+    chunk_count_label = f"{chunk_count:,}"
+    return f"""I'm **AVA** (Automated Virtual Assistant) - a specialized local DevOps AI agent running entirely on your machine.
 
 ### What Makes Me Different
 
@@ -3247,7 +3823,7 @@ def get_ava_introduction():
 - No telemetry or external API calls
 
 **📚 Specialized Knowledge Base**
-- **3,885 curated chunks** from 5 GitHub repositories:
+- **{chunk_count_label} curated chunks** from 5 GitHub repositories:
   - DevOps Exercises (real-world Q&A scenarios)
   - AWS DevOps Zero to Hero
   - Jenkins Zero to Hero  
@@ -3367,6 +3943,14 @@ def ask():
                 query,
                 "Multiple destructive actions in one request are blocked. Submit one action at a time for review.",
                 "compound_destructive_request",
+            )
+            _audit_security_notification(
+                "blocked_destructive_request",
+                _normalize_user_query(query),
+                "Compound destructive request blocked before execution.",
+                risk="critical",
+                threat_type="compound_destructive_request",
+                decision="blocked",
             )
             save_history({
                 'timestamp': datetime.now().isoformat(),
@@ -3635,11 +4219,27 @@ def webhook():
     # Auth
     if not WEBHOOK_SECRET:
         logger.warning("[Webhook] Rejected request because WEBHOOK_SECRET is not configured")
+        _audit_security_notification(
+            "webhook_rejected",
+            "webhook rejected while disabled",
+            "Webhook endpoint was called while WEBHOOK_SECRET is not configured.",
+            risk="medium",
+            threat_type="unauthorized_webhook",
+            decision="blocked",
+        )
         return jsonify({"status": "error", "message": "Webhook endpoint is disabled"}), 503
 
     provided_secret = request.headers.get("X-Webhook-Secret", "")
     if provided_secret != WEBHOOK_SECRET:
         logger.warning(f"[Webhook] Invalid secret from {request.remote_addr}")
+        _audit_security_notification(
+            "webhook_rejected",
+            "webhook rejected for invalid secret",
+            "Webhook endpoint received an invalid X-Webhook-Secret value.",
+            risk="high",
+            threat_type="unauthorized_webhook",
+            decision="blocked",
+        )
         return jsonify({"status": "error", "message": "Unauthorized"}), 401
 
     try:
@@ -3890,55 +4490,6 @@ def get_history():
 def get_stats():
     return jsonify(STATS)
 
-@app.route('/execute_approved', methods=['POST'])
-@require_admin
-@limiter.limit("10 per minute")
-def execute_approved_route():
-    """
-    Execute a command that was previously queued for approval.
-    Called from the UI approval panel.
-
-    Body: {"approval_id": "abc123"}
-    """
-    try:
-        data        = request.json
-        approval_id = data.get('approval_id', '').strip()
-
-        if not approval_id:
-            return jsonify({'error': 'approval_id is required'}), 400
-
-        logger.info(f"[Approval] Executing approved command: {approval_id}")
-        _t0    = time.time()
-        result = execute_approved_command(approval_id)
-        _dur   = time.time() - _t0
-
-        report_approved_execution(
-            approval_id  = approval_id,
-            result       = result,
-            triggered_by = get_jwt_identity(),
-            ip_address   = request.remote_addr,
-            duration     = _dur,
-        )
-
-        if result.get('status') == 'success':
-            return jsonify({
-                'status':  'executed',
-                'command': result.get('command_repr', ''),
-                'output':  result.get('output', ''),
-                'mode':    result.get('mode', ''),
-                'risk':    result.get('risk', ''),
-            })
-        else:
-            return jsonify({
-                'status': 'error',
-                'error':  result.get('error') or result.get('reason') or 'Unknown error',
-            }), 400
-
-    except Exception as e:
-        logger.error(f"Error in execute_approved: {e}")
-        return _api_error("Approved command execution failed")
-
-
 @app.route('/tools', methods=['GET'])
 @jwt_required()
 def list_tools_route():
@@ -4135,6 +4686,10 @@ def rate_limit_status():
             "default":           "30 per minute",
             "/ask":              "20 per minute",
             "/tools/<n>/run":    "10 per minute",
+            "/approvals/pending": "30 per minute",
+            "/approvals/<id>/approve": "20 per minute",
+            "/approvals/<id>/reject": "20 per minute",
+            "/approvals/<id>/execute": "10 per minute",
             "/execute_approved": "10 per minute",
             "/react/run":        "5 per minute",
             "/auth/login":       "10 per minute (per IP, unauthenticated)",
@@ -4328,13 +4883,26 @@ def get_security_stats_route():
             if datetime.fromisoformat(entry['timestamp']) > cutoff
         ]
         
+        notification_events = {
+            "auth_failure",
+            "unauthorized_access",
+            "webhook_rejected",
+            "blocked_destructive_request",
+        }
+        blocked_events = {"blocked", "blocked_destructive_request"}
+
         stats = {
             'total_commands': len(recent),
             'executed': len([e for e in recent if e['event_type'] == 'executed']),
-            'blocked': len([e for e in recent if e['event_type'] == 'blocked']),
+            'blocked': len([e for e in recent if e.get('event_type') in blocked_events]),
             'pending': len(get_pending()),
             'high_risk': len([e for e in recent if e.get('risk_analysis', {}).get('risk') in ['high', 'critical']]),
             'threats_detected': sum(len(e.get('threats', [])) for e in recent),
+            'notifications': len([e for e in recent if e.get('event_type') in notification_events]),
+            'auth_failures': len([e for e in recent if e.get('event_type') == 'auth_failure']),
+            'unauthorized_access': len([e for e in recent if e.get('event_type') == 'unauthorized_access']),
+            'webhook_rejected': len([e for e in recent if e.get('event_type') == 'webhook_rejected']),
+            'blocked_destructive': len([e for e in recent if e.get('event_type') == 'blocked_destructive_request']),
             'audit_integrity': verify_audit_log_integrity(audit_log),
         }
         
@@ -4499,13 +5067,13 @@ HTML_TEMPLATE = r'''
             margin-bottom: 8px;
             white-space: normal;
             line-height: 1.45;
-            background: rgba(255, 255, 255, 0.02);
-            border: 1px solid rgba(255, 255, 255, 0.04);
+            background: var(--card-bg);
+            border: 1px solid var(--border-soft);
             border-radius: 14px;
         }
 
         .thread-query {
-            color: #ececec;
+            color: var(--text-main);
             font-size: 13px;
             display: -webkit-box;
             -webkit-line-clamp: 2;
@@ -4527,15 +5095,15 @@ HTML_TEMPLATE = r'''
             top: 0;
             width: 100%;
             height: 100%;
-            background: rgba(0, 0, 0, 0.8);
+            background: var(--modal-scrim);
             animation: fadeIn 0.2s;
         }
         
         .modal-content {
-            background: #1f1f1f;
+            background: var(--modal-bg);
             margin: 5% auto;
             padding: 0;
-            border: 1px solid #3a3a3a;
+            border: 1px solid var(--border-soft);
             border-radius: 12px;
             width: 90%;
             max-width: 700px;
@@ -4545,7 +5113,7 @@ HTML_TEMPLATE = r'''
         }
 
         .modal.side-panel {
-            background: rgba(0, 0, 0, 0.64);
+            background: var(--modal-scrim);
         }
 
         .modal.side-panel .modal-content {
@@ -4570,7 +5138,7 @@ HTML_TEMPLATE = r'''
         
         .modal-header {
             padding: 20px 24px;
-            border-bottom: 1px solid #2a2a2a;
+            border-bottom: 1px solid var(--border-soft);
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -4584,7 +5152,7 @@ HTML_TEMPLATE = r'''
         .modal-close {
             background: none;
             border: none;
-            color: #888;
+            color: var(--text-faint);
             font-size: 24px;
             cursor: pointer;
             padding: 0;
@@ -4598,8 +5166,8 @@ HTML_TEMPLATE = r'''
         }
         
         .modal-close:hover {
-            background: #2a2a2a;
-            color: #fff;
+            background: var(--card-bg-hover);
+            color: var(--text-main);
         }
         
         .modal-body {
@@ -4610,43 +5178,43 @@ HTML_TEMPLATE = r'''
         
         .history-item {
             padding: 16px;
-            background: #242424;
+            background: var(--card-bg);
             border-radius: 8px;
             margin-bottom: 12px;
-            border: 1px solid #2a2a2a;
+            border: 1px solid var(--border-soft);
         }
         
         .history-query {
             font-weight: 500;
             margin-bottom: 8px;
-            color: #fff;
+            color: var(--text-main);
         }
         
         .history-meta {
             font-size: 12px;
-            color: #888;
+            color: var(--text-faint);
             display: flex;
             gap: 12px;
         }
         
         .stat-card {
             padding: 16px;
-            background: #242424;
+            background: var(--card-bg);
             border-radius: 8px;
             margin-bottom: 12px;
-            border: 1px solid #2a2a2a;
+            border: 1px solid var(--border-soft);
         }
         
         .stat-label {
             font-size: 12px;
-            color: #888;
+            color: var(--text-faint);
             margin-bottom: 4px;
         }
         
         .stat-value {
             font-size: 24px;
             font-weight: 600;
-            color: #667eea;
+            color: var(--accent);
         }
         
         /* Main Content */
@@ -4654,12 +5222,12 @@ HTML_TEMPLATE = r'''
             flex: 1;
             display: flex;
             flex-direction: column;
-            background: #1a1a1a;
+            background: var(--main-bg);
         }
         
         .top-bar {
             padding: 16px 24px;
-            border-bottom: 1px solid #2a2a2a;
+            border-bottom: 1px solid var(--border-soft);
             display: flex;
             align-items: center;
             justify-content: space-between;
@@ -4669,7 +5237,7 @@ HTML_TEMPLATE = r'''
             display: flex;
             gap: 16px;
             font-size: 13px;
-            color: #888;
+            color: var(--text-faint);
         }
         
         .stat-item {
@@ -5111,12 +5679,62 @@ HTML_TEMPLATE = r'''
             --success: #63d297;
             --success-soft: rgba(99, 210, 151, 0.12);
             --shadow-shell: 0 18px 50px rgba(0, 0, 0, 0.28);
+            --page-bg: radial-gradient(circle at top, rgba(124, 140, 255, 0.08), transparent 26%),
+                       linear-gradient(180deg, #171717 0%, #121212 100%);
+            --sidebar-bg: rgba(20, 20, 20, 0.94);
+            --main-bg: rgba(18, 18, 18, 0.92);
+            --bar-bg: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0));
+            --card-bg: rgba(255, 255, 255, 0.03);
+            --card-bg-hover: rgba(255, 255, 255, 0.05);
+            --field-bg: rgba(41, 41, 41, 0.88);
+            --modal-bg: rgba(28, 28, 28, 0.96);
+            --modal-scrim: rgba(0, 0, 0, 0.64);
+            --footer-bg: linear-gradient(180deg, rgba(20, 20, 20, 0), rgba(20, 20, 20, 0.92) 18%, rgba(20, 20, 20, 1) 100%);
+            --terminal-bg: #111;
+            --login-overlay-bg: rgba(10, 10, 20, 0.97);
+            --login-card-bg: #12121f;
+            --login-field-bg: #1a1a2e;
+        }
+
+        :root[data-theme="light"] {
+            --bg-app: #f6f1e8;
+            --bg-panel: #fffaf2;
+            --bg-panel-2: #fff6e8;
+            --bg-panel-3: #f3eadc;
+            --bg-panel-4: #ece1d2;
+            --border-soft: #ded2bf;
+            --border-strong: #cbbca6;
+            --text-main: #1e2527;
+            --text-muted: #5f6a6d;
+            --text-faint: #859094;
+            --accent: #2f6f73;
+            --accent-soft: rgba(47, 111, 115, 0.12);
+            --danger: #b94444;
+            --danger-soft: rgba(185, 68, 68, 0.10);
+            --warning: #9c6b1f;
+            --warning-soft: rgba(156, 107, 31, 0.12);
+            --success: #277a4f;
+            --success-soft: rgba(39, 122, 79, 0.12);
+            --shadow-shell: 0 18px 48px rgba(64, 45, 24, 0.14);
+            --page-bg: radial-gradient(circle at top left, rgba(47, 111, 115, 0.16), transparent 30%),
+                       linear-gradient(180deg, #fbf5eb 0%, #efe6d8 100%);
+            --sidebar-bg: rgba(255, 249, 239, 0.92);
+            --main-bg: rgba(255, 252, 246, 0.93);
+            --bar-bg: linear-gradient(180deg, rgba(47, 111, 115, 0.06), rgba(255, 255, 255, 0));
+            --card-bg: rgba(47, 111, 115, 0.045);
+            --card-bg-hover: rgba(47, 111, 115, 0.08);
+            --field-bg: rgba(255, 252, 246, 0.94);
+            --modal-bg: rgba(255, 252, 246, 0.98);
+            --modal-scrim: rgba(44, 36, 27, 0.36);
+            --footer-bg: linear-gradient(180deg, rgba(255, 249, 239, 0), rgba(255, 249, 239, 0.92) 18%, rgba(255, 249, 239, 1) 100%);
+            --terminal-bg: #f5efe5;
+            --login-overlay-bg: rgba(246, 241, 232, 0.97);
+            --login-card-bg: #fffaf2;
+            --login-field-bg: #fff6e8;
         }
 
         body {
-            background:
-                radial-gradient(circle at top, rgba(124, 140, 255, 0.08), transparent 26%),
-                linear-gradient(180deg, #171717 0%, #121212 100%);
+            background: var(--page-bg);
             color: var(--text-main);
         }
 
@@ -5135,8 +5753,8 @@ HTML_TEMPLATE = r'''
             max-height: calc(100vh - 32px);
             min-height: 0;
             padding: 16px 14px 148px;
-            background: rgba(20, 20, 20, 0.94);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: var(--sidebar-bg);
+            border: 1px solid var(--border-soft);
             border-radius: 22px;
             box-shadow: var(--shadow-shell);
             backdrop-filter: blur(12px);
@@ -5166,14 +5784,14 @@ HTML_TEMPLATE = r'''
             background: transparent;
             border: 1px solid transparent;
             border-radius: 14px;
-            color: #d5d5d5;
+            color: var(--text-main);
             font-size: 15px;
             font-weight: 500;
         }
 
         .sidebar-btn:hover {
-            background: rgba(255, 255, 255, 0.05);
-            border-color: rgba(255, 255, 255, 0.06);
+            background: var(--card-bg-hover);
+            border-color: var(--border-soft);
         }
 
         .nav-icon {
@@ -5181,7 +5799,7 @@ HTML_TEMPLATE = r'''
             display: inline-flex;
             align-items: center;
             justify-content: center;
-            color: #c8c8c8;
+            color: var(--text-muted);
             font-size: 15px;
         }
 
@@ -5218,7 +5836,7 @@ HTML_TEMPLATE = r'''
         }
 
         .profile-name {
-            color: #f3f3f3;
+            color: var(--text-main);
             font-size: 13px;
             font-weight: 600;
             white-space: nowrap;
@@ -5231,15 +5849,15 @@ HTML_TEMPLATE = r'''
             margin-top: 4px;
             padding: 3px 8px;
             border-radius: 999px;
-            background: rgba(255, 255, 255, 0.06);
-            color: #c5ccff;
+            background: var(--card-bg);
+            color: var(--accent);
             font-size: 11px;
         }
 
         .profile-power {
             background: none;
             border: none;
-            color: #7f7f7f;
+            color: var(--text-faint);
             cursor: pointer;
             font-size: 15px;
             padding: 4px;
@@ -5255,8 +5873,8 @@ HTML_TEMPLATE = r'''
             margin-top: 18px;
             padding: 14px;
             border-radius: 18px;
-            background: rgba(255, 255, 255, 0.025);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: var(--card-bg);
+            border: 1px solid var(--border-soft);
             flex-shrink: 0;
         }
 
@@ -5279,19 +5897,19 @@ HTML_TEMPLATE = r'''
             justify-content: space-between;
             align-items: center;
             font-size: 13px;
-            color: #d8d8d8;
+            color: var(--text-muted);
         }
 
         .quick-stat-value {
-            color: #f0f0f0;
+            color: var(--text-main);
             font-weight: 600;
         }
 
         .main-content {
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-soft);
             border-radius: 26px;
             overflow: hidden;
-            background: rgba(18, 18, 18, 0.92);
+            background: var(--main-bg);
             box-shadow: var(--shadow-shell);
             backdrop-filter: blur(10px);
         }
@@ -5302,8 +5920,8 @@ HTML_TEMPLATE = r'''
             justify-content: space-between;
             gap: 16px;
             padding: 16px 22px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-            background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0));
+            border-bottom: 1px solid var(--border-soft);
+            background: var(--bar-bg);
         }
 
         .mobile-topbar {
@@ -5311,8 +5929,8 @@ HTML_TEMPLATE = r'''
             align-items: center;
             justify-content: space-between;
             padding: 14px 16px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
-            background: rgba(18, 18, 18, 0.96);
+            border-bottom: 1px solid var(--border-soft);
+            background: var(--main-bg);
         }
 
         .mobile-topbar-title {
@@ -5324,9 +5942,9 @@ HTML_TEMPLATE = r'''
             width: 38px;
             height: 38px;
             border-radius: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.06);
-            background: rgba(255, 255, 255, 0.03);
-            color: #efefef;
+            border: 1px solid var(--border-soft);
+            background: var(--card-bg);
+            color: var(--text-main);
             cursor: pointer;
         }
 
@@ -5334,7 +5952,7 @@ HTML_TEMPLATE = r'''
             display: none;
             position: fixed;
             inset: 0;
-            background: rgba(0, 0, 0, 0.56);
+            background: var(--modal-scrim);
             z-index: 999;
         }
 
@@ -5365,15 +5983,15 @@ HTML_TEMPLATE = r'''
         .workspace-pill {
             padding: 6px 10px;
             border-radius: 999px;
-            border: 1px solid rgba(255, 255, 255, 0.07);
-            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-soft);
+            background: var(--card-bg);
             color: var(--text-muted);
             font-size: 12px;
             white-space: nowrap;
         }
 
         .workspace-pill.primary {
-            color: #dfe3ff;
+            color: var(--accent);
             background: var(--accent-soft);
             border-color: rgba(124, 140, 255, 0.28);
         }
@@ -5426,16 +6044,211 @@ HTML_TEMPLATE = r'''
             margin-top: 16px;
         }
 
+        .operator-surface {
+            width: 100%;
+            max-width: 920px;
+            margin-top: 22px;
+            display: grid;
+            grid-template-columns: minmax(0, 1.2fr) minmax(260px, 0.8fr);
+            gap: 14px;
+        }
+
+        .operator-panel {
+            border: 1px solid var(--border-soft);
+            background: var(--card-bg);
+            border-radius: 22px;
+            padding: 18px;
+        }
+
+        .operator-panel-title {
+            font-size: 13px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--text-faint);
+            margin-bottom: 12px;
+        }
+
+        .operator-actions {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .operator-action {
+            appearance: none;
+            border: 1px solid var(--border-soft);
+            background: var(--bg-panel-2);
+            color: var(--text-main);
+            border-radius: 16px;
+            padding: 13px 14px;
+            text-align: left;
+            cursor: pointer;
+            transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+        }
+
+        .operator-action:hover {
+            background: var(--card-bg-hover);
+            border-color: var(--border-strong);
+            transform: translateY(-1px);
+        }
+
+        .operator-action:focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        .operator-action-kicker {
+            display: inline-flex;
+            align-items: center;
+            margin-bottom: 10px;
+            padding: 4px 8px;
+            border-radius: 999px;
+            background: var(--accent-soft);
+            color: var(--accent);
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .operator-action-title {
+            display: block;
+            font-size: 14px;
+            font-weight: 650;
+            margin-bottom: 4px;
+        }
+
+        .operator-action-copy {
+            display: block;
+            color: var(--text-faint);
+            font-size: 12px;
+            line-height: 1.45;
+        }
+
+        .operator-action-meta {
+            display: block;
+            margin-top: 10px;
+            color: var(--success);
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+        .operator-action-meta.warn {
+            color: var(--warning);
+        }
+
+        .operator-state-list {
+            display: grid;
+            gap: 10px;
+        }
+
+        .operator-state {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 11px 12px;
+            border-radius: 14px;
+            background: var(--bg-panel-2);
+            border: 1px solid var(--border-soft);
+        }
+
+        .operator-state-label {
+            color: var(--text-muted);
+            font-size: 13px;
+        }
+
+        .operator-state-value {
+            color: var(--text-main);
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        .operator-state-value.warn {
+            color: var(--warning);
+        }
+
+        .operator-state-value.danger {
+            color: var(--danger);
+        }
+
+        .operator-note {
+            margin-top: 12px;
+            color: var(--text-faint);
+            font-size: 12px;
+            line-height: 1.55;
+        }
+
+        .review-summary {
+            padding: 16px;
+            border-radius: 18px;
+            background: var(--bg-panel-2);
+            border: 1px solid var(--border-soft);
+        }
+
+        .review-kicker {
+            color: var(--text-faint);
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+
+        .review-title {
+            color: var(--text-main);
+            font-size: 20px;
+            font-weight: 750;
+            letter-spacing: -0.03em;
+            margin-bottom: 6px;
+        }
+
+        .review-copy {
+            color: var(--text-muted);
+            font-size: 13px;
+            line-height: 1.55;
+        }
+
+        .review-action {
+            appearance: none;
+            width: 100%;
+            margin-top: 14px;
+            padding: 10px 12px;
+            border: 1px solid var(--border-soft);
+            border-radius: 999px;
+            background: var(--accent-soft);
+            color: var(--accent);
+            font-size: 13px;
+            font-weight: 750;
+            cursor: pointer;
+        }
+
+        .review-action:hover {
+            border-color: var(--border-strong);
+            background: var(--card-bg-hover);
+        }
+
+        .prompt-section-title {
+            width: 100%;
+            margin: 22px 0 0;
+            color: var(--text-faint);
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
         .example-prompt {
-            background: rgba(255, 255, 255, 0.025);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: var(--card-bg);
+            border: 1px solid var(--border-soft);
             border-radius: 18px;
             padding: 16px 18px;
         }
 
         .example-prompt:hover {
-            background: rgba(255, 255, 255, 0.04);
-            border-color: rgba(255, 255, 255, 0.08);
+            background: var(--card-bg-hover);
+            border-color: var(--border-strong);
             transform: translateY(-1px);
         }
 
@@ -5474,7 +6287,7 @@ HTML_TEMPLATE = r'''
         }
 
         .message-text {
-            color: #dfdfdf;
+            color: var(--text-main);
             line-height: 1.82;
             font-size: 15px;
         }
@@ -5483,9 +6296,9 @@ HTML_TEMPLATE = r'''
             display: inline-block;
             padding: 12px 16px;
             border-radius: 20px;
-            background: rgba(255, 255, 255, 0.04);
-            border: 1px solid rgba(255, 255, 255, 0.06);
-            color: #f6f6f6;
+            background: var(--card-bg);
+            border: 1px solid var(--border-soft);
+            color: var(--text-main);
             font-weight: 400;
         }
 
@@ -5496,13 +6309,13 @@ HTML_TEMPLATE = r'''
         .action-btn {
             padding: 7px 12px;
             border-radius: 999px;
-            background: rgba(255, 255, 255, 0.03);
-            border-color: rgba(255, 255, 255, 0.06);
+            background: var(--card-bg);
+            border-color: var(--border-soft);
             color: var(--text-muted);
         }
 
         .action-btn:hover {
-            background: rgba(255, 255, 255, 0.06);
+            background: var(--card-bg-hover);
             color: var(--text-main);
         }
 
@@ -5521,7 +6334,7 @@ HTML_TEMPLATE = r'''
         }
 
         .status-card-copy {
-            color: #d9d9d9;
+            color: var(--text-muted);
             font-size: 14px;
             line-height: 1.7;
         }
@@ -5539,8 +6352,8 @@ HTML_TEMPLATE = r'''
             gap: 6px;
             padding: 5px 9px;
             border-radius: 999px;
-            border: 1px solid rgba(255, 255, 255, 0.06);
-            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-soft);
+            background: var(--card-bg);
             color: var(--text-muted);
             font-size: 12px;
         }
@@ -5564,14 +6377,14 @@ HTML_TEMPLATE = r'''
         }
 
         .status-card.executed {
-            background: rgba(255, 255, 255, 0.02);
-            border-color: rgba(255, 255, 255, 0.07);
+            background: var(--card-bg);
+            border-color: var(--border-soft);
         }
 
         .terminal-block {
             margin-top: 10px;
-            background: #111;
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: var(--terminal-bg);
+            border: 1px solid var(--border-soft);
             border-radius: 16px;
             overflow: hidden;
         }
@@ -5580,8 +6393,8 @@ HTML_TEMPLATE = r'''
             padding: 10px 14px;
             font-size: 12px;
             color: var(--text-faint);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-            background: rgba(255, 255, 255, 0.02);
+            border-bottom: 1px solid var(--border-soft);
+            background: var(--card-bg);
         }
 
         .findings-block {
@@ -5591,9 +6404,9 @@ HTML_TEMPLATE = r'''
         }
 
         .findings-panel {
-            border: 1px solid rgba(255, 255, 255, 0.08);
+            border: 1px solid var(--border-soft);
             border-radius: 14px;
-            background: rgba(255, 255, 255, 0.03);
+            background: var(--card-bg);
             overflow: hidden;
         }
 
@@ -5602,8 +6415,8 @@ HTML_TEMPLATE = r'''
             font-size: 12px;
             letter-spacing: 0.08em;
             text-transform: uppercase;
-            color: rgba(255, 255, 255, 0.58);
-            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            color: var(--text-faint);
+            border-bottom: 1px solid var(--border-soft);
         }
 
         .findings-list {
@@ -5615,23 +6428,23 @@ HTML_TEMPLATE = r'''
         }
 
         .findings-item {
-            color: #e6e6e6;
+            color: var(--text-main);
             font-size: 13px;
             line-height: 1.55;
         }
 
         .findings-item-title {
-            color: #ffffff;
+            color: var(--text-main);
             font-weight: 600;
             margin-bottom: 2px;
         }
 
         .findings-item-copy {
-            color: rgba(255, 255, 255, 0.74);
+            color: var(--text-muted);
         }
 
         .findings-item-subcopy {
-            color: rgba(255, 255, 255, 0.56);
+            color: var(--text-faint);
             margin-top: 4px;
             font-size: 12px;
         }
@@ -5682,7 +6495,7 @@ HTML_TEMPLATE = r'''
 
         .input-container {
             padding: 18px 24px 22px;
-            background: linear-gradient(180deg, rgba(18, 18, 18, 0), rgba(18, 18, 18, 0.96) 18%);
+            background: linear-gradient(180deg, transparent, var(--main-bg) 18%);
         }
 
         .input-wrapper {
@@ -5692,8 +6505,8 @@ HTML_TEMPLATE = r'''
         .input-box {
             padding: 16px 18px 12px;
             border-radius: 24px;
-            border-color: rgba(255, 255, 255, 0.08);
-            background: rgba(41, 41, 41, 0.88);
+            border-color: var(--border-soft);
+            background: var(--field-bg);
             min-height: 92px;
             flex-wrap: wrap;
             gap: 10px;
@@ -5733,8 +6546,8 @@ HTML_TEMPLATE = r'''
         .composer-pill {
             padding: 5px 10px;
             border-radius: 999px;
-            border: 1px solid rgba(255, 255, 255, 0.06);
-            background: rgba(255, 255, 255, 0.025);
+            border: 1px solid var(--border-soft);
+            background: var(--card-bg);
             color: var(--text-faint);
             font-size: 12px;
         }
@@ -5745,8 +6558,8 @@ HTML_TEMPLATE = r'''
             right: 14px;
             bottom: 12px;
             padding-top: 12px;
-            border-top: 1px solid rgba(255, 255, 255, 0.06);
-            background: linear-gradient(180deg, rgba(20, 20, 20, 0), rgba(20, 20, 20, 0.92) 18%, rgba(20, 20, 20, 1) 100%);
+            border-top: 1px solid var(--border-soft);
+            background: var(--footer-bg);
             z-index: 2;
         }
 
@@ -5756,14 +6569,14 @@ HTML_TEMPLATE = r'''
             gap: 10px;
             padding: 10px 12px;
             border-radius: 16px;
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid rgba(255, 255, 255, 0.05);
+            background: var(--card-bg);
+            border: 1px solid var(--border-soft);
             cursor: pointer;
             min-height: 56px;
         }
 
         .sidebar-footer-card:hover {
-            background: rgba(255, 255, 255, 0.05);
+            background: var(--card-bg-hover);
         }
 
         .sidebar-footer-text {
@@ -5773,7 +6586,7 @@ HTML_TEMPLATE = r'''
         }
 
         .sidebar-footer-name {
-            color: #f3f3f3;
+            color: var(--text-main);
             font-size: 13px;
             font-weight: 600;
             white-space: nowrap;
@@ -5796,8 +6609,8 @@ HTML_TEMPLATE = r'''
         }
 
         .modal-content {
-            background: rgba(28, 28, 28, 0.96);
-            border-color: rgba(255, 255, 255, 0.08);
+            background: var(--modal-bg);
+            border-color: var(--border-soft);
             border-radius: 24px;
         }
 
@@ -5805,9 +6618,129 @@ HTML_TEMPLATE = r'''
         .stat-card,
         .security-stat,
         .audit-entry {
-            background: rgba(255, 255, 255, 0.03);
-            border: 1px solid rgba(255, 255, 255, 0.06);
+            background: var(--card-bg);
+            border: 1px solid var(--border-soft);
             border-radius: 16px;
+        }
+
+        .theme-card {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 18px;
+        }
+
+        .theme-label {
+            color: var(--text-main);
+            font-size: 13px;
+            margin-top: 4px;
+        }
+
+        .theme-switch {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            width: 74px;
+            height: 34px;
+            padding: 0;
+            border: 1px solid var(--border-soft);
+            border-radius: 999px;
+            background: var(--bg-panel-3);
+            cursor: pointer;
+            transition: background 0.2s ease, border-color 0.2s ease;
+        }
+
+        .theme-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .theme-slider {
+            position: absolute;
+            inset: 3px;
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            border-radius: 999px;
+            font-size: 14px;
+            color: var(--text-main);
+        }
+
+        .theme-slider::before {
+            content: "";
+            width: 28px;
+            height: 28px;
+            border-radius: 999px;
+            background: linear-gradient(180deg, #8a96ff 0%, #7481f4 100%);
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.22);
+            transform: translateX(0);
+            transition: transform 0.2s ease, background 0.2s ease;
+        }
+
+        .theme-switch input:checked + .theme-slider::before {
+            transform: translateX(38px);
+            background: linear-gradient(180deg, #f5c96d 0%, #d98b32 100%);
+        }
+
+        .theme-inline-toggle {
+            appearance: none;
+            border: 1px solid var(--border-soft);
+            background: var(--card-bg);
+            color: var(--text-main);
+            border-radius: 999px;
+            padding: 6px 10px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+        }
+
+        .theme-inline-toggle:hover {
+            background: var(--card-bg-hover);
+            border-color: var(--border-strong);
+            transform: translateY(-1px);
+        }
+
+        :root[data-theme="light"] .terminal-output code {
+            color: #236b45;
+        }
+
+        :root[data-theme="light"] .send-btn {
+            background: linear-gradient(180deg, #347d82 0%, #255f64 100%);
+        }
+
+        :root[data-theme="light"] .profile-avatar,
+        :root[data-theme="light"] .message-avatar {
+            background: linear-gradient(180deg, #3f868a 0%, #2f6f73 100%);
+        }
+
+        :root[data-theme="light"] .message.user .message-avatar {
+            background: linear-gradient(180deg, #d28b37 0%, #ba6f26 100%);
+        }
+
+        #loginOverlay {
+            background: var(--login-overlay-bg) !important;
+        }
+
+        #loginOverlay > div {
+            background: var(--login-card-bg) !important;
+            border-color: var(--border-soft) !important;
+            box-shadow: var(--shadow-shell) !important;
+        }
+
+        #loginOverlay input {
+            background: var(--login-field-bg) !important;
+            border-color: var(--border-soft) !important;
+            color: var(--text-main) !important;
+        }
+
+        #loginOverlay label,
+        #loginOverlay div {
+            color: var(--text-muted);
+        }
+
+        #loginOverlay div[style*="font-size:22px"] {
+            color: var(--text-main) !important;
         }
 
         @media (max-width: 980px) {
@@ -5821,6 +6754,14 @@ HTML_TEMPLATE = r'''
             }
 
             .example-prompts {
+                grid-template-columns: 1fr;
+            }
+
+            .operator-surface {
+                grid-template-columns: 1fr;
+            }
+
+            .operator-actions {
                 grid-template-columns: 1fr;
             }
 
@@ -5935,16 +6876,6 @@ HTML_TEMPLATE = r'''
             <div class="sidebar-header">
                 <div class="sidebar-title">AVA</div>
                 <div class="sidebar-subtitle">Unified DevOps assistant with grounded answers, secured actions, and approval-aware execution.</div>
-                <div class="profile-card">
-                    <div class="profile-row">
-                        <div class="profile-avatar" id="sessionAvatar">A</div>
-                        <div class="profile-meta">
-                            <div class="profile-name" id="sessionBadgeName">admin</div>
-                            <div class="profile-role" id="sessionBadgeRole">admin</div>
-                        </div>
-                        <button class="profile-power" onclick="logoutAva()" title="Sign out">&#x23FB;</button>
-                    </div>
-                </div>
             </div>
             
             <button class="sidebar-btn" onclick="newChat()">
@@ -5981,6 +6912,10 @@ HTML_TEMPLATE = r'''
                         <span class="quick-stat-value" id="quickApprovalCount">0</span>
                     </div>
                     <div class="quick-stat">
+                        <span>Security alerts</span>
+                        <span class="quick-stat-value" id="quickNotificationCount">0</span>
+                    </div>
+                    <div class="quick-stat">
                         <span>Blocked today</span>
                         <span class="quick-stat-value" id="quickBlockedCount">0</span>
                     </div>
@@ -6015,7 +6950,7 @@ HTML_TEMPLATE = r'''
             <div class="mobile-topbar">
                 <button class="mobile-topbar-btn" onclick="openSidebar()">☰</button>
                 <div class="mobile-topbar-title">Project Ava</div>
-                <button class="mobile-topbar-btn" onclick="newChat()">＋</button>
+                <button class="mobile-topbar-btn" id="mobileThemeToggle" onclick="toggleThemeMode()" aria-label="Switch theme">☀</button>
             </div>
             <div class="workspace-bar">
                 <div class="workspace-title">
@@ -6026,6 +6961,8 @@ HTML_TEMPLATE = r'''
                     <span class="workspace-pill primary">AVA Runtime</span>
                     <span class="workspace-pill">Qwen 2.5 14B</span>
                     <span class="workspace-pill">Approval Guard</span>
+                    <span class="workspace-pill" id="workspaceSecurityPill">Security: Healthy</span>
+                    <button type="button" class="theme-inline-toggle" id="themeInlineToggle" onclick="toggleThemeMode()" aria-label="Switch to light mode">☀ Light</button>
                 </div>
             </div>
             
@@ -6035,23 +6972,79 @@ HTML_TEMPLATE = r'''
                 <div class="welcome-screen" id="welcomeScreen">
                     <div class="welcome-title">Operate infrastructure through one assistant.</div>
                     <div class="welcome-subtitle">Ask for exact operational checks, grounded DevOps explanations, or secured actions. AVA will execute, request approval, or block when policy requires it.</div>
+
+                    <div class="operator-surface">
+                        <div class="operator-panel">
+                            <div class="operator-panel-title">Local Diagnostics</div>
+                            <div class="operator-actions">
+                                <button class="operator-action" onclick="askExample('verify my system')">
+                                    <span class="operator-action-kicker">Baseline</span>
+                                    <span class="operator-action-title">Run system verification</span>
+                                    <span class="operator-action-copy">Disk, memory, Docker, runtime health, and current operating limits.</span>
+                                    <span class="operator-action-meta">Read-only</span>
+                                </button>
+                                <button class="operator-action" onclick="askExample('look for suspicious activity')">
+                                    <span class="operator-action-kicker">Security</span>
+                                    <span class="operator-action-title">Hunt suspicious activity</span>
+                                    <span class="operator-action-copy">Auth failures, listeners, process signals, and persistence indicators.</span>
+                                    <span class="operator-action-meta">Read-only</span>
+                                </button>
+                                <button class="operator-action" onclick="askExample('check failed services')">
+                                    <span class="operator-action-kicker">Services</span>
+                                    <span class="operator-action-title">Review failed services</span>
+                                    <span class="operator-action-copy">Check service failures and report host-observed limitations honestly.</span>
+                                    <span class="operator-action-meta">Read-only</span>
+                                </button>
+                                <button class="operator-action" onclick="askExample('show listening ports')">
+                                    <span class="operator-action-kicker">Network</span>
+                                    <span class="operator-action-title">Inspect listening ports</span>
+                                    <span class="operator-action-copy">List local sockets before you decide what needs deeper review.</span>
+                                    <span class="operator-action-meta">Read-only</span>
+                                </button>
+                                <button class="operator-action" onclick="askExample('check security updates')">
+                                    <span class="operator-action-kicker">Patch</span>
+                                    <span class="operator-action-title">Check security updates</span>
+                                    <span class="operator-action-copy">Assess package update posture without installing anything.</span>
+                                    <span class="operator-action-meta">Read-only</span>
+                                </button>
+                                <button class="operator-action" onclick="askExample('scan my system for vulnerabilities')">
+                                    <span class="operator-action-kicker">CVE</span>
+                                    <span class="operator-action-title">Run bounded vulnerability scan</span>
+                                    <span class="operator-action-copy">Start Trivy with timeout protection and explicit incomplete status.</span>
+                                    <span class="operator-action-meta warn">May take longer</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="operator-panel">
+                            <div class="operator-panel-title">Guardrails</div>
+                            <div class="review-summary">
+                                <div class="review-kicker" id="reviewKicker">Security posture</div>
+                                <div class="review-title" id="reviewTitle">Healthy</div>
+                                <div class="review-copy" id="reviewCopy">No security review items are currently visible.</div>
+                                <button class="review-action" onclick="showSecurityModal()">Open Security Review</button>
+                            </div>
+                            <div class="operator-note" id="reviewPolicyNote">Policy mode: loading.</div>
+                        </div>
+                    </div>
                     
+                    <div class="prompt-section-title">Common conversations</div>
                     <div class="example-prompts">
                         <div class="example-prompt" onclick="askExample('verify my system')">
-                            <div class="example-icon">🧭</div>
-                            <div class="example-text">Verify system state</div>
+                            <div class="example-icon">01</div>
+                            <div class="example-text">What is the current system state?</div>
                         </div>
                         <div class="example-prompt" onclick="askExample('check docker')">
-                            <div class="example-icon">🐳</div>
-                            <div class="example-text">Inspect Docker runtime</div>
+                            <div class="example-icon">02</div>
+                            <div class="example-text">Inspect Docker runtime and containers.</div>
                         </div>
                         <div class="example-prompt" onclick="askExample('restart docker service')">
-                            <div class="example-icon">⚠️</div>
-                            <div class="example-text">Queue an approval-required action</div>
+                            <div class="example-icon">03</div>
+                            <div class="example-text">Queue a guarded restart for approval.</div>
                         </div>
                         <div class="example-prompt" onclick="askExample('What is the difference between readiness probe and liveness probe?')">
-                            <div class="example-icon">📘</div>
-                            <div class="example-text">Ask a grounded DevOps question</div>
+                            <div class="example-icon">04</div>
+                            <div class="example-text">Explain a DevOps concept with grounded context.</div>
                         </div>
                     </div>
                 </div>
@@ -6120,33 +7113,27 @@ HTML_TEMPLATE = r'''
             </div>
             <div class="modal-body">
                 <!-- Theme Toggle -->
-                <div class="stat-card" style="display:flex; align-items:center; justify-content:space-between;">
+                <div class="stat-card theme-card">
                     <div>
                         <div class="stat-label">Theme</div>
-                        <div id="themeLabel" style="color:#fff; font-size:13px; margin-top:4px;">Dark Mode</div>
+                        <div id="themeLabel" class="theme-label">Dark Mode</div>
                     </div>
-                    <label style="position:relative; display:inline-block; width:48px; height:26px; cursor:pointer;">
-                        <input type="checkbox" id="themeToggle" onchange="toggleTheme(this.checked)"
-                            style="opacity:0; width:0; height:0;">
-                        <span id="themeSlider" style="
-                            position:absolute; inset:0; background:#2a2a4a;
-                            border-radius:26px; transition:0.3s;
-                            display:flex; align-items:center; padding:0 4px;
-                            font-size:14px;
-                        ">🌙</span>
+                    <label class="theme-switch" title="Switch between dark and light mode">
+                        <input type="checkbox" id="themeToggle" onchange="toggleTheme(this.checked)">
+                        <span id="themeSlider" class="theme-slider"></span>
                     </label>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Model</div>
-                    <div style="color: #fff;">Qwen 2.5 14B (Local)</div>
+                    <div style="color: var(--text-main);">Qwen 2.5 14B (Local)</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Security</div>
-                    <div style="color: #fff;">OPA Policy Enforcement: Enabled</div>
+                    <div style="color: var(--text-main);">OPA Policy Enforcement: Enabled</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Command Whitelist (Read-Only)</div>
-                    <div style="color: #fff; font-size: 13px; line-height: 1.6;">
+                    <div style="color: var(--text-main); font-size: 13px; line-height: 1.6;">
                         <strong>Basic:</strong> date, whoami, pwd, ls, cat, grep, df, free, ps, top, uptime, uname, echo, head, tail, wc, find, which, hostname<br>
                         <strong>Server:</strong> ollama, docker, systemctl, git, curl, wget, netstat, ss
                     </div>
@@ -6172,6 +7159,53 @@ HTML_TEMPLATE = r'''
     <script>
         // ── Day 5: Auth State + JWT Handling ──────────────────────────────────
         const AVA_TOKEN_KEY = 'ava_jwt_token';
+        const AVA_THEME_KEY = 'ava_ui_theme';
+
+        function normalizeTheme(theme) {
+            return theme === 'light' ? 'light' : 'dark';
+        }
+
+        function getStoredTheme() {
+            return normalizeTheme(localStorage.getItem(AVA_THEME_KEY) || 'dark');
+        }
+
+        function applyTheme(theme) {
+            const mode = normalizeTheme(theme);
+            document.documentElement.setAttribute('data-theme', mode);
+            localStorage.setItem(AVA_THEME_KEY, mode);
+
+            const isLight = mode === 'light';
+            const label = document.getElementById('themeLabel');
+            const toggle = document.getElementById('themeToggle');
+            const inlineToggle = document.getElementById('themeInlineToggle');
+            const mobileToggle = document.getElementById('mobileThemeToggle');
+
+            if (label) label.textContent = isLight ? 'Light Mode' : 'Dark Mode';
+            if (toggle) toggle.checked = isLight;
+            if (inlineToggle) {
+                inlineToggle.textContent = isLight ? '☾ Dark' : '☀ Light';
+                inlineToggle.setAttribute('aria-label', isLight ? 'Switch to dark mode' : 'Switch to light mode');
+            }
+            if (mobileToggle) {
+                mobileToggle.textContent = isLight ? '☾' : '☀';
+                mobileToggle.setAttribute('aria-label', isLight ? 'Switch to dark mode' : 'Switch to light mode');
+            }
+
+            if (window.mermaid && typeof mermaid.initialize === 'function') {
+                mermaid.initialize({ startOnLoad: false, theme: isLight ? 'default' : 'dark' });
+            }
+        }
+
+        function toggleTheme(isLight) {
+            applyTheme(isLight ? 'light' : 'dark');
+        }
+
+        function toggleThemeMode() {
+            const current = document.documentElement.getAttribute('data-theme') || getStoredTheme();
+            applyTheme(current === 'light' ? 'dark' : 'light');
+        }
+
+        applyTheme(getStoredTheme());
 
         function getToken() {
             return localStorage.getItem(AVA_TOKEN_KEY);
@@ -6374,7 +7408,7 @@ HTML_TEMPLATE = r'''
                     }
                     const recent = data.history.slice(-10).reverse();
                     if (recent.length === 0) {
-                        container.innerHTML = '<div class="chat-item" style="color: #666;">No recent chats</div>';
+                        container.innerHTML = '<div class="chat-item" style="color: var(--text-faint);">No recent chats</div>';
                         return;
                     }
                     container.innerHTML = recent.map(h => 
@@ -6409,7 +7443,7 @@ HTML_TEMPLATE = r'''
                     .then(data => {
                         const content = document.getElementById('historyContent');
                         if (data.history.length === 0) {
-                            content.innerHTML = '<p style="color: #888; text-align: center;">No history yet</p>';
+                            content.innerHTML = '<p style="color: var(--text-faint); text-align: center;">No history yet</p>';
                             return;
                         }
                         content.innerHTML = data.history.reverse().map(h => `
@@ -6448,35 +7482,35 @@ HTML_TEMPLATE = r'''
                             <div class="stat-card">
                                 <div class="stat-label">🔧 Source Repositories</div>
                                 <div class="stat-value">${data.repos} GitHub repos</div>
-                                <div style="color: #888; font-size: 13px; margin-top: 6px;">
+                                <div style="color: var(--text-faint); font-size: 13px; margin-top: 6px;">
                                     DevOps Exercises, AWS/Jenkins/Docker/Terraform Zero to Hero
                                 </div>
                             </div>
                             <div class="stat-card">
                                 <div class="stat-label">🤖 LLM Model</div>
                                 <div class="stat-value" style="font-size: 18px;">${data.model}</div>
-                                <div style="color: #888; font-size: 13px; margin-top: 6px;">
+                                <div style="color: var(--text-faint); font-size: 13px; margin-top: 6px;">
                                     14B parameters • Local inference via Ollama
                                 </div>
                             </div>
                             <div class="stat-card">
                                 <div class="stat-label">🔢 Token Usage (Current Session)</div>
                                 <div class="stat-value">${data.total_tokens ? data.total_tokens.toLocaleString() : '0'} tokens</div>
-                                <div style="color: #888; font-size: 13px; margin-top: 6px;">
+                                <div style="color: var(--text-faint); font-size: 13px; margin-top: 6px;">
                                     Queries: ${data.query_count || 0} • Avg: ${data.avg_tokens_per_query || 0} tokens/query
                                 </div>
                             </div>
                             <div class="stat-card">
                                 <div class="stat-label">🛡️ Security</div>
                                 <div class="stat-value">${data.opa_enabled ? 'OPA Policy Enforcement Enabled' : 'Disabled'}</div>
-                                <div style="color: #888; font-size: 13px; margin-top: 6px;">
+                                <div style="color: var(--text-faint); font-size: 13px; margin-top: 6px;">
                                     Whitelist: ${data.whitelisted_commands || 0} commands • Blocked paths enforced
                                 </div>
                             </div>
                             <div class="stat-card">
                                 <div class="stat-label">💾 Storage</div>
                                 <div class="stat-value">ChromaDB Vector Store</div>
-                                <div style="color: #888; font-size: 13px; margin-top: 6px;">
+                                <div style="color: var(--text-faint); font-size: 13px; margin-top: 6px;">
                                     Embedding: nomic-embed-text • Collection: devops_policies_v2
                                 </div>
                             </div>
@@ -6610,12 +7644,90 @@ HTML_TEMPLATE = r'''
             if (loading) loading.remove();
         }
 
+        async function approvePendingAction(approvalId) {
+            if (!approvalId) return;
+            try {
+                const resp = await fetch(`/approvals/${encodeURIComponent(approvalId)}/approve`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({}),
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    throw new Error(data.error || 'Approval request failed');
+                }
+                addAVAMessage({
+                    type: 'knowledge',
+                    response: `Approval ${approvalId} is now approved.`,
+                    time_taken: '',
+                    sources_used: 0,
+                });
+                loadSecurityData();
+            } catch (err) {
+                addAVAMessage({
+                    type: 'knowledge',
+                    response: `Approval failed for ${approvalId}: ${err.message || 'Unknown error'}`,
+                    time_taken: '',
+                    sources_used: 0,
+                });
+            }
+        }
+
+        async function executeApprovedAction(approvalId) {
+            if (!approvalId) return;
+            try {
+                const resp = await fetch(`/approvals/${encodeURIComponent(approvalId)}/execute`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({}),
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    throw new Error(data.error || 'Execution failed');
+                }
+                addAVAMessage({
+                    type: 'command',
+                    result: {
+                        success: true,
+                        command: data.command || `approval:${approvalId}`,
+                        output: data.output || 'Approved command executed.',
+                        mode: data.mode || 'tool',
+                        risk: data.risk || 'medium',
+                        approval_id: data.approval_id || approvalId,
+                    },
+                    time_taken: '',
+                    sources_used: 0,
+                });
+                loadRecentChats();
+                loadSecurityData();
+            } catch (err) {
+                addAVAMessage({
+                    type: 'command',
+                    result: {
+                        success: false,
+                        error: `Execution failed for ${approvalId}: ${err.message || 'Unknown error'}`,
+                        risk: 'medium',
+                    },
+                    time_taken: '',
+                    sources_used: 0,
+                });
+                loadSecurityData();
+            }
+        }
+
+        async function approveAndExecuteAction(approvalId) {
+            if (!approvalId) return;
+            await approvePendingAction(approvalId);
+            await executeApprovedAction(approvalId);
+        }
+
         function renderCommandCard(result) {
             const normalized = result && typeof result === 'object' ? result : {};
             const metadata = normalized.metadata && typeof normalized.metadata === 'object' ? normalized.metadata : {};
             const risk = escapeHtml(
                 ((normalized.security && normalized.security.risk) || normalized.risk || 'unknown').toString()
             );
+            const rawApprovalId = String(normalized.approval_id || '');
             const approvalId = escapeHtml(normalized.approval_id || '');
             const command = escapeHtml(normalized.command || normalized.command_repr || 'requested action');
             const reason = escapeHtml(normalized.reason || normalized.error || 'Action could not be completed.');
@@ -6821,6 +7933,13 @@ HTML_TEMPLATE = r'''
             }
 
             if (normalized.approval_required) {
+                const actions = rawApprovalId
+                    ? `<div class="findings-actions">
+                        <button class="findings-action-btn" onclick="approveAndExecuteAction('${rawApprovalId}')">Approve & run</button>
+                        <button class="findings-action-btn" onclick="approvePendingAction('${rawApprovalId}')">Approve only</button>
+                        <button class="findings-action-btn" onclick="executeApprovedAction('${rawApprovalId}')">Execute approved</button>
+                    </div>`
+                    : '';
                 return `<div class="status-card approval">
                     <div class="status-card-title">Approval required</div>
                     <div class="status-card-copy">${reason}</div>
@@ -6832,6 +7951,7 @@ HTML_TEMPLATE = r'''
                         <div class="terminal-label">Requested action</div>
                         <pre class="terminal-output"><code>${command}</code></pre>
                     </div>
+                    ${actions}
                 </div>`;
             }
 
@@ -7004,14 +8124,14 @@ HTML_TEMPLATE = r'''
             text = safeString(text);
             // Handle mermaid code blocks FIRST
             text = text.replace(/```mermaid\n([\s\S]*?)```/g, function(match, diagram) {
-                return '<div class="mermaid-placeholder" data-diagram="' + encodeURIComponent(diagram.trim()) + '" style="background:#1a1a2e;padding:16px;border-radius:8px;margin:8px 0;text-align:center;color:#888;">Loading diagram...</div>';
+                return '<div class="mermaid-placeholder" data-diagram="' + encodeURIComponent(diagram.trim()) + '" style="background:var(--bg-panel-2);padding:16px;border-radius:8px;margin:8px 0;text-align:center;color:var(--text-faint);">Loading diagram...</div>';
             });
             // Handle plain ``` blocks containing graph syntax
             text = text.replace(/```[^\n]*\n(graph\s+(?:TD|LR|BT|RL)[\s\S]*?)```/g, function(match, diagram) {
-                return '<div class="mermaid-placeholder" data-diagram="' + encodeURIComponent(diagram.trim()) + '" style="background:#1a1a2e;padding:16px;border-radius:8px;margin:8px 0;text-align:center;color:#888;">Loading diagram...</div>';
+                return '<div class="mermaid-placeholder" data-diagram="' + encodeURIComponent(diagram.trim()) + '" style="background:var(--bg-panel-2);padding:16px;border-radius:8px;margin:8px 0;text-align:center;color:var(--text-faint);">Loading diagram...</div>';
             });
             text = text.replace(/```(\w+)?\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
-            text = text.replace(/`([^`]+)`/g, '<code style="background: #2a2a2a; padding: 2px 6px; border-radius: 4px; font-size: 13px;">$1</code>');
+            text = text.replace(/`([^`]+)`/g, '<code style="background: var(--bg-panel-3); padding: 2px 6px; border-radius: 4px; font-size: 13px;">$1</code>');
             text = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
             text = text.replace(/\n/g, '<br>');
             return text;
@@ -7026,16 +8146,16 @@ HTML_TEMPLATE = r'''
 
                 var toolbar = document.createElement('div');
                 toolbar.style.cssText = 'display:flex;gap:8px;margin-bottom:6px;';
-                toolbar.innerHTML = '<button onclick="toggleDiagramView(this)" style="background:#2a2a3e;border:1px solid #444;color:#aaa;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;">📊 Diagram</button><button onclick="exportSVG(this)" style="background:#2a2a3e;border:1px solid #444;color:#aaa;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;">⬇ SVG</button><button onclick="copyMermaid(this)" style="background:#2a2a3e;border:1px solid #444;color:#aaa;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;">📋 Code</button>';
+                toolbar.innerHTML = '<button onclick="toggleDiagramView(this)" style="background:var(--bg-panel-3);border:1px solid var(--border-soft);color:var(--text-muted);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;">📊 Diagram</button><button onclick="exportSVG(this)" style="background:var(--bg-panel-3);border:1px solid var(--border-soft);color:var(--text-muted);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;">⬇ SVG</button><button onclick="copyMermaid(this)" style="background:var(--bg-panel-3);border:1px solid var(--border-soft);color:var(--text-muted);padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px;">📋 Code</button>';
 
                 var diagramDiv = document.createElement('div');
                 diagramDiv.className = 'mermaid';
                 diagramDiv.textContent = diagram;
-                diagramDiv.style.cssText = 'background:#1a1a2e;padding:16px;border-radius:8px;overflow:auto;';
+                diagramDiv.style.cssText = 'background:var(--bg-panel-2);padding:16px;border-radius:8px;overflow:auto;';
                 diagramDiv.setAttribute('data-raw', diagram);
 
                 var codeDiv = document.createElement('pre');
-                codeDiv.style.cssText = 'display:none;background:#1a1a2e;padding:16px;border-radius:8px;color:#a8ff78;font-size:12px;overflow:auto;';
+                codeDiv.style.cssText = 'display:none;background:var(--bg-panel-2);padding:16px;border-radius:8px;color:var(--success);font-size:12px;overflow:auto;';
                 codeDiv.textContent = diagram;
 
                 wrapper.appendChild(toolbar);
@@ -7166,13 +8286,49 @@ HTML_TEMPLATE = r'''
         function displaySecurityData(stats, audit, posture) {
             const quickApprovalCount = document.getElementById('quickApprovalCount');
             const quickBlockedCount = document.getElementById('quickBlockedCount');
+            const quickNotificationCount = document.getElementById('quickNotificationCount');
+            const workspaceSecurityPill = document.getElementById('workspaceSecurityPill');
+            const reviewKicker = document.getElementById('reviewKicker');
+            const reviewTitle = document.getElementById('reviewTitle');
+            const reviewCopy = document.getElementById('reviewCopy');
+            const reviewPolicyNote = document.getElementById('reviewPolicyNote');
+            const pending = stats.pending || 0;
+            const blocked = stats.blocked || 0;
+            const notifications = stats.notifications || 0;
+            const commands = stats.total_commands || 0;
+            const reviewItems = pending + notifications;
+            const postureState = notifications > 0 ? 'Action Required' : (pending > 0 ? 'Needs Review' : 'Healthy');
+            const postureClass = notifications > 0 ? 'danger' : (pending > 0 ? 'warn' : '');
+
             if (quickApprovalCount) quickApprovalCount.textContent = stats.pending || 0;
             if (quickBlockedCount) quickBlockedCount.textContent = stats.blocked || 0;
+            if (quickNotificationCount) quickNotificationCount.textContent = notifications;
+
+            if (workspaceSecurityPill) {
+                workspaceSecurityPill.textContent = `Security: ${postureState}`;
+                workspaceSecurityPill.classList.toggle('primary', reviewItems > 0);
+            }
+            if (reviewKicker) {
+                reviewKicker.textContent = reviewItems > 0 ? `${reviewItems} item${reviewItems === 1 ? '' : 's'} need review` : 'Security posture';
+            }
+            if (reviewTitle) {
+                reviewTitle.textContent = postureState;
+                reviewTitle.className = 'review-title' + (postureClass ? ` ${postureClass}` : '');
+            }
+            if (reviewCopy) {
+                reviewCopy.textContent = reviewItems > 0
+                    ? `${pending} approval${pending === 1 ? '' : 's'} and ${notifications} security event${notifications === 1 ? '' : 's'} are waiting in Security Review. ${blocked} destructive/security block${blocked === 1 ? '' : 's'} recorded today.`
+                    : `Policy is active and ${commands} action${commands === 1 ? '' : 's'} are recorded in the current audit window.`;
+            }
+            if (reviewPolicyNote) {
+                reviewPolicyNote.textContent = `Policy mode: ${posture.mode || 'unknown'}. Details stay in Security Review to avoid dashboard noise.`;
+            }
 
             const badge = document.getElementById('securityBadge');
             if (badge) {
-                if ((stats.pending || 0) > 0) {
-                    badge.textContent = stats.pending;
+                const badgeCount = pending + notifications;
+                if (badgeCount > 0) {
+                    badge.textContent = '!';
                     badge.style.display = 'inline-flex';
                 } else {
                     badge.style.display = 'none';
@@ -7182,11 +8338,11 @@ HTML_TEMPLATE = r'''
             const content = document.getElementById('securityContent');
             
             let html = '<div style="margin-bottom: 24px;">';
-            html += '<h3 style="margin-bottom: 12px; font-size: 14px; color: #888; text-transform: uppercase;">Zero-Trust Posture</h3>';
+            html += '<h3 style="margin-bottom: 12px; font-size: 14px; color: var(--text-faint); text-transform: uppercase;">Zero-Trust Posture</h3>';
             html += `<div class="stat-card" style="margin-bottom: 12px;">
                 <div class="stat-label">Runtime Mode</div>
                 <div class="stat-value" style="font-size: 18px;">${escapeHtml(posture.mode || 'unknown')}</div>
-                <div style="color: #aaa; font-size: 12px; line-height: 1.55; margin-top: 8px;">${escapeHtml(posture.summary || '')}</div>
+                <div style="color: var(--text-muted); font-size: 12px; line-height: 1.55; margin-top: 8px;">${escapeHtml(posture.summary || '')}</div>
             </div>`;
 
             if (posture.controls && posture.controls.length > 0) {
@@ -7194,7 +8350,7 @@ HTML_TEMPLATE = r'''
                     const status = control.status === 'pass' ? 'success' : 'danger';
                     const label = control.status === 'pass' ? 'PASS' : 'WATCH';
                     html += `<div class="security-stat">
-                        <span class="security-stat-label">${escapeHtml(control.name || '')}<br><span style="color:#777;font-size:11px;font-weight:400;">${escapeHtml(control.detail || '')}</span></span>
+                        <span class="security-stat-label">${escapeHtml(control.name || '')}<br><span style="color:var(--text-faint);font-size:11px;font-weight:400;">${escapeHtml(control.detail || '')}</span></span>
                         <span class="security-stat-value ${status}">${label}</span>
                     </div>`;
                 });
@@ -7203,7 +8359,7 @@ HTML_TEMPLATE = r'''
             if (posture.remaining_gaps && posture.remaining_gaps.length > 0) {
                 html += '<div class="stat-card" style="margin-top: 12px;">';
                 html += '<div class="stat-label">Known Remaining Gaps</div>';
-                html += '<ul style="margin: 10px 0 0 18px; padding: 0; color: #bbb; font-size: 12px; line-height: 1.65;">';
+                html += '<ul style="margin: 10px 0 0 18px; padding: 0; color: var(--text-muted); font-size: 12px; line-height: 1.65;">';
                 posture.remaining_gaps.forEach(gap => {
                     html += `<li>${escapeHtml(gap)}</li>`;
                 });
@@ -7218,7 +8374,7 @@ HTML_TEMPLATE = r'''
             html += '</div>';
 
             html += '<div style="margin-bottom: 24px;">';
-            html += '<h3 style="margin-bottom: 12px; font-size: 14px; color: #888; text-transform: uppercase;">Last 24 Hours</h3>';
+            html += '<h3 style="margin-bottom: 12px; font-size: 14px; color: var(--text-faint); text-transform: uppercase;">Last 24 Hours</h3>';
             
             html += `<div class="security-stat">
                 <span class="security-stat-label">Total Commands</span>
@@ -7239,6 +8395,21 @@ HTML_TEMPLATE = r'''
                 <span class="security-stat-label">Pending Approval</span>
                 <span class="security-stat-value ${stats.pending > 0 ? 'danger' : ''}">${stats.pending}</span>
             </div>`;
+
+            html += `<div class="security-stat">
+                <span class="security-stat-label">Security Alerts</span>
+                <span class="security-stat-value ${stats.notifications > 0 ? 'danger' : ''}">${stats.notifications || 0}</span>
+            </div>`;
+
+            html += `<div class="security-stat">
+                <span class="security-stat-label">Unauthorized Access</span>
+                <span class="security-stat-value ${stats.unauthorized_access > 0 ? 'danger' : ''}">${stats.unauthorized_access || 0}</span>
+            </div>`;
+
+            html += `<div class="security-stat">
+                <span class="security-stat-label">Auth Failures</span>
+                <span class="security-stat-value ${stats.auth_failures > 0 ? 'danger' : ''}">${stats.auth_failures || 0}</span>
+            </div>`;
             
             html += `<div class="security-stat">
                 <span class="security-stat-label">High Risk Commands</span>
@@ -7254,7 +8425,7 @@ HTML_TEMPLATE = r'''
             
             // Recent audit entries
             html += '<div>';
-            html += '<h3 style="margin-bottom: 12px; font-size: 14px; color: #888; text-transform: uppercase;">Recent Activity</h3>';
+            html += '<h3 style="margin-bottom: 12px; font-size: 14px; color: var(--text-faint); text-transform: uppercase;">Recent Activity</h3>';
             
             if (audit.entries && audit.entries.length > 0) {
                 audit.entries.reverse().forEach(entry => {
@@ -7268,23 +8439,23 @@ HTML_TEMPLATE = r'''
                         <div class="audit-command">${escapeHtml(entry.cmd || 'N/A')}</div>
                         <div>
                             <span class="audit-risk ${riskClass}">${risk.toUpperCase()}</span>
-                            <span style="color: #888; font-size: 11px;">${entry.event_type.replace(/_/g, ' ').toUpperCase()}</span>
+                            <span style="color: var(--text-faint); font-size: 11px;">${entry.event_type.replace(/_/g, ' ').toUpperCase()}</span>
                         </div>
                     </div>`;
                 });
             } else {
-                html += '<p style="color: #888; text-align: center;">No recent activity</p>';
+                html += '<p style="color: var(--text-faint); text-align: center;">No recent activity</p>';
             }
             
             html += '</div>';
             
             // CLI instructions
-            html += `<div style="margin-top: 24px; padding: 16px; background: #1a1a2e; border-radius: 8px; border-left: 3px solid #667eea;">
-                <div style="font-size: 12px; color: #667eea; margin-bottom: 6px; font-weight: 600;">📋 CLI Commands</div>
-                <div style="color: #ddd; font-size: 13px; line-height: 1.8;">
-                    <code style="background: #0a0a0a; padding: 2px 6px; border-radius: 3px;">python3 -m control.security_review</code> - Review pending<br>
-                    <code style="background: #0a0a0a; padding: 2px 6px; border-radius: 3px;">python3 -m control.security_review audit 10</code> - View audit log<br>
-                    <code style="background: #0a0a0a; padding: 2px 6px; border-radius: 3px;">python3 -m control.security_review export</code> - Export CSV
+            html += `<div style="margin-top: 24px; padding: 16px; background: var(--bg-panel-2); border-radius: 8px; border-left: 3px solid var(--accent);">
+                <div style="font-size: 12px; color: var(--accent); margin-bottom: 6px; font-weight: 600;">📋 CLI Commands</div>
+                <div style="color: var(--text-main); font-size: 13px; line-height: 1.8;">
+                    <code style="background: var(--terminal-bg); padding: 2px 6px; border-radius: 3px;">python3 -m control.security_review</code> - Review pending<br>
+                    <code style="background: var(--terminal-bg); padding: 2px 6px; border-radius: 3px;">python3 -m control.security_review audit 10</code> - View audit log<br>
+                    <code style="background: var(--terminal-bg); padding: 2px 6px; border-radius: 3px;">python3 -m control.security_review export</code> - Export CSV
                 </div>
             </div>`;
             
@@ -7380,3 +8551,7 @@ def route_scan_lynis():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5002, debug=False)
+
+
+
+
