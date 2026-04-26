@@ -4,11 +4,25 @@
 AVA is a production-grade autonomous DevOps AI assistant built on local LLMs.
 Fully offline, no data leaves the machine. Built by Manoj, Delhi.
 
+## Documentation And Project Structure
+
+This repository now uses a governance overlay:
+
+- `workspace/`: intended home for source, scripts, configs, tests, tools, and runtime assets.
+- `wiki/`: canonical project documentation.
+- `updates/`: changelog, daily log, known issues, next steps, and release notes.
+
+Existing implementation files currently remain at the repository root and in existing directories such as `control/`, `knowledge_updater/`, `tests/`, and `policies/` to avoid breaking Docker, imports, and live scripts. See:
+
+- `workspace/README.md`
+- `wiki/README.md`
+- `updates/CHANGELOG.md`
+
 ## Stack
 - LLM: qwen2.5:14b (Q4_K_M) via Ollama
 - Embedding: nomic-embed-text
 - Vision: llava:13b
-- Vector DB: ChromaDB (8,780 chunks, 4 collections)
+- Vector DB: ChromaDB (8,809 chunks, 4 collections)
 - Backend: Flask/Gunicorn (HTTPS :5443)
 - Security: OPA + JWT + TLS + rate limiting
 - Storage: SQLite + ChromaDB
@@ -55,7 +69,7 @@ curl -sk https://localhost:5443/ask \
 | /healing/history | GET | JWT | Healing audit trail |
 
 ## Features
-- RAG over 8,780 DevOps knowledge chunks
+- RAG over 8,809 DevOps knowledge chunks
 - Self-healing: auto-detect + fix K8s/infra issues
 - Memory: store and recall user context
 - Webhook: Alertmanager/Datadog/PagerDuty integration
@@ -71,7 +85,7 @@ curl -sk https://localhost:5443/ask \
 |-----------|--------|---------|
 | devops_policies_v2 | 3,881 | K8s, Docker, AWS policies |
 | devops_blogs_v1 | 4,822 | Engineering blog articles |
-| devops_patterns_v1 | 57 | Infrastructure patterns |
+| devops_patterns_v1 | 86 | Infrastructure patterns |
 | devops_fixes_v1 | 20 | Real DevOps fixes |
 
 ## Project Structure
