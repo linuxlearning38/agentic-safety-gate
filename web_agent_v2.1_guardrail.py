@@ -3808,6 +3808,14 @@ def is_meta_question(query):
     query_lower = query.lower()
     return any(pattern in query_lower for pattern in meta_patterns)
 
+def _ask_rate_limit() -> str:
+    """Rate limit policy for /ask: higher for authenticated traffic."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return "60 per minute"
+    return "20 per minute"
+
+
 def get_ava_introduction():
     """Return AVA's self-introduction"""
     chunk_count = int(STATS.get('total_chunks') or 0)
@@ -3879,7 +3887,7 @@ I'm here to help with your DevOps journey - ask me anything!"""
 
 @app.route('/ask', methods=['POST'])
 @jwt_required()
-@limiter.limit("20 per minute")
+@limiter.limit(_ask_rate_limit)
 def ask():
     start_time = time.time()
     try:
@@ -4684,7 +4692,7 @@ def rate_limit_status():
         "role":    role,
         "limits":  {
             "default":           "30 per minute",
-            "/ask":              "20 per minute",
+            "/ask":              "60 per minute (authenticated), 20 per minute (unauthenticated)",
             "/tools/<n>/run":    "10 per minute",
             "/approvals/pending": "30 per minute",
             "/approvals/<id>/approve": "20 per minute",
