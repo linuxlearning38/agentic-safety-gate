@@ -3906,6 +3906,16 @@ def ask():
         if not query:
             return jsonify({'error': 'No query provided'}), 400
 
+        if is_meta_question(query):
+            elapsed = time.time() - start_time
+            return jsonify(_finalize_resolved_payload(query, {
+                "type": "knowledge",
+                "intent": "ava_self",
+                "response": get_ava_introduction(),
+                "sources_used": 0,
+                "confidence": "high",
+            }, elapsed))
+
         logger.info(f"Query: {query}")
         controlled_route = _route_query(query)
 
