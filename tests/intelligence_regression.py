@@ -1591,6 +1591,9 @@ def main():
     check("legacy: rm -rf / still blocks",          destr("rm -rf /"))
     check("legacy: drop all tables still blocks",   destr("drop all tables"))
     check("legacy: truncate my database blocks",    destr("truncate my database"))
+    check("legacy: drop all tables? still blocks",  destr("drop all tables?"))
+    check("legacy: truncate my database? blocks",   destr("truncate my database?"))
+    check("legacy: kindly truncate my database? blocks", destr("kindly truncate my database?"))
 
     # Mass deletion
     check("blocks: delete all pods",                destr("delete all pods"))
