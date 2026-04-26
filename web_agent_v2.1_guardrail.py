@@ -61,17 +61,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_limiter.errors import RateLimitExceeded
 from control.security_layer import security_audit_log
-from control.infra_intent import (
-    classify_infrastructure_intent,
-    compose_infrastructure_plan,
-    render_infrastructure_plan,
-)
 from control.capability_router import route_capability
-from control.approval_routes import register_approval_routes
-from control.provisioning_routes import register_provisioning_routes
-from control.guest_access import build_guest_access_contract, merge_guest_access_with_metadata
-from control.provisioning_jobs import attach_approval, create_job, set_guest_access, transition_job
-from control.unattended_install import build_unattended_install_contract
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -119,8 +109,6 @@ limiter = Limiter(
     swallow_errors=True,
 )
 logger.info(f"[RateLimit] Flask-Limiter initialised — default: 30 req/min per user, storage={RATE_LIMIT_STORAGE_URI}")
-register_approval_routes(app, require_admin, limiter)
-register_provisioning_routes(app, require_admin, limiter)
 
 
 @app.before_request
@@ -280,19 +268,11 @@ db.init_db()
 
 # Phase 5C: background health monitor
 from control.monitor import start_monitor
-from control.provisioning_monitor_runner import start_installer_monitor_loop, monitor_loop_enabled
 if os.getenv("AVA_MONITOR_ENABLED", "false").lower() == "true":
     start_monitor()
 else:
     logger.info("[Monitor] Background health monitor disabled by default; set AVA_MONITOR_ENABLED=true to enable.")
 
-if monitor_loop_enabled():
-    start_installer_monitor_loop()
-else:
-    logger.info(
-        "[ProvisioningMonitor] Background installer monitor disabled by default; "
-        "set AVA_INSTALLER_MONITOR_LOOP_ENABLED=true to enable."
-    )
 
 # Command whitelist - expanded for server management
 ALLOWED_COMMANDS = [
@@ -693,199 +673,6 @@ def _resolve_direct_action_query(query: str) -> dict | None:
             "response": _build_vague_diagnostic_clarification(),
             "confidence": "high",
         }
-
-    infrastructure_intent = classify_infrastructure_intent(query)
-    if infrastructure_intent:
-        if infrastructure_intent.capability == "virtualbox.list_vms":
-            exec_result = execute_tool_safe(
-                "list_virtualbox_vms",
-                {},
-                query=query,
-                source="ask_infrastructure_bridge",
-            )
-            return {
-                "kind": "command",
-                "result": exec_result,
-                "response": _command_response_text(exec_result),
-                "metadata": {
-                    "infrastructure_intent": infrastructure_intent.to_dict(),
-                },
-            }
-
-        if infrastructure_intent.capability == "virtualbox.vm_status":
-            if infrastructure_intent.missing:
-                return {
-                    "kind": "knowledge",
-                    "response": "I can inspect a VirtualBox VM, but I need the VM name. Example: inspect VM ava-ubuntu-01.",
-                    "confidence": "high",
-                    "metadata": {
-                        "infrastructure_intent": infrastructure_intent.to_dict(),
-                    },
-                }
-            exec_result = execute_tool_safe(
-                "inspect_virtualbox_vm",
-                {"name": infrastructure_intent.vm_name},
-                query=query,
-                source="ask_infrastructure_bridge",
-            )
-            return {
-                "kind": "command",
-                "result": exec_result,
-                "response": _command_response_text(exec_result),
-                "metadata": {
-                    "infrastructure_intent": infrastructure_intent.to_dict(),
-                },
-            }
-
-        if infrastructure_intent.capability == "virtualbox.delete_preview":
-            if infrastructure_intent.missing:
-                return {
-                    "kind": "knowledge",
-                    "response": "I can generate a safe delete preview, but I need the VM name. Example: delete vm ava-web-01.",
-                    "confidence": "high",
-                    "metadata": {
-                        "infrastructure_intent": infrastructure_intent.to_dict(),
-                    },
-                }
-            exec_result = execute_tool_safe(
-                "preview_delete_virtualbox_vm",
-                {
-                    "name": infrastructure_intent.vm_name,
-                    "reason": _normalize_user_query(query)[:240],
-                },
-                query=query,
-                source="ask_infrastructure_preview",
-            )
-            return {
-                "kind": "command",
-                "result": exec_result,
-                "response": _command_response_text(exec_result),
-                "metadata": {
-                    "infrastructure_intent": infrastructure_intent.to_dict(),
-                },
-            }
-
-        if (
-            infrastructure_intent.capability == "infra.provision_linux_server"
-            and infrastructure_intent.provider == "virtualbox"
-            and not infrastructure_intent.missing
-        ):
-            guest_access_contract = build_guest_access_contract(str(infrastructure_intent.vm_name or "unknown"))
-            install_contract = build_unattended_install_contract(
-                vm_name=str(infrastructure_intent.vm_name or "unknown"),
-                os_family=str(infrastructure_intent.os_family or "ubuntu"),
-                provider=str(infrastructure_intent.provider or "virtualbox"),
-            )
-            job = create_job(
-                vm_name=str(infrastructure_intent.vm_name or "unknown"),
-                role=str(infrastructure_intent.role or "base-linux"),
-                provider=str(infrastructure_intent.provider),
-                resources={
-                    "cpu": int(infrastructure_intent.cpu),
-                    "memory_mb": int(infrastructure_intent.memory_mb),
-                    "disk_gb": int(infrastructure_intent.disk_gb),
-                },
-                network=str(infrastructure_intent.network),
-                storage_root=str(infrastructure_intent.storage_root),
-                iso_path=infrastructure_intent.iso_path,
-                guest_access=guest_access_contract.to_dict(),
-                install_contract=install_contract.to_dict(),
-                query=query,
-            )
-            autostart_after_create = (
-                os.getenv("AVA_VIRTUALBOX_AUTOSTART_AFTER_CREATE", "true").strip().lower() == "true"
-                and bool(install_contract.enabled)
-                and bool(install_contract.ready)
-            )
-            exec_result = execute_tool_safe(
-                "create_virtualbox_vm",
-                {
-                    "name": infrastructure_intent.vm_name,
-                    "os_family": infrastructure_intent.os_family,
-                    "cpu": infrastructure_intent.cpu,
-                    "memory_mb": infrastructure_intent.memory_mb,
-                    "disk_gb": infrastructure_intent.disk_gb,
-                    "network": infrastructure_intent.network,
-                    "vm_root": infrastructure_intent.storage_root,
-                    "iso_path": infrastructure_intent.iso_path or os.getenv("AVA_VIRTUALBOX_DEFAULT_ISO_PATH", "").strip(),
-                    "ssh_host_port": int(guest_access_contract.ssh_port),
-                    "autoinstall_seed_iso_path": install_contract.seed_iso_path if install_contract.ready else "",
-                    "autostart_after_create": autostart_after_create,
-                },
-                query=query,
-                source="ask_infrastructure_bridge",
-            )
-            status = str(exec_result.get("status") or "").strip().lower()
-            if status == "approval_required":
-                approval_id = str(exec_result.get("approval_id") or "").strip()
-                if approval_id:
-                    attach_approval(str(job.get("job_id")), approval_id)
-                else:
-                    transition_job(
-                        str(job.get("job_id")),
-                        "approval_pending",
-                        error_summary="approval_required_without_approval_id",
-                    )
-            elif status == "success":
-                transition_job(str(job.get("job_id")), "creating")
-                metadata = exec_result.get("metadata") if isinstance(exec_result.get("metadata"), dict) else {}
-                merged_guest_access = merge_guest_access_with_metadata(guest_access_contract.to_dict(), metadata)
-                set_guest_access(str(job.get("job_id")), merged_guest_access)
-                transition_job(
-                    str(job.get("job_id")),
-                    "created",
-                    verification_result={"vm_created": True, "status": "created"},
-                    error_summary="",
-                )
-                if install_contract.enabled or install_contract.requires_manual_installer:
-                    vm_started = bool(metadata.get("vm_started"))
-                    pending_reason = (
-                        "manual_installer_required"
-                        if install_contract.requires_manual_installer
-                        else ("unattended_install_in_progress" if vm_started else "unattended_install_waiting_for_start")
-                    )
-                    transition_job(
-                        str(job.get("job_id")),
-                        "installer_pending",
-                        verification_result={
-                            "vm_created": True,
-                            "status": "installer_pending",
-                            "reason": pending_reason,
-                            "vm_started": vm_started,
-                            "missing": install_contract.missing,
-                        },
-                        error_summary=pending_reason,
-                    )
-            else:
-                transition_job(
-                    str(job.get("job_id")),
-                    "failed",
-                    verification_result={"vm_created": False, "status": status or "failed"},
-                    error_summary=str(exec_result.get("error") or exec_result.get("reason") or "provisioning_execution_failed"),
-                )
-            return {
-                "kind": "command",
-                "result": exec_result,
-                "response": _command_response_text(exec_result),
-                "metadata": {
-                    "infrastructure_intent": infrastructure_intent.to_dict(),
-                    "provisioning_job": job,
-                    "guest_access_contract": guest_access_contract.to_dict(),
-                    "install_contract": install_contract.to_dict(),
-                },
-            }
-
-        infrastructure_plan = compose_infrastructure_plan(infrastructure_intent)
-        return {
-            "kind": "knowledge",
-            "response": render_infrastructure_plan(infrastructure_plan),
-            "confidence": infrastructure_intent.confidence,
-            "metadata": {
-                "infrastructure_intent": infrastructure_intent.to_dict(),
-                "infrastructure_plan": infrastructure_plan.to_dict(),
-            },
-        }
-
     capability_match = route_capability(query)
     if capability_match:
         if capability_match.missing:
@@ -3820,70 +3607,28 @@ def get_ava_introduction():
     """Return AVA's self-introduction"""
     chunk_count = int(STATS.get('total_chunks') or 0)
     chunk_count_label = f"{chunk_count:,}"
-    return f"""I'm **AVA** (Automated Virtual Assistant) - a specialized local DevOps AI agent running entirely on your machine.
+    return f"""I'm **AVA** (Automated Virtual Assistant), a local DevOps knowledge and operations assistant.
 
-### What Makes Me Different
+### What I Do In v1.0
 
-**🔒 Private & Secure**
-- Everything runs locally (no cloud, no data leaks)
-- OPA policy enforcement for command safety
-- Whitelisted command execution only
-- No telemetry or external API calls
+- Provide grounded DevOps answers from **{chunk_count_label} knowledge chunks**.
+- Run safe, read-only operational checks (system, Docker, ports, memory, disk).
+- Queue medium-risk actions behind approval.
+- Block destructive requests before execution.
 
-**📚 Specialized Knowledge Base**
-- **{chunk_count_label} curated chunks** from 5 GitHub repositories:
-  - DevOps Exercises (real-world Q&A scenarios)
-  - AWS DevOps Zero to Hero
-  - Jenkins Zero to Hero  
-  - Docker Zero to Hero
-  - Terraform Zero to Hero
-  - mrcloudbook.com best practices
-- Powered by Qwen 2.5 14B (local LLM)
-- ChromaDB for semantic search
+### Security Model
 
-### What I Can Do
+- Local-first runtime (no cloud dependency for normal operation).
+- JWT authentication + RBAC.
+- OPA policy enforcement.
+- Tamper-evident audit trail for security review.
 
-**💡 Answer DevOps Questions**
-- AWS architecture, S3, RDS, VPC, IAM
-- Kubernetes deployments and strategies
-- Docker image optimization
-- Terraform infrastructure-as-code
-- Jenkins CI/CD pipelines
+### Product Boundary
 
-**📄 Analyze Your Files**
-- Terraform (.tf, .hcl)
-- Docker (Dockerfile)
-- Kubernetes (.yaml, .yml)
-- Shell scripts (.sh)
-- Python (.py)
-- JSON configs
+- v1.0 focuses on DevOps knowledge, observability, and guarded actions.
+- Linux VM provisioning is tracked separately on branch `provisioning-v0.1-experimental`.
 
-**⚡ Execute Safe Commands**
-- Run whitelisted shell commands
-- Commands: date, whoami, pwd, ls, cat, grep, df, free, ps, top, uptime, etc.
-- OPA blocks dangerous operations
-
-**🔍 Provide Working Examples**
-- AWS CLI commands
-- Infrastructure code
-- Configuration files
-- Best practices
-
-### What I'm NOT
-
-- ❌ Not a general-purpose chatbot
-- ❌ Not connected to the internet
-- ❌ Not sending your data anywhere
-- ❌ Not replacing human expertise (verify critical decisions!)
-
-### Try Me With
-
-- "How to secure S3 buckets in production?"
-- "Analyze this Terraform file" (upload a .tf file)
-- "Design a highly available RDS setup"
-- "Run pwd" (safe command execution)
-
-I'm here to help with your DevOps journey - ask me anything!"""
+Ask me about system state, Docker health, DevOps troubleshooting, or architecture concepts."""
 
 @app.route('/ask', methods=['POST'])
 @jwt_required()
@@ -4704,11 +4449,6 @@ def rate_limit_status():
             "default":           "30 per minute",
             "/ask":              "60 per minute (authenticated), 20 per minute (unauthenticated)",
             "/tools/<n>/run":    "10 per minute",
-            "/approvals/pending": "30 per minute",
-            "/approvals/<id>/approve": "20 per minute",
-            "/approvals/<id>/reject": "20 per minute",
-            "/approvals/<id>/execute": "10 per minute",
-            "/execute_approved": "10 per minute",
             "/react/run":        "5 per minute",
             "/auth/login":       "10 per minute (per IP, unauthenticated)",
         },
@@ -7662,81 +7402,14 @@ HTML_TEMPLATE = r'''
             if (loading) loading.remove();
         }
 
-        async function approvePendingAction(approvalId) {
+        function showApprovalHandlingGuide(approvalId) {
             if (!approvalId) return;
-            try {
-                const resp = await fetch(`/approvals/${encodeURIComponent(approvalId)}/approve`, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({}),
-                });
-                const data = await resp.json();
-                if (!resp.ok) {
-                    throw new Error(data.error || 'Approval request failed');
-                }
-                addAVAMessage({
-                    type: 'knowledge',
-                    response: `Approval ${approvalId} is now approved.`,
-                    time_taken: '',
-                    sources_used: 0,
-                });
-                loadSecurityData();
-            } catch (err) {
-                addAVAMessage({
-                    type: 'knowledge',
-                    response: `Approval failed for ${approvalId}: ${err.message || 'Unknown error'}`,
-                    time_taken: '',
-                    sources_used: 0,
-                });
-            }
-        }
-
-        async function executeApprovedAction(approvalId) {
-            if (!approvalId) return;
-            try {
-                const resp = await fetch(`/approvals/${encodeURIComponent(approvalId)}/execute`, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({}),
-                });
-                const data = await resp.json();
-                if (!resp.ok) {
-                    throw new Error(data.error || 'Execution failed');
-                }
-                addAVAMessage({
-                    type: 'command',
-                    result: {
-                        success: true,
-                        command: data.command || `approval:${approvalId}`,
-                        output: data.output || 'Approved command executed.',
-                        mode: data.mode || 'tool',
-                        risk: data.risk || 'medium',
-                        approval_id: data.approval_id || approvalId,
-                    },
-                    time_taken: '',
-                    sources_used: 0,
-                });
-                loadRecentChats();
-                loadSecurityData();
-            } catch (err) {
-                addAVAMessage({
-                    type: 'command',
-                    result: {
-                        success: false,
-                        error: `Execution failed for ${approvalId}: ${err.message || 'Unknown error'}`,
-                        risk: 'medium',
-                    },
-                    time_taken: '',
-                    sources_used: 0,
-                });
-                loadSecurityData();
-            }
-        }
-
-        async function approveAndExecuteAction(approvalId) {
-            if (!approvalId) return;
-            await approvePendingAction(approvalId);
-            await executeApprovedAction(approvalId);
+            addAVAMessage({
+                type: 'knowledge',
+                response: `Approval ${approvalId} is queued. In v1.0, use the local security review flow to approve and execute guarded actions.`,
+                time_taken: '',
+                sources_used: 0,
+            });
         }
 
         function renderCommandCard(result) {
@@ -7953,9 +7626,7 @@ HTML_TEMPLATE = r'''
             if (normalized.approval_required) {
                 const actions = rawApprovalId
                     ? `<div class="findings-actions">
-                        <button class="findings-action-btn" onclick="approveAndExecuteAction('${rawApprovalId}')">Approve & run</button>
-                        <button class="findings-action-btn" onclick="approvePendingAction('${rawApprovalId}')">Approve only</button>
-                        <button class="findings-action-btn" onclick="executeApprovedAction('${rawApprovalId}')">Execute approved</button>
+                        <button class="findings-action-btn" onclick="showApprovalHandlingGuide('${rawApprovalId}')">Review approval flow</button>
                     </div>`
                     : '';
                 return `<div class="status-card approval">
