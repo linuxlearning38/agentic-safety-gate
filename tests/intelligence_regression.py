@@ -52,6 +52,7 @@ FUNCTIONS = {
     "_build_healing_response",
     "_extract_query_entities",
     "_diagram_entities_from_text",
+    "_extract_diagram_entities",
     "_extract_relevant_context_lines",
     "_is_noisy_architecture_line",
     "_build_diagram_grounding_block",
@@ -86,6 +87,10 @@ FUNCTIONS = {
     "detect_query_intent",
     "_is_learning_query",
     "_is_single_destructive_request",
+    "_blocked_action_result",
+    "_command_response_text",
+    "_resolve_direct_action_query",
+    "_has_shell_control_syntax",
 }
 
 CONSTANTS = {
@@ -339,6 +344,7 @@ def load_helpers():
         spec = importlib.util.spec_from_file_location(name, path)
         module = importlib.util.module_from_spec(spec)
         assert spec and spec.loader
+        sys.modules[name] = module
         spec.loader.exec_module(module)
         return module
 
@@ -348,6 +354,8 @@ def load_helpers():
     evidence_selector = load_module("ava_evidence_selector", SOURCE.parent / "control" / "evidence_selector.py")
     answer_planner = load_module("ava_answer_planner", SOURCE.parent / "control" / "answer_planner.py")
     response_composer = load_module("ava_response_composer", SOURCE.parent / "control" / "response_composer.py")
+    infra_intent = load_module("ava_infra_intent", SOURCE.parent / "control" / "infra_intent.py")
+    capability_router = load_module("ava_capability_router", SOURCE.parent / "control" / "capability_router.py")
     namespace = {
         "json": json,
         "re": re,
@@ -371,11 +379,27 @@ def load_helpers():
         "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
         "build_troubleshooting_plan": answer_planner.build_troubleshooting_plan,
         "compose_controlled_response": response_composer.compose_response,
+        "classify_infrastructure_intent": infra_intent.classify_infrastructure_intent,
+        "compose_infrastructure_plan": infra_intent.compose_infrastructure_plan,
+        "render_infrastructure_plan": infra_intent.render_infrastructure_plan,
+        "route_capability": capability_router.route_capability,
         "ollama": FakeOllama(),
         "LLM_MODEL": "qwen2.5:14b",
         "db": FakeDB(),
         "healer": FakeHealer(),
         "hybrid_retriever": FakeHybridRetriever(),
+        "_audit_security_notification": lambda *args, **kwargs: None,
+        "execute_tool_safe": lambda tool_name, tool_args, query, source="unknown": {
+            "status": "success",
+            "success": True,
+            "risk": "low",
+            "tool_name": tool_name,
+            "tool_args": tool_args,
+            "command_repr": tool_name,
+            "output": "",
+            "approval_required": False,
+            "blocked": False,
+        },
         "_get_about_data": lambda: {
             "version": "2.1.2",
             "built_by": "Manoj, Delhi",
@@ -783,6 +807,8 @@ def test_fix72_host_service_inspection_truth_surface(tool_registry):
                 "runtime state requires host systemd bus access" in service_result.get("output", ""),
             )
 
+            # Force deterministic host-systemd-read-only path before calling check_failed_services.
+            tool_registry.shutil.which = lambda name: None
             failed_result = tool_registry.registry.execute("check_failed_services", {})
             failed_metadata = failed_result.get("metadata", {})
             check(
@@ -1022,16 +1048,18 @@ def main():
     check("raw command not treated as vague", ns["_is_vague_diagnostic_query"]("run date") is False)
     check("destructive command not treated as vague", ns["_is_vague_diagnostic_query"]("rm -rf /") is False)
     check("vague diagnostic clarification includes suspicious check", "'is anything suspicious on this system'" in ns["_build_vague_diagnostic_clarification"]())
-    check("hybrid classifier gate matches suspicious phrasing", ns["_should_try_operational_intent_classifier"]("look for suspicious activity") is True)
+    check("suspicious phrasing maps deterministically before hybrid classifier", ns["extract_operational_tool_request"]("look for suspicious activity") == {"tool_name": "check_suspicious_activity", "tool_args": {}})
+    check("hybrid classifier gate skips deterministic suspicious phrasing", ns["_should_try_operational_intent_classifier"]("look for suspicious activity") is False)
     check("hybrid classifier gate rejects ava self", ns["_should_try_operational_intent_classifier"]("who built you") is False)
-    classifier_suspicious = ns["_classify_operational_intent_with_llm"]("look for suspicious activity")
-    check("hybrid classifier maps suspicious activity", classifier_suspicious["tool_name"] == "check_suspicious_activity")
+    docker_status_resolved = ns["_resolve_direct_action_query"]("docker daemon status")
+    check("natural docker daemon status uses structured tool before raw command", docker_status_resolved["result"]["tool_name"] == "check_docker")
+    container_status_resolved = ns["_resolve_direct_action_query"]("which containers are up")
+    check("natural container inventory uses structured tool before raw command", container_status_resolved["result"]["tool_name"] == "list_containers")
     classifier_patching = ns["_classify_operational_intent_with_llm"]("check if my machine needs patching")
     check("hybrid classifier maps patching to updates", classifier_patching["tool_name"] == "check_updates")
-    classifier_service = ns["_classify_operational_intent_with_llm"]("can you inspect nginx service health")
-    check("hybrid classifier maps named service inspection", classifier_service["tool_name"] == "inspect_service" and classifier_service["tool_args"]["service"] == "nginx")
-    classifier_clarification = ns["_classify_operational_intent_with_llm"]("inspect my service")
-    check("hybrid classifier asks for service clarification", classifier_clarification["decision"] == "clarification" and "service name" in classifier_clarification["clarification"].lower())
+    check("named service inspection maps deterministically before hybrid classifier", ns["extract_operational_tool_request"]("can you inspect nginx service health") == {"tool_name": "inspect_service", "tool_args": {"service": "nginx"}})
+    check("hybrid classifier gate skips deterministic named service inspection", ns["_should_try_operational_intent_classifier"]("can you inspect nginx service health") is False)
+    check("service clarification is deterministic before hybrid classifier", ns["extract_operational_clarification"]("inspect my service") is not None)
     check("hybrid classifier ignores general knowledge", ns["_classify_operational_intent_with_llm"]("what is kubernetes") is None)
     correlated = tool_registry._build_correlated_assessment(
         new_listeners=["0.0.0.0:4444 users:(('python',pid=321,fd=5))"],
@@ -1152,7 +1180,7 @@ def main():
     check("ambiguous rollback asks for deployment name", ns["extract_operational_clarification"]("rollback my deployment") == "I can queue a deployment rollback, but I need the deployment name. Example: rollback deployment nginx.")
     check("ambiguous service restart asks for service name", ns["extract_operational_clarification"]("restart my service and show me the result") == "I can queue a service restart, but I need the service name. Example: restart service docker.")
     check("ambiguous pod logs asks for pod name", ns["extract_operational_clarification"]("show me pod logs") == "I can fetch pod logs, but I need the pod name. Example: show me pod logs for nginx-7d8b49557c-abc12.")
-    check("ambiguous service check asks for service name", ns["extract_operational_clarification"]("check my service") == "I can check a service, but I need the service name. Example: check service api-gateway.")
+    check("ambiguous service check asks for service name", ns["extract_operational_clarification"]("check my service") == "I can check a service, but I need the specific service name. Example: check service api-gateway.")
     check("running processes map to check_processes", ns["extract_operational_tool_request"]("show running processes") == {"tool_name": "check_processes", "tool_args": {}})
     check("listening ports map to check_listening_ports", ns["extract_operational_tool_request"]("show listening ports") == {"tool_name": "check_listening_ports", "tool_args": {}})
     check("auth failures map to check_auth_events", ns["extract_operational_tool_request"]("check ssh failures") == {"tool_name": "check_auth_events", "tool_args": {}})
@@ -1652,3 +1680,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
