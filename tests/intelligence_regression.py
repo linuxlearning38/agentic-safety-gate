@@ -354,7 +354,10 @@ def load_helpers():
     evidence_selector = load_module("ava_evidence_selector", SOURCE.parent / "control" / "evidence_selector.py")
     answer_planner = load_module("ava_answer_planner", SOURCE.parent / "control" / "answer_planner.py")
     response_composer = load_module("ava_response_composer", SOURCE.parent / "control" / "response_composer.py")
-    infra_intent = load_module("ava_infra_intent", SOURCE.parent / "control" / "infra_intent.py")
+    infra_intent = None
+    infra_path = SOURCE.parent / "control" / "infra_intent.py"
+    if infra_path.exists():
+        infra_intent = load_module("ava_infra_intent", infra_path)
     capability_router = load_module("ava_capability_router", SOURCE.parent / "control" / "capability_router.py")
     namespace = {
         "json": json,
@@ -379,9 +382,9 @@ def load_helpers():
         "build_memory_recall_plan": answer_planner.build_memory_recall_plan,
         "build_troubleshooting_plan": answer_planner.build_troubleshooting_plan,
         "compose_controlled_response": response_composer.compose_response,
-        "classify_infrastructure_intent": infra_intent.classify_infrastructure_intent,
-        "compose_infrastructure_plan": infra_intent.compose_infrastructure_plan,
-        "render_infrastructure_plan": infra_intent.render_infrastructure_plan,
+        "classify_infrastructure_intent": (infra_intent.classify_infrastructure_intent if infra_intent else (lambda q: None)),
+        "compose_infrastructure_plan": (infra_intent.compose_infrastructure_plan if infra_intent else (lambda x: x)),
+        "render_infrastructure_plan": (infra_intent.render_infrastructure_plan if infra_intent else (lambda x: "")),
         "route_capability": capability_router.route_capability,
         "ollama": FakeOllama(),
         "LLM_MODEL": "qwen2.5:14b",
