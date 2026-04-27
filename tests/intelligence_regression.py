@@ -1416,6 +1416,22 @@ def main():
     architecture_diagram_resolved = ns["_resolve_architecture_response"]("Create a mermaid diagram of your Docker architecture")
     check("controlled architecture diagram is deterministic", architecture_diagram_resolved["response"].startswith("```mermaid"))
     check("controlled architecture diagram includes ava runtime", "ava-agent:5443" in architecture_diagram_resolved["response"])
+    ava_diagram = ns["_resolve_architecture_response"]("ava diagram")
+    check("ava diagram is deterministic", ava_diagram["response"].startswith("```mermaid"))
+    check("ava diagram includes ava runtime core nodes", "ava-agent:5443" in ava_diagram["response"] and "PostgreSQL:5432" in ava_diagram["response"])
+    docker_runtime_diagram = ns["_resolve_architecture_response"]("create a mermaid diagram an acrhcitecture of docker")
+    check("docker runtime diagram avoids generic fallback", "Application Service" not in docker_runtime_diagram["response"] and "Data Store" not in docker_runtime_diagram["response"])
+    check("docker runtime diagram includes docker engine", "Docker Engine" in docker_runtime_diagram["response"] and "Container Runtime" in docker_runtime_diagram["response"])
+    ava_kubernetes_diagram = ns["_resolve_architecture_response"]("ava kubernetes diagram")
+    check("ava kubernetes diagram includes ava-service", "ava-service" in ava_kubernetes_diagram["response"])
+    check("ava kubernetes diagram includes dependency services", "OPA Service" in ava_kubernetes_diagram["response"] and "Vault Service" in ava_kubernetes_diagram["response"])
+    devops_diagram = ns["_resolve_architecture_response"]("devops diagram")
+    check("devops diagram includes lifecycle stages", "Plan" in devops_diagram["response"] and "Observe / Monitor" in devops_diagram["response"])
+    check("devops diagram avoids generic fallback", "Application Service" not in devops_diagram["response"] and "Data Store" not in devops_diagram["response"])
+    netflix_diagram = ns["_resolve_architecture_response"]("netflix diagram")
+    check("netflix diagram includes netflix stack nodes", all(term in netflix_diagram["response"] for term in ["Zuul", "Kafka", "Cassandra", "EVCache"]))
+    provisioning_diagram = ns["_resolve_architecture_response"]("ava linux provisioning diagram")
+    check("ava provisioning diagram is explicit experimental", "Experimental" in provisioning_diagram["response"] and "non-executing" in provisioning_diagram["response"])
     lifecycle_diagram_resolved = ns["_resolve_architecture_response"]("create a mermaid diagram of kubernetes, docker, and devops lifecycle")
     check("controlled lifecycle diagram is deterministic", lifecycle_diagram_resolved["response"].startswith("```mermaid"))
     check("controlled lifecycle diagram includes kubernetes", "Kubernetes Cluster" in lifecycle_diagram_resolved["response"])
@@ -1468,12 +1484,19 @@ def main():
     check("operational follow_up preserves approval gating", run_that_resolved["raw_result"]["status"] in {"approval_required", "success", "blocked"})
     comparison_resolved = ns["_resolve_comparison_response"]("What is the difference between readiness probe and liveness probe?")
     check("controlled comparison response includes both targets", "readiness probe" in comparison_resolved["response"].lower() and "liveness probe" in comparison_resolved["response"].lower())
+    comparison_vs_resolved = ns["_resolve_comparison_response"]("Explain readiness vs liveness probes")
+    check("vs comparison normalizes readiness target", "readiness probe" in comparison_vs_resolved["response"].lower())
+    check("vs comparison normalizes liveness target", "liveness probe" in comparison_vs_resolved["response"].lower())
+    check("vs comparison filters noisy probe text", "kill the main processes" not in comparison_vs_resolved["response"].lower())
     definition_resolved = ns["_resolve_definition_response"]("What is readiness probe?")
     check("controlled definition response is deterministic", "readiness probe" in definition_resolved["response"].lower() and "receive traffic" in definition_resolved["response"].lower())
     configmap_resolved = ns["_resolve_definition_response"]("What is a ConfigMap?")
     check("controlled configmap definition response is grounded", "configmap" in configmap_resolved["response"].lower() and "configuration data" in configmap_resolved["response"].lower())
     general_resolved = ns["_resolve_general_unknown_response"]("What is machine learning?")
-    check("controlled general response uses direct llm path", "machine learning" in general_resolved["response"].lower() and general_resolved["sources_used"] == 0)
+    check(
+        "controlled general response enforces v1 scope boundary",
+        "scoped to devops" in general_resolved["response"].lower() and general_resolved["sources_used"] == 0,
+    )
     unrelated_context = [
         "A cooking article about tomatoes and olive oil.",
         "A travel note about train schedules and hotel bookings.",
@@ -1686,9 +1709,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
 
 
 

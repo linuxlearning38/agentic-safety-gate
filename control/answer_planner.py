@@ -39,6 +39,8 @@ def _first_sentence(text: str) -> str:
 
 def _clean_explanation_line(text: str) -> str:
     cleaned = (text or "").strip()
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\[(.*?)\]\((.*?)\)", r"\1", cleaned)
     cleaned = re.sub(r"^(TRADEOFFS|BENEFITS|DESCRIPTION|EXAMPLE|IMPLEMENTATION):\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(copy \| explain|read more|certified kubernetes administrator course.*?)\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:")
@@ -59,6 +61,16 @@ def _looks_like_noise(text: str) -> bool:
         "used to kill the processes forcefully",
     )
     return any(marker in lower for marker in noise_markers)
+
+
+def _first_clean_signal_line(lines: list[str]) -> str:
+    for line in lines or []:
+        cleaned = _clean_explanation_line(_first_sentence(line))
+        if cleaned and not _looks_like_noise(cleaned):
+            return cleaned
+    if lines:
+        return _clean_explanation_line(_first_sentence(lines[0]))
+    return ""
 
 
 def _pick_architecture_lines(evidence_blocks: list[str], entities: list[str], *terms: str) -> list[str]:
@@ -163,17 +175,143 @@ def _known_architecture_flow_key(normalized_query: str, entities: list[str]) -> 
     combined = f"{q} {entity_text}"
     if "ingress" in combined and ("kubernetes" in combined or "k8s" in combined or "request flow" in q):
         return "kubernetes_ingress"
+    if "ava" in combined and ("kubernetes" in combined or "k8s" in combined) and any(
+        term in q for term in ("flow", "architecture", "diagram")
+    ):
+        return "ava_kubernetes"
+    if "ava" in combined and "linux" in combined and "provision" in combined and any(
+        term in q for term in ("flow", "architecture", "diagram")
+    ):
+        return "ava_linux_provisioning"
+    if "netflix" in combined and any(term in q for term in ("flow", "architecture", "diagram")):
+        return "netflix_streaming"
+    if (
+        "devops" in combined
+        and any(term in q for term in ("flow", "architecture", "diagram", "lifecycle"))
+        and not any(term in combined for term in ("kubernetes", "k8s", "docker", "terraform", "ci/cd", "cicd", "jenkins", "pipeline"))
+    ):
+        return "devops_lifecycle"
+    if (
+        ("kubernetes" in combined or "k8s" in combined)
+        and any(term in q for term in ("flow", "architecture", "diagram"))
+        and "lifecycle" not in q
+    ):
+        return "kubernetes_runtime"
     if any(term in combined for term in ("ci/cd", "cicd", "jenkins", "pipeline")) and any(
         term in q for term in ("flow", "architecture", "diagram", "pipeline")
     ):
         return "cicd_pipeline"
+    if "docker" in combined and any(term in q for term in ("flow", "architecture", "diagram")) and "lifecycle" not in q:
+        return "docker_runtime"
     if "terraform" in combined and any(term in combined for term in ("plan", "apply", "state", "drift", "flow", "diagram")):
         return "terraform_workflow"
+    if "ava" in combined and any(term in q for term in ("flow", "architecture", "diagram")):
+        return "ava_runtime"
     return None
 
 
 def _known_architecture_text(flow_key: str) -> str:
     templates = {
+        "ava_runtime": (
+            "**Components and Roles:**\n"
+            "- **ava-agent (Flask/Gunicorn):** Main API/runtime process that handles user requests.\n"
+            "- **PostgreSQL:** Durable relational state.\n"
+            "- **Redis:** Fast cache/session/runtime state.\n"
+            "- **Open Policy Agent (OPA):** Authorization/policy decision point.\n"
+            "- **Vault:** Secret management.\n"
+            "- **Ollama Host:** Local model inference endpoint.\n\n"
+            "**Request Flow:**\n"
+            "- User requests hit ava-agent first, then policy checks and guarded tool paths execute when required.\n"
+            "- ava-agent coordinates with Redis/PostgreSQL/Ollama based on request type.\n\n"
+            "**Data Flow:**\n"
+            "- Operational metadata and history are persisted through AVA state stores.\n"
+            "- Inference prompts/responses flow through the local Ollama runtime.\n\n"
+            "**Failure Points:**\n"
+            "- API process health, policy service reachability, database/cache availability, model endpoint health.\n\n"
+            "**Operational Checks:**\n"
+            "- Verify container health, listener port 5443, OPA/Redis/Postgres reachability, and model endpoint readiness."
+        ),
+        "ava_kubernetes": (
+            "**Components and Roles:**\n"
+            "- **Ingress/Gateway:** Entry point for external traffic.\n"
+            "- **ava-service:** Stable Service endpoint for AVA pods.\n"
+            "- **ava-agent Pods:** Runtime workers serving AVA requests.\n"
+            "- **Redis/PostgreSQL:** State and cache backends.\n"
+            "- **OPA/Vault/Ollama endpoints:** Policy, secrets, and model inference dependencies.\n\n"
+            "**Request Flow:**\n"
+            "- External traffic enters through ingress, routes to ava-service, then to ready ava-agent pods.\n"
+            "- Pods call dependent services (OPA/Vault/Ollama/state stores) during request handling.\n\n"
+            "**Data Flow:**\n"
+            "- AVA runtime state flows between pods and data services through cluster networking.\n"
+            "- Secrets and policy decisions are fetched on-demand for guarded operations.\n\n"
+            "**Failure Points:**\n"
+            "- Ingress routing, Service endpoints, pod readiness, dependency service availability, PVC health.\n\n"
+            "**Operational Checks:**\n"
+            "- Validate ingress events, service endpoints, pod readiness probes, and dependent service connectivity."
+        ),
+        "kubernetes_runtime": (
+            "**Components and Roles:**\n"
+            "- **Client:** Source of inbound requests.\n"
+            "- **Ingress/Gateway:** Cluster edge routing.\n"
+            "- **Kubernetes Service:** Stable backend discovery.\n"
+            "- **Deployment/ReplicaSet/Pods:** Workload controller chain and runtime instances.\n"
+            "- **Readiness Probes:** Endpoint eligibility guard.\n\n"
+            "**Request Flow:**\n"
+            "- Traffic enters ingress, is routed to Service, and then sent only to ready pod endpoints.\n"
+            "- Deployment/ReplicaSet maintain desired pod count and rollout behavior.\n\n"
+            "**Data Flow:**\n"
+            "- Request payloads traverse ingress -> service -> pod and return through the reverse path.\n"
+            "- Readiness state controls whether a pod participates in live service routing.\n\n"
+            "**Failure Points:**\n"
+            "- Ingress class/rules, service selectors/endpoints, probe failures, rollout drift, DNS/TLS issues.\n\n"
+            "**Operational Checks:**\n"
+            "- Inspect ingress/controller logs, service endpoints, pod readiness, rollout status, and events."
+        ),
+        "devops_lifecycle": (
+            "**Lifecycle Stages:**\n"
+            "- **Plan -> Code -> Build -> Test/Scan -> Package -> Deploy -> Observe -> Improve**\n\n"
+            "**Components and Roles:**\n"
+            "- **Planning/Backlog:** Defines desired change and risk.\n"
+            "- **SCM + CI:** Builds and validates the change.\n"
+            "- **Security/Quality Gates:** Enforces policy before release.\n"
+            "- **Registry + Runtime Platform:** Delivers immutable artifacts.\n"
+            "- **Observability Loop:** Feeds incidents and performance signals back into planning.\n\n"
+            "**Request/Data Flow:**\n"
+            "- Change intent becomes code, then artifact, then runtime deployment, then telemetry feedback.\n\n"
+            "**Failure Points:**\n"
+            "- Missing tests/gates, mutable artifacts, unsafe rollout, weak telemetry, no rollback discipline.\n\n"
+            "**Operational Checks:**\n"
+            "- Verify gate pass/fail evidence, deployment health, rollback readiness, and SLO-driven feedback loops."
+        ),
+        "netflix_streaming": (
+            "**Components and Roles:**\n"
+            "- **Zuul/API Gateway:** Entry/routing layer.\n"
+            "- **Backend Services:** Domain service tier.\n"
+            "- **Kafka:** Durable event transport.\n"
+            "- **Samza/Mantis:** Stream processing and near-real-time computation.\n"
+            "- **Cassandra:** Durable serving data store.\n"
+            "- **EVCache:** Hot-path cache for low latency.\n\n"
+            "**Request Flow:**\n"
+            "- Client requests enter via gateway, fan into backend services, and may publish events to Kafka.\n\n"
+            "**Data Flow:**\n"
+            "- Streams are processed and persisted into serving stores; hot reads are accelerated through cache.\n\n"
+            "**Failure Points:**\n"
+            "- Gateway routing, stream lag, consumer health, storage saturation, cache miss storms.\n\n"
+            "**Operational Checks:**\n"
+            "- Track gateway errors/latency, Kafka lag, stream processor backlog, Cassandra health, EVCache hit ratio."
+        ),
+        "ava_linux_provisioning": (
+            "**Status Note:**\n"
+            "- Linux provisioning is preserved on the experimental branch and is non-executing on master v1.0.1.\n\n"
+            "**Planned Components:**\n"
+            "- **Intent Router -> Approval Gate -> Provisioning Workflow -> VM Adapter -> Verification/Report**\n\n"
+            "**Planned Flow:**\n"
+            "- AVA parses infrastructure intent, enforces approval, then hands off to provider-specific provisioning workflow.\n"
+            "- Post-create bootstrap/verification/reporting complete the lifecycle.\n\n"
+            "**Current Master Boundary:**\n"
+            "- Diagram and architecture references are available for design visibility.\n"
+            "- Execution remains disabled in master; implementation continues on the experimental branch."
+        ),
         "kubernetes_ingress": (
             "**Components and Roles:**\n"
             "- **Client/DNS:** Resolves the public hostname and sends HTTP or HTTPS traffic toward the cluster edge.\n"
@@ -210,6 +348,24 @@ def _known_architecture_text(flow_key: str) -> str:
             "**Operational Checks:**\n"
             "- Verify pipeline logs, test reports, scan output, artifact digest, deployment events, health probes, and rollback path before promoting the release."
         ),
+        "docker_runtime": (
+            "**Components and Roles:**\n"
+            "- **Docker CLI/API:** Entry point where operators submit build, run, inspect, and lifecycle commands.\n"
+            "- **Docker Engine (dockerd):** Control plane that manages images, containers, networks, and volumes on the host.\n"
+            "- **Image Registry:** Source for pulling versioned images and destination for pushing built images.\n"
+            "- **Container Runtime:** Executes isolated containers from images with configured resources and namespaces.\n"
+            "- **Volumes/Networks:** Provide persistent data paths and service connectivity between containers and hosts.\n\n"
+            "**Request Flow:**\n"
+            "- Operator command reaches Docker Engine, which resolves image/runtime requirements and starts or updates containers.\n"
+            "- Docker Engine validates requested resources, applies network/volume wiring, and orchestrates container lifecycle state.\n\n"
+            "**Data Flow:**\n"
+            "- Image layers are pulled from registry into local cache, then mounted as container filesystems.\n"
+            "- Runtime logs and metrics flow from containers back to host observability and operational tooling.\n\n"
+            "**Failure Points:**\n"
+            "- Registry auth failures, image pull errors, port conflicts, volume mount issues, runtime permission denials, or host resource pressure.\n\n"
+            "**Operational Checks:**\n"
+            "- Verify daemon health, image pull status, container state, port bindings, volume mounts, and host CPU/memory/disk saturation."
+        ),
         "terraform_workflow": (
             "**Components and Roles:**\n"
             "- **Terraform Configuration:** Desired infrastructure state written as code.\n"
@@ -233,6 +389,82 @@ def _known_architecture_text(flow_key: str) -> str:
 
 def _known_architecture_mermaid(flow_key: str) -> str:
     diagrams = {
+        "ava_runtime": (
+            "```mermaid\n"
+            "graph LR\n"
+            "    Client[\"User Request\"] --> Ava[\"ava-agent:5443\\nFlask/Gunicorn\"]\n"
+            "    Ava --> Postgres[\"PostgreSQL:5432\"]\n"
+            "    Ava --> Redis[\"Redis:6379\"]\n"
+            "    Ava --> OPA[\"Open Policy Agent:8181\"]\n"
+            "    Ava --> Vault[\"HashiCorp Vault:8200\"]\n"
+            "    Ava --> Ollama[\"Ollama Host\"]\n"
+            "```"
+        ),
+        "ava_kubernetes": (
+            "```mermaid\n"
+            "graph LR\n"
+            "    User[\"User\"] --> Ingress[\"Ingress / API Gateway\"]\n"
+            "    Ingress --> Service[\"ava-service\"]\n"
+            "    Service --> Pods[\"ava-agent Pods\"]\n"
+            "    Config[\"ConfigMap / Secrets\"] --> Pods\n"
+            "    Pods --> Redis[\"Redis\"]\n"
+            "    Pods --> Postgres[\"PostgreSQL\"]\n"
+            "    Pods --> OPA[\"OPA Service\"]\n"
+            "    Pods --> Vault[\"Vault Service\"]\n"
+            "    Pods --> Ollama[\"Ollama Endpoint\"]\n"
+            "```"
+        ),
+        "kubernetes_runtime": (
+            "```mermaid\n"
+            "graph LR\n"
+            "    Client[\"Client\"] --> Ingress[\"Ingress / Gateway\"]\n"
+            "    Ingress --> Service[\"Kubernetes Service\"]\n"
+            "    Service --> Endpoints[\"Ready Endpoints\"]\n"
+            "    Endpoints --> Pods[\"Pods\"]\n"
+            "    Deployment[\"Deployment\"] --> ReplicaSet[\"ReplicaSet\"]\n"
+            "    ReplicaSet --> Pods\n"
+            "    Readiness[\"Readiness Probes\"] --> Endpoints\n"
+            "```"
+        ),
+        "devops_lifecycle": (
+            "```mermaid\n"
+            "graph LR\n"
+            "    Plan[\"Plan\"] --> Code[\"Code\"]\n"
+            "    Code --> Build[\"Build\"]\n"
+            "    Build --> Test[\"Test / Security Scan\"]\n"
+            "    Test --> Package[\"Package / Registry\"]\n"
+            "    Package --> Deploy[\"Deploy\"]\n"
+            "    Deploy --> Operate[\"Operate\"]\n"
+            "    Operate --> Observe[\"Observe / Monitor\"]\n"
+            "    Observe --> Improve[\"Improve / Backlog\"]\n"
+            "    Improve --> Plan\n"
+            "```"
+        ),
+        "netflix_streaming": (
+            "```mermaid\n"
+            "graph LR\n"
+            "    Client[\"Client\"] --> Zuul[\"Zuul / API Gateway\"]\n"
+            "    Zuul --> Services[\"Backend Services\"]\n"
+            "    Services --> Kafka[\"Kafka\"]\n"
+            "    Kafka --> Stream[\"Samza / Mantis\"]\n"
+            "    Stream --> Cassandra[\"Cassandra\"]\n"
+            "    Cassandra --> EVCache[\"EVCache\"]\n"
+            "    EVCache --> Client\n"
+            "```"
+        ),
+        "ava_linux_provisioning": (
+            "```mermaid\n"
+            "graph LR\n"
+            "    User[\"User Prompt\"] --> Intent[\"AVA Intent Router\"]\n"
+            "    Intent --> Approval[\"Approval Gate\"]\n"
+            "    Approval --> Workflow[\"Provisioning Workflow (Experimental)\"]\n"
+            "    Workflow --> Adapter[\"VM Provider Adapter\"]\n"
+            "    Adapter --> VM[\"Ubuntu Linux VM\"]\n"
+            "    VM --> Bootstrap[\"Role Bootstrap (Planned)\"]\n"
+            "    Bootstrap --> Verify[\"Verification + Report\"]\n"
+            "    Note[\"Master v1.0.1: non-executing\"] --> Workflow\n"
+            "```"
+        ),
         "kubernetes_ingress": (
             "```mermaid\n"
             "graph LR\n"
@@ -255,6 +487,19 @@ def _known_architecture_mermaid(flow_key: str) -> str:
             "    Registry --> Deploy[\"Deploy\"]\n"
             "    Deploy --> Observe[\"Observe Health\"]\n"
             "    Observe --> Rollback[\"Rollback if unhealthy\"]\n"
+            "```"
+        ),
+        "docker_runtime": (
+            "```mermaid\n"
+            "graph LR\n"
+            "    User[\"Operator / CI\"] --> CLI[\"Docker CLI / API\"]\n"
+            "    CLI --> Engine[\"Docker Engine (dockerd)\"]\n"
+            "    Engine --> Registry[\"Image Registry\"]\n"
+            "    Engine --> Cache[\"Local Image Cache\"]\n"
+            "    Cache --> Runtime[\"Container Runtime\"]\n"
+            "    Runtime --> Container[\"Running Containers\"]\n"
+            "    Engine --> Network[\"Docker Networks\"]\n"
+            "    Engine --> Volumes[\"Docker Volumes\"]\n"
             "```"
         ),
         "terraform_workflow": (
@@ -674,27 +919,36 @@ def build_comparison_plan(route, evidence) -> AnswerPlan:
     left_lines = collected.get(left.lower(), [])
     right_lines = collected.get(right.lower(), [])
 
-    left_summary = _clean_explanation_line(left_lines[0]) if left_lines else f"{left} is one of the options you asked to compare."
-    right_summary = _clean_explanation_line(right_lines[0]) if right_lines else f"{right} is the other option you asked to compare."
+    left_norm = left.lower().strip()
+    right_norm = right.lower().strip()
+    left_canonical = "readiness probe" if left_norm in {"readiness", "readiness probes"} else ("liveness probe" if left_norm in {"liveness", "liveness probes"} else left_norm)
+    right_canonical = "readiness probe" if right_norm in {"readiness", "readiness probes"} else ("liveness probe" if right_norm in {"liveness", "liveness probes"} else right_norm)
 
-    if left.lower() == "readiness probe":
+    left_summary = _first_clean_signal_line(left_lines) if left_lines else f"{left} is one of the options you asked to compare."
+    right_summary = _first_clean_signal_line(right_lines) if right_lines else f"{right} is the other option you asked to compare."
+
+    if left_canonical == "readiness probe":
         left_summary = "A readiness probe decides whether a container should receive traffic."
-    if right.lower() == "readiness probe":
+    if right_canonical == "readiness probe":
         right_summary = "A readiness probe decides whether a container should receive traffic."
-    if left.lower() == "liveness probe":
+    if left_canonical == "liveness probe":
         left_summary = "A liveness probe decides whether Kubernetes should restart an unhealthy container."
-    if right.lower() == "liveness probe":
+    if right_canonical == "liveness probe":
         right_summary = "A liveness probe decides whether Kubernetes should restart an unhealthy container."
 
     choose_lines = []
-    if left.lower() == "readiness probe":
+    if left_canonical == "readiness probe":
         choose_lines.append(f"- Choose **{left}** when you want Kubernetes to stop sending traffic to a container that is not ready yet.")
-    elif left_lines and not _looks_like_noise(left_lines[0]):
-        choose_lines.append(f"- Choose **{left}** when you want {_clean_explanation_line(left_lines[0]).rstrip('.')}.")
-    if right.lower() == "liveness probe":
+    elif left_lines:
+        chosen_left = _first_clean_signal_line(left_lines)
+        if chosen_left and not _looks_like_noise(chosen_left):
+            choose_lines.append(f"- Choose **{left}** when you want {chosen_left.rstrip('.')}.")
+    if right_canonical == "liveness probe":
         choose_lines.append(f"- Choose **{right}** when you want Kubernetes to restart a container that is unhealthy or stuck.")
-    elif right_lines and not _looks_like_noise(right_lines[0]):
-        choose_lines.append(f"- Choose **{right}** when you want {_clean_explanation_line(right_lines[0]).rstrip('.')}.")
+    elif right_lines:
+        chosen_right = _first_clean_signal_line(right_lines)
+        if chosen_right and not _looks_like_noise(chosen_right):
+            choose_lines.append(f"- Choose **{right}** when you want {chosen_right.rstrip('.')}.")
     if not choose_lines:
         choose_lines = [
             f"- Choose **{left}** when its operational trade-offs fit your rollout or reliability needs better.",
