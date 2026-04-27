@@ -3267,6 +3267,16 @@ def _resolve_general_unknown_response(query, prior_messages=None, route=None):
     route = route or _route_query(query)
     if not _should_direct_unknown_to_llm(query, route=route):
         return None
+    if route.intent == "general_qwen":
+        return {
+            "response": (
+                "AVA v1.0.1 is scoped to DevOps and infrastructure operations. "
+                "I can help with Kubernetes, Docker, Linux, CI/CD, observability, and guarded operational actions. "
+                "If your question is infra-related, include system context (for example: cluster, host, service, or runtime)."
+            ),
+            "confidence": "high",
+            "sources_used": 0,
+        }
     messages = [{
         "role": "system",
         "content": (
@@ -8254,7 +8264,5 @@ def route_scan_lynis():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5002, debug=False)
-
-
 
 
