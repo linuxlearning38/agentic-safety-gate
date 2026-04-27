@@ -41,7 +41,7 @@ def _with_mermaid_init(diagram: str) -> str:
     text = (diagram or "").strip()
     if not text.startswith("```mermaid"):
         return diagram
-    init = "%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '14px'}}}%%\n"
+    init = "%%{init: {'themeVariables': {'fontSize': '16px'}}}%%\n"
     return text.replace("```mermaid\n", f"```mermaid\n{init}", 1)
 
 
