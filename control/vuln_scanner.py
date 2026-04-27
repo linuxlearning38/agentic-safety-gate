@@ -30,6 +30,8 @@ LYNIS_REPORT_PATH = Path(os.getenv("LYNIS_REPORT_PATH", "/tmp/lynis-report.dat")
 LYNIS_LOG_PATH    = Path(os.getenv("LYNIS_LOG_PATH", "/tmp/lynis.log"))
 SCAN_TIMEOUT      = 300   # 5 min max for any scan
 TRIVY_SCAN_TIMEOUT = int(os.getenv("AVA_TRIVY_SCAN_TIMEOUT_SECONDS", "45"))
+TRIVY_CACHE_DIR = Path(os.getenv("TRIVY_CACHE_DIR", "/data/tmp/trivy-cache"))
+TRIVY_TMP_DIR = Path(os.getenv("TMPDIR", "/data/tmp"))
 
 # ─── Tool Availability Check ─────────────────────────────────────────────────
 
@@ -39,6 +41,44 @@ def check_tools() -> dict:
         "trivy": shutil.which("trivy") is not None,
         "lynis": shutil.which("lynis") is not None,
     }
+
+
+def _compress_trivy_error_detail(text: str) -> str:
+    lower = (text or "").lower()
+    if "failed to download vulnerability db" in lower:
+        return "failed to download vulnerability DB"
+    if "db error" in lower and "mirror.gcr.io" in lower:
+        return "failed to download vulnerability DB"
+    if "authentication required" in lower:
+        return "registry authentication required for vulnerability DB download"
+    if "context deadline exceeded" in lower or "timeout" in lower:
+        return "scanner dependency timed out while preparing vulnerability data"
+    compact = re.sub(r"\s+", " ", (text or "")).strip()
+    return compact[:200] or "empty Trivy output"
+
+
+def _build_trivy_env() -> dict:
+    env = os.environ.copy()
+    cache_dir = Path(env.get("TRIVY_CACHE_DIR") or TRIVY_CACHE_DIR)
+    tmp_dir = Path(env.get("TMPDIR") or TRIVY_TMP_DIR)
+
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # Fall back to a writable cache path under the configured temp directory.
+        cache_dir = tmp_dir / "trivy-cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+    env["TMPDIR"] = str(tmp_dir)
+    env["TMP"] = str(tmp_dir)
+    env["TEMP"] = str(tmp_dir)
+    env["TRIVY_CACHE_DIR"] = str(cache_dir)
+    return env
 
 
 # ─── Trivy ───────────────────────────────────────────────────────────────────
@@ -88,11 +128,13 @@ def scan_trivy(image: str, severity_filter: Optional[str] = None) -> dict:
     started_at = datetime.now(timezone.utc).isoformat()
 
     try:
+        trivy_env = _build_trivy_env()
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=TRIVY_SCAN_TIMEOUT + 5,
+            env=trivy_env,
         )
     except subprocess.TimeoutExpired:
         return _error_result("timeout", f"Trivy scan timed out after {TRIVY_SCAN_TIMEOUT}s")
@@ -112,7 +154,7 @@ def scan_trivy(image: str, severity_filter: Optional[str] = None) -> dict:
     except json.JSONDecodeError:
         stderr = (proc.stderr or "").strip()
         stdout = (proc.stdout or "").strip()
-        detail = stdout[:200] or stderr[:300] or "empty Trivy output"
+        detail = _compress_trivy_error_detail(stdout or stderr)
         return _error_result("parse_failed", f"Could not parse Trivy JSON output: {detail}")
 
     return _parse_trivy_json(data, image, scan_type, started_at)
