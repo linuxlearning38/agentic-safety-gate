@@ -1,8 +1,8 @@
-# AVA v1.0 - Local DevOps Knowledge Assistant
+# AVA v1.0.3 - Local DevOps Knowledge Assistant
 
 AVA is a local-first DevOps assistant focused on grounded answers, safe operations, and approval-aware execution.
 
-## v1.0 Scope (Master Branch)
+## Current Stable Scope (Master Branch)
 
 Master is intentionally scoped to the v1.0 product boundary:
 
@@ -67,7 +67,12 @@ curl -sk https://localhost:5443/ask \
 
 ## Release Notes
 
-See `V1_0_RELEASE_NOTES.md` for the v1.0 release record and known limitations.
+Current release line:
+
+- `V1_0_RELEASE_NOTES.md`
+- `V1_0_1_RELEASE_NOTES.md`
+- `V1_0_2_RELEASE_NOTES.md`
+- `V1_0_3_RELEASE_NOTES.md`
 
 ## Experimental Provisioning Branch
 
@@ -75,4 +80,3 @@ Provisioning work is preserved separately:
 
 - Branch: `provisioning-v0.1-experimental`
 - Marker doc: `PROVISIONING_BRANCH_README.md` (on that branch)
-
