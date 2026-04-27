@@ -195,7 +195,16 @@ def _clean_comparison_target(text: str) -> str:
         cleaned,
         flags=re.IGNORECASE,
     )
-    return cleaned.strip()
+    normalized = cleaned.strip().lower()
+    canonical_targets = {
+        "readiness": "readiness probe",
+        "readiness probe": "readiness probe",
+        "readiness probes": "readiness probe",
+        "liveness": "liveness probe",
+        "liveness probe": "liveness probe",
+        "liveness probes": "liveness probe",
+    }
+    return canonical_targets.get(normalized, cleaned.strip())
 
 
 def extract_comparison_targets(normalized_query: str) -> list[str]:
