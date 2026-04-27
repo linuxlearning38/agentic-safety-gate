@@ -3270,7 +3270,7 @@ def _resolve_general_unknown_response(query, prior_messages=None, route=None):
     if route.intent == "general_qwen":
         return {
             "response": (
-                "AVA v1.0.1 is scoped to DevOps and infrastructure operations. "
+                "AVA v1.0.3 is scoped to DevOps and infrastructure operations. "
                 "I can help with Kubernetes, Docker, Linux, CI/CD, observability, and guarded operational actions. "
                 "If your question is infra-related, include system context (for example: cluster, host, service, or runtime)."
             ),
@@ -8264,5 +8264,4 @@ def route_scan_lynis():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5002, debug=False)
-
 

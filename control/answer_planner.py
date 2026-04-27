@@ -302,7 +302,7 @@ def _known_architecture_text(flow_key: str) -> str:
         ),
         "ava_linux_provisioning": (
             "**Status Note:**\n"
-            "- Linux provisioning is preserved on the experimental branch and is non-executing on master v1.0.1.\n\n"
+            "- Linux provisioning is preserved on the experimental branch and is non-executing on master v1.0.3.\n\n"
             "**Planned Components:**\n"
             "- **Intent Router -> Approval Gate -> Provisioning Workflow -> VM Adapter -> Verification/Report**\n\n"
             "**Planned Flow:**\n"
@@ -462,7 +462,7 @@ def _known_architecture_mermaid(flow_key: str) -> str:
             "    Adapter --> VM[\"Ubuntu Linux VM\"]\n"
             "    VM --> Bootstrap[\"Role Bootstrap (Planned)\"]\n"
             "    Bootstrap --> Verify[\"Verification + Report\"]\n"
-            "    Note[\"Master v1.0.1: non-executing\"] --> Workflow\n"
+            "    Note[\"Master v1.0.3: non-executing\"] --> Workflow\n"
             "```"
         ),
         "kubernetes_ingress": (

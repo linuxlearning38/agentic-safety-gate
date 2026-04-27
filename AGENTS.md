@@ -9,6 +9,23 @@ AVA must behave like one assistant with one brain:
 - Security and approval policy are enforced before execution.
 - Internal subsystem boundaries are invisible to the user.
 
+## Current State
+
+Current stable line on `master`:
+
+- `v1.0` - scope-locked baseline release.
+- `v1.0.1` - stabilization and hardening patch.
+- `v1.0.2` - scope enforcement, answer quality fixes, deterministic diagrams.
+- `v1.0.3` - professional polish patch (LICENSE, README credential cleanup, real CI, repo hygiene).
+
+What is now intentionally true on `master`:
+
+- AVA enforces DevOps-only scope on v1.
+- Non-DevOps prompts are redirected instead of answered out of scope.
+- Deterministic diagrams exist for key architecture prompts.
+- Readiness vs liveness answer quality is fixed and regression-covered.
+- Repository presentation now matches shipped behavior more honestly.
+
 ## v1.0 Product Boundary (Master)
 
 Master branch is intentionally limited to:
@@ -59,3 +76,19 @@ Run before closing major serving changes:
 - `tests/ava_e2e_live_test.py`
 - `tests/ava_500_robust_audit.py`
 
+## Documentation Map
+
+Keep `AGENTS.md` as the short operational truth, not the full history.
+
+- `AGENTS.md` - serving contract, scope lock, branch intent, latest durable state.
+- `docs/AVA_V1_CURRENT_CAPABILITIES.md` - honest current v1 capability sheet.
+- `V1_0_RELEASE_NOTES.md` - v1.0 baseline release snapshot.
+- `V1_0_1_RELEASE_NOTES.md` - stabilization and validation snapshot.
+- `V1_0_2_RELEASE_NOTES.md` - scope and answer-quality hardening snapshot.
+- `V1_0_3_RELEASE_NOTES.md` - repo polish and professionalism snapshot.
+
+Rule of thumb:
+
+- Update `AGENTS.md` when the serving contract, scope boundary, or durable product truth changes.
+- Update release notes when a version ships.
+- Update capability docs when user-visible behavior changes.
