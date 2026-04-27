@@ -36,6 +36,10 @@ curl -sk https://localhost:5443/health
 
 Get a token:
 
+> **Note:** Replace `<YOUR_ADMIN_PASSWORD>` with your actual admin password.
+> Default credentials are set in `.env` and **must** be changed before any
+> non-local deployment.
+
 ```bash
 curl -sk https://localhost:5443/auth/login \
   -X POST -H "Content-Type: application/json" \
