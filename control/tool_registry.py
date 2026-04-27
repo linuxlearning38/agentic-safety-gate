@@ -1363,6 +1363,48 @@ def _check_updates(args: Dict) -> Dict:
     return _fail("No supported package manager found (apt/dnf/yum/apk)")
 
 
+def _dedupe_vulnerability_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for finding in findings or []:
+        key = (
+            str(finding.get("cve_id") or ""),
+            str(finding.get("package") or ""),
+            str(finding.get("installed_version") or ""),
+            str(finding.get("fixed_version") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(finding)
+    return deduped
+
+
+def _summarize_vulnerability_findings(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    deduped = _dedupe_vulnerability_findings(findings)
+    patchable = 0
+    no_fix = 0
+    unique_cves: set[str] = set()
+
+    for finding in deduped:
+        cve_id = str(finding.get("cve_id") or "").strip()
+        if cve_id:
+            unique_cves.add(cve_id)
+        fixed = str(finding.get("fixed_version") or "").strip().lower()
+        if fixed and fixed != "no fix available":
+            patchable += 1
+        else:
+            no_fix += 1
+
+    return {
+        "deduped": deduped,
+        "display_limit": min(10, len(deduped)),
+        "unique_cves": len(unique_cves),
+        "patchable_count": patchable,
+        "no_fix_count": no_fix,
+    }
+
+
 def _scan_host_vulnerabilities(args: Dict) -> Dict:
     tools = check_vuln_tools()
     if not tools.get("trivy"):
@@ -1379,7 +1421,9 @@ def _scan_host_vulnerabilities(args: Dict) -> Dict:
         )
 
     summary = result.get("summary", {})
-    findings = result.get("top_findings", [])
+    all_findings = list(result.get("all_findings") or result.get("top_findings") or [])
+    vuln_summary = _summarize_vulnerability_findings(all_findings)
+    findings = list(vuln_summary.get("deduped") or [])
     primary_concern = None
     lines = [
         f"Runtime filesystem vulnerability summary: CRITICAL={summary.get('CRITICAL', 0)}, HIGH={summary.get('HIGH', 0)}, MEDIUM={summary.get('MEDIUM', 0)}, LOW={summary.get('LOW', 0)}",
@@ -1415,8 +1459,16 @@ def _scan_host_vulnerabilities(args: Dict) -> Dict:
         lines.append(f"- Why it matters: {primary_concern['evidence'][0]}")
         lines.append(f"- Next action: {primary_concern['next_action']}")
         lines.append("")
-        lines.append("Top findings:")
-        for finding in findings[:10]:
+        lines.append("[Finding Overview]")
+        lines.append(
+            f"- Showing top {vuln_summary['display_limit']} of {len(findings)} runtime findings across {vuln_summary['unique_cves']} unique CVE IDs."
+        )
+        lines.append(
+            f"- Fix status: {vuln_summary['patchable_count']} with a reported fix version, {vuln_summary['no_fix_count']} currently showing no fix available."
+        )
+        lines.append("")
+        lines.append(f"Top findings (top {vuln_summary['display_limit']} of {len(findings)}):")
+        for finding in findings[: vuln_summary["display_limit"]]:
             fixed = finding.get("fixed_version") or "no fix available"
             lines.append(
                 f"- {finding.get('cve_id', 'UNKNOWN')} | {finding.get('severity', 'UNKNOWN')} | "
@@ -1467,6 +1519,13 @@ def _scan_host_vulnerabilities(args: Dict) -> Dict:
             "inspection_type": "vulnerability_scan",
             "summary": summary,
             "top_findings": findings,
+            "finding_overview": {
+                "total_findings": len(findings),
+                "display_limit": vuln_summary["display_limit"],
+                "unique_cves": vuln_summary["unique_cves"],
+                "patchable_count": vuln_summary["patchable_count"],
+                "no_fix_count": vuln_summary["no_fix_count"],
+            },
             "primary_concern": primary_concern,
             "remediation_candidates": remediation_candidates[:5],
             "broad_remediation": {
