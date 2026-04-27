@@ -323,6 +323,9 @@ def main():
         ("Explain Netflix architecture with Zuul, Kafka, Cassandra, EVCache", "external", "text", "**Components and Roles:**", "Zuul"),
         ("Create a mermaid diagram of your Docker architecture", "self_runtime", "diagram", "```mermaid", "ava-agent:5443"),
         ("Draw a diagram showing Kubernetes deployment flow", "external", "diagram", "```mermaid", "Ingress / Gateway"),
+        ("ava diagram", "external", "diagram", "```mermaid", "ava-agent:5443"),
+        ("devops diagram", "external", "diagram", "```mermaid", "Observe / Monitor"),
+        ("netflix diagram", "external", "diagram", "```mermaid", "Zuul / API Gateway"),
     ]
     for query, topic, response_mode, expected, extra in architecture_queries:
         route = ns["_route_query"](query)
@@ -374,13 +377,13 @@ def main():
         check(f"definition response {query!r}", subject.lower() in resolved["response"].lower() and expected.lower() in resolved["response"].lower())
 
     general_queries = [
-        ("What is the capital of France?", "paris"),
-        ("What is 2+2?", "4"),
-        ("Explain photosynthesis", "plants"),
-        ("What is machine learning?", "machine learning"),
-        ("What is network security?", "security"),
-        ("What is server?", "server"),
-        ("TCP vs UDP", "tcp"),
+        ("What is the capital of France?", "scoped to devops"),
+        ("What is 2+2?", "scoped to devops"),
+        ("Explain photosynthesis", "scoped to devops"),
+        ("What is machine learning?", "scoped to devops"),
+        ("What is network security?", "scoped to devops"),
+        ("What is server?", "scoped to devops"),
+        ("TCP vs UDP", "scoped to devops"),
     ]
     for query, expected in general_queries:
         route = ns["_route_query"](query)
