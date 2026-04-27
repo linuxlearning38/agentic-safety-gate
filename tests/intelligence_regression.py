@@ -1416,6 +1416,7 @@ def main():
     architecture_diagram_resolved = ns["_resolve_architecture_response"]("Create a mermaid diagram of your Docker architecture")
     check("controlled architecture diagram is deterministic", architecture_diagram_resolved["response"].startswith("```mermaid"))
     check("controlled architecture diagram includes ava runtime", "ava-agent:5443" in architecture_diagram_resolved["response"])
+    check("controlled architecture diagram sets readable font size", "fontSize" in architecture_diagram_resolved["response"])
     ava_diagram = ns["_resolve_architecture_response"]("ava diagram")
     check("ava diagram is deterministic", ava_diagram["response"].startswith("```mermaid"))
     check("ava diagram includes ava runtime core nodes", "ava-agent:5443" in ava_diagram["response"] and "PostgreSQL:5432" in ava_diagram["response"])
@@ -1488,6 +1489,13 @@ def main():
     check("vs comparison normalizes readiness target", "readiness probe" in comparison_vs_resolved["response"].lower())
     check("vs comparison normalizes liveness target", "liveness probe" in comparison_vs_resolved["response"].lower())
     check("vs comparison filters noisy probe text", "kill the main processes" not in comparison_vs_resolved["response"].lower())
+    deployment_compare = ns["_resolve_comparison_response"]("Explain blue-green vs canary deployment")
+    check("deployment comparison avoids leaked pattern labels", "pattern:" not in deployment_compare["response"].lower())
+    check(
+        "deployment comparison explains rollout difference",
+        "cutover" in deployment_compare["response"].lower()
+        and ("gradual" in deployment_compare["response"].lower() or "small percentage" in deployment_compare["response"].lower()),
+    )
     definition_resolved = ns["_resolve_definition_response"]("What is readiness probe?")
     check("controlled definition response is deterministic", "readiness probe" in definition_resolved["response"].lower() and "receive traffic" in definition_resolved["response"].lower())
     configmap_resolved = ns["_resolve_definition_response"]("What is a ConfigMap?")
@@ -1709,7 +1717,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 

@@ -37,6 +37,14 @@ def _first_sentence(text: str) -> str:
     return match[0].strip()
 
 
+def _with_mermaid_init(diagram: str) -> str:
+    text = (diagram or "").strip()
+    if not text.startswith("```mermaid"):
+        return diagram
+    init = "%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '14px'}}}%%\n"
+    return text.replace("```mermaid\n", f"```mermaid\n{init}", 1)
+
+
 def _clean_explanation_line(text: str) -> str:
     cleaned = (text or "").strip()
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
@@ -115,7 +123,8 @@ def _should_keep_architecture_entity(entity: str, evidence_blocks: list[str]) ->
 def _build_architecture_mermaid(entities: list[str], evidence_blocks: list[str], topic: str) -> str:
     lower_entities = {entity.lower(): entity for entity in entities}
     if topic == "self_runtime":
-        return (
+        return _with_mermaid_init(
+            (
             "```mermaid\n"
             "graph LR\n"
             "    Client[\"User Request\"] --> Ava[\"ava-agent:5443\\nFlask/Gunicorn\"]\n"
@@ -125,6 +134,7 @@ def _build_architecture_mermaid(entities: list[str], evidence_blocks: list[str],
             "    Ava --> Vault[\"HashiCorp Vault:8200\"]\n"
             "    Ava --> Ollama[\"Ollama Host\"]\n"
             "```"
+            )
         )
 
     edges = []
@@ -166,7 +176,7 @@ def _build_architecture_mermaid(entities: list[str], evidence_blocks: list[str],
     for left, right in edges[:8]:
         lines.append(f"    {re.sub(r'[^A-Za-z0-9]+', '', left) or 'NodeA'}[\"{left}\"] --> {re.sub(r'[^A-Za-z0-9]+', '', right) or 'NodeB'}[\"{right}\"]")
     lines.append("```")
-    return "\n".join(lines)
+    return _with_mermaid_init("\n".join(lines))
 
 
 def _known_architecture_flow_key(normalized_query: str, entities: list[str]) -> str | None:
@@ -515,13 +525,14 @@ def _known_architecture_mermaid(flow_key: str) -> str:
             "```"
         ),
     }
-    return diagrams[flow_key]
+    return _with_mermaid_init(diagrams[flow_key])
 
 
 def _build_lifecycle_mermaid(normalized_query: str, entities: list[str]) -> str:
     q = (normalized_query or "").lower()
     if "kubernetes" in q or "docker" in q or "devops" in q or "lifecycle" in q:
-        return (
+        return _with_mermaid_init(
+            (
             "```mermaid\n"
             "graph LR\n"
             "    Plan[\"Plan\"] --> Code[\"Code\"]\n"
@@ -534,6 +545,7 @@ def _build_lifecycle_mermaid(normalized_query: str, entities: list[str]) -> str:
             "    Kubernetes --> Observe[\"Observe / Monitor\"]\n"
             "    Observe --> Plan\n"
             "```"
+            )
         )
     return _build_architecture_mermaid(entities, [], "external")
 
@@ -923,6 +935,30 @@ def build_comparison_plan(route, evidence) -> AnswerPlan:
     right_norm = right.lower().strip()
     left_canonical = "readiness probe" if left_norm in {"readiness", "readiness probes"} else ("liveness probe" if left_norm in {"liveness", "liveness probes"} else left_norm)
     right_canonical = "readiness probe" if right_norm in {"readiness", "readiness probes"} else ("liveness probe" if right_norm in {"liveness", "liveness probes"} else right_norm)
+    pair = {left_canonical, right_canonical}
+
+    if pair in ({"blue-green", "canary"}, {"blue-green deployment", "canary deployment"}):
+        answer = "\n".join([
+            "**Blue-green deployment:** Run the old and new production environments in parallel, validate the new version, then switch traffic to it in one cutover.",
+            "**Canary deployment:** Send a small percentage of live traffic to the new version first, watch health and error signals, then increase traffic gradually if it stays healthy.",
+            "",
+            "**When to choose each:**",
+            "- Choose **blue-green deployment** when you want a fast cutover, simple rollback, and you can afford to keep two environments ready during the switch.",
+            "- Choose **canary deployment** when you want to reduce rollout risk by exposing the new version to only a small slice of users before full release.",
+            "",
+            "**Trade-off:**",
+            "- **Blue-green** is easier to reason about operationally, but it usually needs two full environments during the cutover window.",
+            "- **Canary** gives better progressive risk control, but it needs stronger observability and rollout discipline.",
+        ])
+        return AnswerPlan(
+            intent="comparison",
+            mode="deterministic",
+            topic="comparison",
+            answer=answer,
+            evidence=evidence.facts,
+            entities=list(evidence.entities or []),
+            confidence="high",
+        )
 
     left_summary = _first_clean_signal_line(left_lines) if left_lines else f"{left} is one of the options you asked to compare."
     right_summary = _first_clean_signal_line(right_lines) if right_lines else f"{right} is the other option you asked to compare."

@@ -99,6 +99,9 @@ services:
       WEBHOOK_SECRET:      ${WEBHOOK_SECRET:-}
       DB_PATH:             /data/ava.db
       AVA_DATA_DIR:        /data
+      TMPDIR:              /data/tmp
+      TMP:                 /data/tmp
+      TEMP:                /data/tmp
       APPROVAL_QUEUE_PATH: /data/approval_queue.json
       EXECUTION_LOG_PATH:  /data/execution_log.json
       SECURITY_AUDIT_PATH: /data/security_audit.json
@@ -106,7 +109,7 @@ services:
       WHITELIST_PATH:      /data/control_whitelist.json
       AVA_REPORTS_DIR:     /data/ava_reports
       HOME:                /tmp
-      TRIVY_CACHE_DIR:     /tmp/trivy-cache
+      TRIVY_CACHE_DIR:     /data/tmp/trivy-cache
       AVA_TRIVY_SCAN_TIMEOUT_SECONDS: "45"
       LYNIS_REPORT_PATH:   /tmp/lynis-report.dat
       LYNIS_LOG_PATH:      /tmp/lynis.log

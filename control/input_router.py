@@ -197,6 +197,9 @@ def _clean_comparison_target(text: str) -> str:
     )
     normalized = cleaned.strip().lower()
     canonical_targets = {
+        "blue-green deployment": "blue-green",
+        "blue green deployment": "blue-green",
+        "canary deployment": "canary",
         "readiness": "readiness probe",
         "readiness probe": "readiness probe",
         "readiness probes": "readiness probe",

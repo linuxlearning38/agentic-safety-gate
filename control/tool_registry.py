@@ -1523,6 +1523,57 @@ def _incomplete_vulnerability_scan_result(scan_status: str, message: str) -> Dic
     )
 
 
+def _failed_services_truth_available(environment_note: str) -> bool:
+    return environment_note not in {"systemd_unavailable", "host_systemd_read_only"}
+
+
+def _suspicious_summary_text(metadata: Dict[str, Any]) -> str:
+    primary = metadata.get("primary_concern") or {}
+    alerts = list(metadata.get("alerts") or [])
+    environment_note = str(metadata.get("failed_services_environment_note") or "").strip()
+    investigation = metadata.get("investigation_plan") or {}
+
+    lines: List[str] = []
+    if primary.get("title"):
+        lines.append(f"Primary concern: {primary['title']}")
+        if primary.get("next_action"):
+            lines.append(f"Next action: {primary['next_action']}")
+    if alerts:
+        lines.append("Alerts:")
+        lines.extend(f"- {item}" for item in alerts[:3])
+    elif not primary.get("title"):
+        lines.append("No strong suspicious indicators were confirmed from the current runtime-visible signals.")
+    if environment_note == "host_systemd_read_only":
+        lines.append("Limitation: host failed-service truth is read-only here; AVA can inspect named services but cannot read `systemctl --failed` state directly.")
+    elif environment_note == "systemd_unavailable":
+        lines.append("Limitation: full host service-state truth is unavailable because AVA is not running with systemd context.")
+    if investigation.get("step"):
+        lines.append(f"Next diagnostic step: {investigation['step']}")
+    return "\n".join(lines)
+
+
+def _vulnerability_summary_text(metadata: Dict[str, Any], output: str) -> str:
+    primary = metadata.get("primary_concern") or {}
+    summary = metadata.get("summary") or {}
+    critical = int(summary.get("CRITICAL", 0) or 0)
+    high = int(summary.get("HIGH", 0) or 0)
+
+    if primary.get("title"):
+        lines = [f"Primary concern: {primary['title']}"]
+        evidence = list(primary.get("evidence") or [])
+        if evidence:
+            lines.append(f"Evidence: {evidence[0]}")
+        if primary.get("next_action"):
+            lines.append(f"Next action: {primary['next_action']}")
+        return "\n".join(lines)
+
+    if critical > 0 or high > 0:
+        return f"Runtime CVE summary: CRITICAL={critical}, HIGH={high}."
+
+    trimmed = (output or "").strip()
+    return trimmed[:400] if trimmed else "No vulnerability summary was available."
+
+
 def _check_suspicious_activity(args: Dict) -> Dict:
     sections: List[str] = []
     findings: List[str] = []
@@ -1549,10 +1600,7 @@ def _check_suspicious_activity(args: Dict) -> Dict:
         failed_services_environment_note = str(failed_services_metadata.get("environment_note") or "").strip()
         failed_service_names = list((failed_services.get("metadata") or {}).get("failed_services", _extract_failed_service_names(failed_output)) or [])
         sections.append(f"[Failed Services]\n{failed_output}")
-        if (
-            "No failed systemd units detected." not in failed_output
-            and failed_services_metadata.get("environment_note") != "systemd_unavailable"
-        ):
+        if failed_service_names and _failed_services_truth_available(failed_services_environment_note):
             findings.append("failed systemd services detected")
     else:
         sections.append(f"[Failed Services]\n{failed_services.get('error', 'service inspection failed')}")
@@ -1699,7 +1747,7 @@ def _check_suspicious_activity(args: Dict) -> Dict:
                 "check failed services",
                 "check persistence points",
             ],
-            runtime_scope="container_runtime_limited" if failed_services_environment_note == "systemd_unavailable" else "container_runtime_observed",
+            runtime_scope="container_runtime_limited" if not _failed_services_truth_available(failed_services_environment_note) else "container_runtime_observed",
         )
 
     concern_candidates: List[Dict[str, Any]] = []
@@ -1832,7 +1880,7 @@ def _assess_host_risk(args: Dict) -> Dict:
     vuln_primary = vuln_metadata.get("primary_concern")
 
     if suspicious.get("status") == "success":
-        sections.append("[Suspicious Activity Summary]\n" + suspicious.get("output", ""))
+        sections.append("[Suspicious Activity Summary]\n" + _suspicious_summary_text(suspicious_metadata))
         if suspicious_primary:
             concern_candidates.append(dict(suspicious_primary))
         suggested_actions.extend(list(suspicious_metadata.get("suggested_actions") or []))
@@ -1840,7 +1888,7 @@ def _assess_host_risk(args: Dict) -> Dict:
         sections.append("[Suspicious Activity Summary]\n" + suspicious.get("error", "suspicious activity check failed"))
 
     if vulnerabilities.get("status") == "success":
-        sections.append("[Vulnerability Summary]\n" + vulnerabilities.get("output", ""))
+        sections.append("[Vulnerability Summary]\n" + _vulnerability_summary_text(vuln_metadata, vulnerabilities.get("output", "")))
         if vuln_primary:
             concern_candidates.append(dict(vuln_primary))
         remediation_candidates.extend(list(vuln_metadata.get("remediation_candidates") or []))
@@ -1943,20 +1991,28 @@ def _assess_host_risk(args: Dict) -> Dict:
         seen_prompts.add(prompt)
 
     primary_concern = _select_primary_concern(concern_candidates)
-    host_investigation_plan = _plan_next_diagnostic_step(
-        objective="Choose the single best next diagnostic step for host-risk investigation.",
-        facts=(correlated_assessment.get("evidence", []) if correlated_assessment else [])
-        + (primary_concern.get("evidence", []) if isinstance(primary_concern, dict) else [])
-        + host_risk_reasoning_facts[:6],
-        allowed_actions=[
-            "scan my system for vulnerabilities",
-            "check failed services",
-            "inspect process <pid>",
-            "inspect service <name>",
-            "check ssh failures",
-        ],
-        runtime_scope="container_runtime_limited" if failed_services_environment_note == "systemd_unavailable" else "container_runtime_mixed",
-    )
+    vuln_scan_incomplete = str(vuln_metadata.get("scan_status") or "").lower() in {"timeout", "parse_failed", "scan_failed"}
+    if vuln_scan_incomplete and not list(suspicious_metadata.get("alerts") or []):
+        host_investigation_plan = {
+            "step": "scan my system for vulnerabilities",
+            "rationale": "The vulnerability scan did not complete, so CVE posture is still unknown and the scanner dependency should be fixed first.",
+            "expected_signal": "A completed runtime vulnerability scan or a clear scanner-access failure that can be remediated.",
+        }
+    else:
+        host_investigation_plan = _plan_next_diagnostic_step(
+            objective="Choose the single best next diagnostic step for host-risk investigation.",
+            facts=(correlated_assessment.get("evidence", []) if correlated_assessment else [])
+            + (primary_concern.get("evidence", []) if isinstance(primary_concern, dict) else [])
+            + host_risk_reasoning_facts[:6],
+            allowed_actions=[
+                "scan my system for vulnerabilities",
+                "check failed services",
+                "inspect process <pid>",
+                "inspect service <name>",
+                "check ssh failures",
+            ],
+            runtime_scope="container_runtime_limited" if not _failed_services_truth_available(failed_services_environment_note) else "container_runtime_mixed",
+        )
     remediation_actions = [str(item.get("prompt") or "").strip() for item in deduped_candidates if str(item.get("prompt") or "").strip()]
     remediation_facts = (
         (primary_concern.get("evidence", []) if isinstance(primary_concern, dict) else [])
