@@ -79,11 +79,12 @@ def classify_case(case: dict) -> str:
     return "knowledge"
 
 
-def build_cases(rounds: int, shuffle_seed: int) -> list[dict]:
+def build_cases(rounds: int, shuffle_seed: int, start_round: int = 0) -> list[dict]:
     base_cases = smoke.build_cases()
     expanded: list[dict] = []
 
-    for round_index in range(rounds):
+    for local_round_index in range(rounds):
+        round_index = start_round + local_round_index
         for base_index, case in enumerate(base_cases):
             clone = dict(case)
             clone["query"] = mutate_query(case["query"], round_index * len(base_cases) + base_index)
@@ -106,12 +107,13 @@ def build_cases(rounds: int, shuffle_seed: int) -> list[dict]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run 500 mutated live /ask checks against AVA.")
     parser.add_argument("--rounds", type=int, default=5, help="How many 100-question rounds to run.")
+    parser.add_argument("--start-round", type=int, default=0, help="Variant round offset for generating a distinct mutation window.")
     parser.add_argument("--delay", type=float, default=1.05, help="Seconds between questions.")
     parser.add_argument("--shuffle-seed", type=int, default=20260428, help="Reserved for future shuffling; execution stays ordered for stateful checks.")
     args = parser.parse_args()
 
     token = smoke.login()
-    cases = build_cases(rounds=args.rounds, shuffle_seed=args.shuffle_seed)
+    cases = build_cases(rounds=args.rounds, shuffle_seed=args.shuffle_seed, start_round=args.start_round)
     totals = Counter()
     failures = Counter()
     sample_failures: list[dict] = []
@@ -147,6 +149,7 @@ def main() -> int:
     failed = sum(failures.values())
     passed = len(cases) - failed
     print("\n=== AVA_500_RIGOROUS_LIVE_AUDIT ===")
+    print(f"start_round={args.start_round}")
     print(f"total={len(cases)} passed={passed} failed={failed} pass_rate={(passed/len(cases))*100:.2f}% elapsed_sec={elapsed:.1f}")
     print("category_totals=" + json.dumps(dict(sorted(totals.items())), sort_keys=True))
     print("category_failures=" + json.dumps(dict(sorted(failures.items())), sort_keys=True))
