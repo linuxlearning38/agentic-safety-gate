@@ -30,6 +30,7 @@ FUNCTIONS = {
     "_extract_action_after_label",
     "_retrieve_troubleshooting_chunks",
     "_resolve_troubleshooting_response",
+    "_resolve_controlled_query",
     "_normalize_fact_key",
     "_canonical_fact_label",
     "_fact_aliases",
@@ -986,6 +987,9 @@ def main():
     check("architecture diagram route is controlled", architecture_diagram_route.intent == "architecture")
     check("architecture diagram topic", architecture_diagram_route.topic == "self_runtime")
     check("architecture diagram mode", architecture_diagram_route.response_mode == "diagram")
+    docker_architecture_route = ns["_route_query"]("docker architecture diagram")
+    check("docker architecture route is controlled", docker_architecture_route.intent == "architecture")
+    check("docker architecture route mode", docker_architecture_route.response_mode == "diagram")
     lifecycle_diagram_route = ns["_route_query"]("create a mermaid diagram of kubernetes, docker, and devops lifecycle")
     check("lifecycle diagram route is controlled", lifecycle_diagram_route.intent == "architecture")
     check("lifecycle diagram mode", lifecycle_diagram_route.response_mode == "diagram")
@@ -1418,6 +1422,9 @@ def main():
     check("controlled architecture diagram is deterministic", architecture_diagram_resolved["response"].startswith("```mermaid"))
     check("controlled architecture diagram includes ava runtime", "ava-agent:5443" in architecture_diagram_resolved["response"])
     check("controlled architecture diagram sets readable font size", "fontSize" in architecture_diagram_resolved["response"])
+    docker_architecture_controlled = ns["_resolve_controlled_query"]("docker architecture diagram")
+    check("docker architecture controlled query stays diagram", docker_architecture_controlled["type"] == "diagram")
+    check("docker architecture controlled query avoids approval flow", "approval required" not in docker_architecture_controlled["response"].lower())
     ava_diagram = ns["_resolve_architecture_response"]("ava diagram")
     check("ava diagram is deterministic", ava_diagram["response"].startswith("```mermaid"))
     check("ava diagram includes ava runtime core nodes", "ava-agent:5443" in ava_diagram["response"] and "PostgreSQL:5432" in ava_diagram["response"])
@@ -1718,4 +1725,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
