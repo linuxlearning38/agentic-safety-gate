@@ -56,7 +56,13 @@ def main() -> int:
             "ava 8 0.1 1.1 gunicorn --bind 0.0.0.0:5443"
         )
         tool_registry._check_persistence_points = lambda _args: _ok("No unusual persistence points detected.")
-        tool_registry._load_linux_operator_baseline = lambda: {}
+        tool_registry._load_linux_operator_baseline = lambda: {
+            "listeners": [
+                "LISTEN 0 2048 0.0.0.0:5443 0.0.0.0:* users:((\"gunicorn\",pid=8,fd=5))"
+            ],
+            "auth_failure_count": 0,
+            "failed_services": [],
+        }
         tool_registry._save_linux_operator_baseline = lambda _data: None
         tool_registry._scan_host_vulnerabilities = lambda _args: tool_registry._incomplete_vulnerability_scan_result(
             "parse_failed",
@@ -77,6 +83,40 @@ def main() -> int:
         host_risk = tool_registry._assess_host_risk({})
         host_output = host_risk.get("output", "")
 
+        tool_registry._scan_host_vulnerabilities = lambda _args: {
+            "status": "success",
+            "output": "\n".join([
+                "Runtime filesystem vulnerability summary: CRITICAL=0, HIGH=20, MEDIUM=0, LOW=0",
+                "Recommendation: 20 high-severity CVE(s) found. Review fixed_version fields and update packages.",
+                "",
+                "[Primary Concern]",
+                "- Top runtime CVE: CVE-2026-24882 in dirmngr",
+                "- Why it matters: Affected package: dirmngr 2.4.7-21+deb13u1+b2",
+                "- Next action: install security updates",
+            ]),
+            "metadata": {
+                "summary": {"CRITICAL": 0, "HIGH": 20, "MEDIUM": 0, "LOW": 0},
+                "primary_concern": {
+                    "title": "Top runtime CVE: CVE-2026-24882 in dirmngr",
+                    "severity": "high",
+                    "confidence": "high",
+                    "evidence": [
+                        "Affected package: dirmngr 2.4.7-21+deb13u1+b2",
+                        "Recommended fix version: no fix available",
+                        "CRITICAL=0, HIGH=20 across the runtime filesystem",
+                    ],
+                    "next_action": "install security updates",
+                },
+                "remediation_candidates": [],
+                "broad_remediation": {
+                    "action": "install_updates",
+                    "prompt": "install security updates",
+                },
+            },
+        }
+        host_risk_cve_only = tool_registry._assess_host_risk({})
+        host_cve_only_output = host_risk_cve_only.get("output", "")
+
         failures.extend(
             [
                 check("read-only failed-services limitation is not treated as a real alert", "failed systemd services detected" not in suspicious_output),
@@ -84,6 +124,8 @@ def main() -> int:
                 check("host-risk summary stays concise", "[Auth Events]" not in host_output and "[Top Processes]" not in host_output),
                 check("host-risk summary keeps Trivy failure concise", "failed to download vulnerability DB" in host_output),
                 check("host-risk summary avoids raw Trivy fatal dump", "mirror.gcr.io" not in host_output and "FATAL Fatal error" not in host_output),
+                check("host-risk CVE-only path avoids unrelated ssh investigation", "check ssh failures" not in host_cve_only_output.lower()),
+                check("host-risk CVE-only path keeps focus on vulnerability review", "review runtime cve findings" in host_cve_only_output.lower()),
             ]
         )
     finally:

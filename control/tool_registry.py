@@ -2051,11 +2051,24 @@ def _assess_host_risk(args: Dict) -> Dict:
 
     primary_concern = _select_primary_concern(concern_candidates)
     vuln_scan_incomplete = str(vuln_metadata.get("scan_status") or "").lower() in {"timeout", "parse_failed", "scan_failed"}
+    no_suspicious_alerts = (
+        not list(suspicious_metadata.get("alerts") or [])
+        and auth_failure_delta == 0
+        and not list(suspicious_metadata.get("new_listeners") or [])
+        and not list(suspicious_metadata.get("new_failed_services") or [])
+    )
     if vuln_scan_incomplete and not list(suspicious_metadata.get("alerts") or []):
         host_investigation_plan = {
             "step": "scan my system for vulnerabilities",
             "rationale": "The vulnerability scan did not complete, so CVE posture is still unknown and the scanner dependency should be fixed first.",
             "expected_signal": "A completed runtime vulnerability scan or a clear scanner-access failure that can be remediated.",
+        }
+    elif (critical_count > 0 or high_count > 0) and no_suspicious_alerts:
+        host_investigation_plan = {
+            "step": "review runtime CVE findings",
+            "rationale": "The runtime vulnerability scan already completed and no separate suspicious-activity signal is competing for attention, so the next operator decision is remediation rather than a side investigation.",
+            "expected_signal": "Whether you want to queue security updates now or track the affected packages until fixed versions become available.",
+            "priority": "medium",
         }
     else:
         host_investigation_plan = _plan_next_diagnostic_step(
