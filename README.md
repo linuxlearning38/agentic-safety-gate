@@ -1,4 +1,4 @@
-# AVA v1.0.3 - Local DevOps Knowledge Assistant
+# AVA v1.0.4 - Local DevOps Knowledge Assistant
 
 AVA is a local-first DevOps assistant focused on grounded answers, safe operations, and approval-aware execution.
 
@@ -73,6 +73,11 @@ Current release line:
 - `V1_0_1_RELEASE_NOTES.md`
 - `V1_0_2_RELEASE_NOTES.md`
 - `V1_0_3_RELEASE_NOTES.md`
+- `V1_0_4_RELEASE_NOTES.md`
+
+Current capabilities reference:
+
+- `docs/AVA_V1_CURRENT_CAPABILITIES.md`
 
 ## Experimental Provisioning Branch
 
