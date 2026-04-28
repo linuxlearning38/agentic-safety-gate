@@ -17,6 +17,7 @@ Current stable line on `master`:
 - `v1.0.1` - stabilization and hardening patch.
 - `v1.0.2` - scope enforcement, answer quality fixes, deterministic diagrams.
 - `v1.0.3` - professional polish patch (LICENSE, README credential cleanup, real CI, repo hygiene).
+- `v1.0.4` - runtime quality patch (vulnerability reporting cleanup, host-risk alignment, controlled diagram routing, rigorous validation).
 
 What is now intentionally true on `master`:
 
@@ -24,6 +25,8 @@ What is now intentionally true on `master`:
 - Non-DevOps prompts are redirected instead of answered out of scope.
 - Deterministic diagrams exist for key architecture prompts.
 - Readiness vs liveness answer quality is fixed and regression-covered.
+- Runtime vulnerability scanning is restored and reported more clearly.
+- Host-risk and suspicious-activity outputs stay aligned with environment truth.
 - Repository presentation now matches shipped behavior more honestly.
 
 ## v1.0 Product Boundary (Master)
@@ -82,10 +85,12 @@ Keep `AGENTS.md` as the short operational truth, not the full history.
 
 - `AGENTS.md` - serving contract, scope lock, branch intent, latest durable state.
 - `docs/AVA_V1_CURRENT_CAPABILITIES.md` - honest current v1 capability sheet.
+- `V1_1_WISHLIST.md` - current polish backlog and next-step sequencing for v1.1 work.
 - `V1_0_RELEASE_NOTES.md` - v1.0 baseline release snapshot.
 - `V1_0_1_RELEASE_NOTES.md` - stabilization and validation snapshot.
 - `V1_0_2_RELEASE_NOTES.md` - scope and answer-quality hardening snapshot.
 - `V1_0_3_RELEASE_NOTES.md` - repo polish and professionalism snapshot.
+- `V1_0_4_RELEASE_NOTES.md` - runtime quality, vulnerability, and validation snapshot.
 
 Rule of thumb:
 
