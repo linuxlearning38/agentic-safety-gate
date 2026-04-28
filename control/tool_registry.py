@@ -1616,12 +1616,22 @@ def _vulnerability_summary_text(metadata: Dict[str, Any], output: str) -> str:
     summary = metadata.get("summary") or {}
     critical = int(summary.get("CRITICAL", 0) or 0)
     high = int(summary.get("HIGH", 0) or 0)
+    overview = metadata.get("finding_overview") or {}
 
     if primary.get("title"):
         lines = [f"Primary concern: {primary['title']}"]
         evidence = list(primary.get("evidence") or [])
         if evidence:
             lines.append(f"Evidence: {evidence[0]}")
+        if overview:
+            total = int(overview.get("total_findings", 0) or 0)
+            unique = int(overview.get("unique_cves", 0) or 0)
+            patchable = int(overview.get("patchable_count", 0) or 0)
+            no_fix = int(overview.get("no_fix_count", 0) or 0)
+            lines.append(
+                f"Finding overview: {total} runtime findings across {unique} unique CVE IDs; "
+                f"{patchable} with a reported fix version and {no_fix} currently showing no fix available."
+            )
         if primary.get("next_action"):
             lines.append(f"Next action: {primary['next_action']}")
         return "\n".join(lines)
@@ -1792,7 +1802,7 @@ def _check_suspicious_activity(args: Dict) -> Dict:
     if any("new failed service since last baseline" in item.lower() for item in unique_findings):
         suggestion_lines.append("- Investigate newly failed services first; inspect service <name> gives the fastest next step.")
     if not suggestion_lines:
-        suggestion_lines.append("- No immediate remediation is suggested from the current signals.")
+        suggestion_lines.append("- No immediate follow-up is suggested from the current snapshot.")
 
     investigation_plan = None
     if unique_findings or correlated_assessment:
@@ -1872,7 +1882,11 @@ def _check_suspicious_activity(args: Dict) -> Dict:
         ))
     primary_concern = _select_primary_concern(concern_candidates)
 
-    header = "Potential suspicious indicators detected." if unique_findings else "No strong suspicious indicators detected from auth logs, service state, ports, processes, and persistence points."
+    header = (
+        "Potential suspicious indicators detected."
+        if unique_findings
+        else "Current runtime snapshot does not show a strong suspicious pattern across auth logs, service state, listeners, processes, and persistence points."
+    )
     if correlated_assessment:
         correlated_lines = [
             f"- {correlated_assessment['title']}",
@@ -2133,7 +2147,7 @@ def _assess_host_risk(args: Dict) -> Dict:
     sections.append("[Suggested Next Steps]\n" + "\n".join(deduped_actions))
 
     return _metadata_result(
-        "Overall host risk assessment generated from runtime CVEs, suspicious activity, and package update posture.\n\n"
+        "Host risk summary based on runtime CVEs, suspicious-activity signals, and package update posture.\n\n"
         + "\n\n".join(section for section in sections if section).strip(),
         "tool:assess_host_risk",
         _with_control_metadata({
