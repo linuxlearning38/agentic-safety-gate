@@ -670,6 +670,10 @@ def _resolve_direct_action_query(query: str) -> dict | None:
             "response": _command_response_text(blocked_result),
         }
 
+    learning_response = _resolve_learning_safety_response(query)
+    if learning_response:
+        return learning_response
+
     # Vague diagnostics like "find problems" must clarify before raw command
     # extraction, otherwise "find" is treated as a shell command starter.
     if _is_vague_diagnostic_query(query):
@@ -778,28 +782,48 @@ _RAW_COMMAND_PREFIXES = (
 )
 
 _RAW_COMMAND_STARTERS = (
-    "df", "free", "ps", "top", "uptime", "uname", "whoami", "pwd", "ls", "cat",
+    "date", "df", "free", "ps", "top", "uptime", "uname", "whoami", "pwd", "ls", "cat",
     "grep", "find", "head", "tail", "wc", "which", "hostname", "echo", "git",
     "docker", "kubectl", "helm", "terraform", "systemctl", "service", "journalctl",
     "curl", "wget", "ssh", "scp", "bash", "sh", "python", "python3", "rm", "mv",
     "cp", "chmod", "chown", "kill", "pkill", "netstat", "ss",
 )
 
-
 def extract_explicit_command_request(query: str) -> str | None:
     q = _normalize_user_query(query).strip()
     if not q:
         return None
 
+    decoration_prefix = r"^(?:(?:ava please|please|can you|could you|kindly|ava|quickly)[,\s]+)+"
+
+    def _strip_command_decorations(text: str) -> str:
+        cleaned = (text or "").strip()
+        cleaned = re.sub(r"[?!]+$", "", cleaned).strip()
+        suffixes = ("please", "for me", "right now", "now", "asap")
+        while True:
+            updated = cleaned
+            for suffix in suffixes:
+                updated = re.sub(rf"\b{re.escape(suffix)}\b$", "", updated, flags=re.IGNORECASE).strip(" ,")
+            if updated == cleaned:
+                break
+            cleaned = updated.strip()
+        parts = cleaned.split(None, 1)
+        if parts:
+            starter = parts[0].lower()
+            if starter in _RAW_COMMAND_STARTERS:
+                cleaned = starter if len(parts) == 1 else f"{starter} {parts[1]}"
+        return cleaned
+
+    q = re.sub(decoration_prefix, "", q, flags=re.IGNORECASE).strip()
     lower = q.lower()
     for prefix in _RAW_COMMAND_PREFIXES:
         if lower.startswith(prefix):
-            candidate = q[len(prefix):].strip()
+            candidate = _strip_command_decorations(q[len(prefix):].strip())
             return candidate or None
 
     first_token = q.split()[0].lower()
     if first_token in _RAW_COMMAND_STARTERS:
-        return q
+        return _strip_command_decorations(q)
 
     return None
 
@@ -835,12 +859,63 @@ def looks_like_operational_request(query: str) -> bool:
     return any(term in q for term in target_terms)
 
 
+def _resolve_learning_safety_response(query: str) -> dict | None:
+    q = _normalize_user_query(query).strip().lower()
+    if not q or not _is_learning_query(q):
+        return None
+
+    if "rm -rf" in q:
+        return {
+            "kind": "knowledge",
+            "response": (
+                "`rm -rf` recursively and forcefully deletes files and directories. "
+                "`rm -rf /` would try to erase the whole filesystem, so AVA blocks that kind of destructive execution request."
+            ),
+            "confidence": "high",
+        }
+    if "mkfs" in q or "format a disk" in q:
+        return {
+            "kind": "knowledge",
+            "response": (
+                "`mkfs` creates a filesystem on a disk or partition. "
+                "That normally destroys existing contents, so AVA blocks disk-format execution requests."
+            ),
+            "confidence": "high",
+        }
+    if "shutdown" in q or "poweroff" in q or "halt" in q or "reboot" in q:
+        return {
+            "kind": "knowledge",
+            "response": (
+                "`shutdown`, `poweroff`, `halt`, and forced reboot commands stop or restart a system. "
+                "Because they can interrupt workloads and sessions, AVA blocks those execution requests here."
+            ),
+            "confidence": "high",
+        }
+    if ("dd " in q and "of=/dev/" in q) or "dd wipe" in q:
+        return {
+            "kind": "knowledge",
+            "response": (
+                "`dd` can write raw bytes directly to a block device. "
+                "Against `/dev/*`, it can overwrite disks at a low level, so AVA blocks those destructive execution requests."
+            ),
+            "confidence": "high",
+        }
+    return None
+
+
 def _is_vague_diagnostic_query(query: str) -> bool:
     q = _normalize_user_query(query).strip().lower()
     if not q:
         return False
-    q = re.sub(r"^(?:ava please|please|can you|could you|ava|quickly)\s+", "", q).strip()
-    q = re.sub(r"\s+please$", "", q).strip(" ?!.")
+    q = re.sub(r"^(?:(?:ava please|please|can you|could you|kindly|ava|quickly)[,\s]+)+", "", q).strip()
+    while True:
+        updated = q
+        for suffix in ("please", "for me", "right now", "now", "asap"):
+            updated = re.sub(rf"\b{re.escape(suffix)}\b$", "", updated, flags=re.IGNORECASE).strip(" ,")
+        updated = updated.strip(" ?!.")
+        if updated == q:
+            break
+        q = updated
 
     if extract_operational_tool_request(q):
         return False
@@ -1088,11 +1163,17 @@ def extract_operational_tool_request(query: str) -> dict | None:
         return None
 
     lower = q.lower()
-    lower = re.sub(r"^(?:ava please|please|can you|could you|right now|now|ava|quickly)\s+", "", lower).strip()
+    lower = re.sub(r"^(?:(?:ava please|please|can you|could you|kindly|right now|now|ava|quickly)[,\s]+)+", "", lower).strip()
     lower = re.sub(r"^(?:can you|could you)\s+", "", lower).strip()
-    lower = re.sub(r"\s+for this host$", "", lower).strip()
-    lower = re.sub(r"\s+now$", "", lower).strip()
-    lower = re.sub(r"\s+please$", "", lower).strip(" ?!.")
+    while True:
+        updated = lower
+        updated = re.sub(r"\s+for this host$", "", updated).strip()
+        for suffix in ("please", "for me", "right now", "now", "asap"):
+            updated = re.sub(rf"\b{re.escape(suffix)}\b$", "", updated, flags=re.IGNORECASE).strip(" ,")
+        updated = updated.strip(" ?!.")
+        if updated == lower:
+            break
+        lower = updated
 
     # Do not extract a safe-looking structured tool from a compound shell-like
     # request. The full request must be handled by the direct-action safety path.
@@ -1498,8 +1579,15 @@ def extract_operational_clarification(query: str) -> str | None:
     q = _normalize_text(query).strip().lower()
     if not q:
         return None
-    q = re.sub(r"^(?:ava please|please|can you|could you|ava|quickly)\s+", "", q).strip()
-    q = re.sub(r"\s+please$", "", q).strip(" ?!.")
+    q = re.sub(r"^(?:(?:ava please|please|can you|could you|kindly|ava|quickly)[,\s]+)+", "", q).strip()
+    while True:
+        updated = q
+        for suffix in ("please", "for me", "right now", "now", "asap"):
+            updated = re.sub(rf"\b{re.escape(suffix)}\b$", "", updated, flags=re.IGNORECASE).strip(" ,")
+        updated = updated.strip(" ?!.")
+        if updated == q:
+            break
+        q = updated
 
     if re.search(r"\bscale\s+(?:the\s+)?deployment\s+to\s+\d+\s+replicas?\b", q):
         return "I can queue a deployment scale action, but I need the deployment name. Example: scale deployment nginx to 5 replicas."
@@ -3561,6 +3649,23 @@ def split_multi_query(query):
     
     return questions
 
+
+_NOISE_MULTI_FRAGMENTS = {
+    "please", "for me", "right now", "now", "asap", "thanks", "thank you",
+    "kindly", "ava", "ava please", "please ava",
+}
+
+
+def _is_noise_question_fragment(text: str) -> bool:
+    cleaned = (text or "").strip().strip("?.!, ").lower()
+    if not cleaned:
+        return True
+    normalized = re.sub(r"\s+", " ", cleaned)
+    if normalized in _NOISE_MULTI_FRAGMENTS:
+        return True
+    words = [word for word in normalized.split() if word]
+    return len(words) <= 3 and all(word in _NOISE_MULTI_FRAGMENTS for word in words)
+
 def detect_multiple_questions(query):
     """Detect and split a message containing multiple questions (max 3).
 
@@ -3582,6 +3687,8 @@ def detect_multiple_questions(query):
     parts = re.split(r'\?\s+', query.strip())
     parts = [p.strip() for p in parts if p.strip()]
     if len(parts) >= 2:
+        if any(_is_noise_question_fragment(part) for part in parts[1:]):
+            return [query]
         # Re-attach the "?" to each part except the last (which may already have it)
         questions = [p + '?' for p in parts[:-1]]
         last = parts[-1]
@@ -8264,4 +8371,3 @@ def route_scan_lynis():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5002, debug=False)
-

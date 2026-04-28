@@ -70,7 +70,7 @@ TROUBLESHOOTING_TOPIC_PATTERNS = {
 
 EXPLICIT_EXECUTION_MARKERS = (
     "run kubectl", "execute", "apply the fix", "apply this", "run this",
-    "run the", "kubectl apply", "kubectl exec", "diagnose now", "check now",
+    "run the", "kubectl apply", "kubectl exec",
 )
 
 FOLLOW_UP_MARKERS = (
@@ -143,7 +143,7 @@ def classify_ava_self_topic(normalized_query: str) -> str | None:
     for topic, patterns in AVA_SELF_TOPIC_PATTERNS.items():
         if any(pattern in q for pattern in patterns):
             return topic
-    if "ava" in q:
+    if q in {"ava", "ava?", "ava please", "hey ava", "hi ava"}:
         return "runtime"
     return None
 

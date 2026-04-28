@@ -86,6 +86,7 @@ FUNCTIONS = {
     "detect_multiple_questions",
     "detect_query_intent",
     "_is_learning_query",
+    "_resolve_learning_safety_response",
     "_is_single_destructive_request",
     "_blocked_action_result",
     "_command_response_text",
@@ -1717,5 +1718,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
