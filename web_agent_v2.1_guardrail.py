@@ -2299,6 +2299,16 @@ def _record_query(query, response, intent, elapsed, sources_used=0, confidence=N
 def _resolve_controlled_query(query, *, controlled_route=None, prior_messages=None):
     controlled_route = controlled_route or _route_query(query)
 
+    if controlled_route.intent == "architecture":
+        resolved = _resolve_architecture_response(query)
+        return {
+            "type": "diagram" if resolved["response_mode"] == "diagram" else "knowledge",
+            "intent": "architecture",
+            "response": resolved["response"],
+            "confidence": resolved["confidence"],
+            "sources_used": resolved["sources_used"],
+        }
+
     direct_action = _resolve_direct_action_query(query)
     if direct_action:
         if direct_action["kind"] == "command":
@@ -2324,16 +2334,6 @@ def _resolve_controlled_query(query, *, controlled_route=None, prior_messages=No
         return {
             "type": "knowledge",
             "intent": "troubleshooting",
-            "response": resolved["response"],
-            "confidence": resolved["confidence"],
-            "sources_used": resolved["sources_used"],
-        }
-
-    if controlled_route.intent == "architecture":
-        resolved = _resolve_architecture_response(query)
-        return {
-            "type": "diagram" if resolved["response_mode"] == "diagram" else "knowledge",
-            "intent": "architecture",
             "response": resolved["response"],
             "confidence": resolved["confidence"],
             "sources_used": resolved["sources_used"],
