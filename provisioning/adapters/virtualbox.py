@@ -151,6 +151,28 @@ class VirtualBoxAdapter(ProviderAdapter):
             result[key] = value_part.strip()
         return result
 
+    def _ensure_seed_storage_controller(self, instance_id: str, controller_name: str) -> None:
+        state = self.get_instance_state(instance_id)
+        controller_values = {
+            str(value).strip('"')
+            for key, value in state.raw.items()
+            if key.startswith("storagecontrollername")
+        }
+        if controller_name in controller_values:
+            return
+        self._run_vboxmanage(
+            "storagectl",
+            instance_id,
+            "--name",
+            controller_name,
+            "--add",
+            "sata",
+            "--controller",
+            "IntelAhci",
+            "--portcount",
+            "1",
+        )
+
     def _get_disk_capacity_mb(self, disk_path: str) -> int | None:
         proc = self._run_vboxmanage("showmediuminfo", "disk", disk_path, timeout=30, check=False)
         if proc.returncode != 0:
@@ -337,7 +359,40 @@ class VirtualBoxAdapter(ProviderAdapter):
         return "hostonly_configured"
 
     def inject_access(self, instance_id: str, access_spec: Dict[str, Any]) -> str:
-        raise NotImplementedError("Phase 1 scaffold only: inject_access implementation is pending.")
+        seed_iso_path = str(access_spec.get("seed_iso_path") or "").strip()
+        if not seed_iso_path:
+            raise ValueError("VirtualBox inject_access requires seed_iso_path")
+
+        state = self.get_instance_state(instance_id)
+        if not state.exists:
+            raise RuntimeError(f"VirtualBox VM '{instance_id}' does not exist")
+        if state.power_state == "running":
+            raise RuntimeError("cloud-init seed media must be attached before the VM is started")
+
+        controller_name = str(access_spec.get("storage_controller") or "AVA-Seed").strip() or "AVA-Seed"
+        self._ensure_seed_storage_controller(instance_id, controller_name)
+        self._run_vboxmanage(
+            "storageattach",
+            instance_id,
+            "--storagectl",
+            controller_name,
+            "--port",
+            "0",
+            "--device",
+            "0",
+            "--type",
+            "dvddrive",
+            "--medium",
+            seed_iso_path,
+        )
+
+        username = str(access_spec.get("username") or "ubuntu").strip() or "ubuntu"
+        self._set_extradata(instance_id, "AVA:access:seed_iso_path", seed_iso_path)
+        self._set_extradata(instance_id, "AVA:access:seed_controller", controller_name)
+        self._set_extradata(instance_id, "AVA:connection:username", username)
+        if access_spec.get("temporary_password"):
+            self._set_extradata(instance_id, "AVA:access:temporary_password_present", "true")
+        return "cloud_init_seed_attached"
 
     def get_instance_state(self, instance_id: str) -> ProviderState:
         proc = subprocess.run(
@@ -395,5 +450,6 @@ class VirtualBoxAdapter(ProviderAdapter):
             metadata={
                 "network_mode": extradata.get("AVA:connection:network_mode") or state.raw.get("nic1", "nat"),
                 "http_host_port": int(http_port) if http_port else None,
+                "seed_iso_attached": bool(extradata.get("AVA:access:seed_iso_path")),
             },
         )

@@ -2,7 +2,7 @@
 
 Date: 2026-04-30  
 Branch: `v2-development`  
-Status: Cloud-image OVA path verified
+Status: Cloud-image OVA and per-clone cloud-init access verified
 
 ## Purpose
 
@@ -129,6 +129,55 @@ Official image source:
 
 - `https://cloud-images.ubuntu.com/releases/jammy/release/ubuntu-22.04-server-cloudimg-amd64.ova`
 
+## Cloud-Init Access Mechanism
+
+The imported OVA is only the base image. Each clone still needs per-VM
+customization for:
+
+- hostname
+- username
+- temporary password
+- SSH access material
+- first-boot proof marker
+
+AVA now uses cloud-init's NoCloud local seed-media pattern for that.
+
+The seed mechanism is:
+
+1. create a temporary seed directory
+2. write `user-data`
+3. write `meta-data`
+4. build a small ISO with volume label `CIDATA`
+5. attach that ISO to the cloned VM before first boot
+6. let cloud-init customize the clone on first boot
+
+Why this approach:
+
+- cloud-init officially supports labelled ISO/VFAT seed media named `CIDATA`
+- it works without a metadata server
+- it works offline
+- it keeps the base OVA generic
+- each clone gets unique metadata
+
+The Windows host does not need `cloud-localds`, `genisoimage`, `mkisofs`,
+`xorriso`, or `oscdimg`. AVA creates the ISO with Windows IMAPI2FS through:
+
+- [C:\Users\mmc\Documents\New project 3\devops-agent\scripts\new_cloud_init_seed_iso.ps1](C:/Users/mmc/Documents/New%20project%203/devops-agent/scripts/new_cloud_init_seed_iso.ps1)
+
+The VirtualBox adapter then attaches that ISO with:
+
+- `VirtualBoxAdapter.inject_access(...)`
+
+For the live smoke, AVA seeds both:
+
+- the intended product-style temporary username/password
+- a test-only SSH public key so the smoke can verify access without manual
+  password typing
+
+The SSH key is for automation only. The v2 product UX remains temporary
+username/password with a forced password-change workflow later in the
+conversation layer.
+
 ## Previous Autoinstall Approach
 
 The explored fallback path used a **VirtualBox VISO overlay** plus Ubuntu
@@ -201,6 +250,7 @@ This script:
 - [C:\Users\mmc\Documents\New project 3\devops-agent\provisioning\adapters\virtualbox.py](C:/Users/mmc/Documents/New%20project%203/devops-agent/provisioning/adapters/virtualbox.py)
 - [C:\Users\mmc\Documents\New project 3\devops-agent\tests\virtualbox_adapter_smoke.py](C:/Users/mmc/Documents/New%20project%203/devops-agent/tests/virtualbox_adapter_smoke.py)
 - [C:\Users\mmc\Documents\New project 3\devops-agent\tests\virtualbox_adapter_live_smoke.py](C:/Users/mmc/Documents/New%20project%203/devops-agent/tests/virtualbox_adapter_live_smoke.py)
+- [C:\Users\mmc\Documents\New project 3\devops-agent\tests\virtualbox_cloud_init_access_smoke.py](C:/Users/mmc/Documents/New%20project%203/devops-agent/tests/virtualbox_cloud_init_access_smoke.py)
 
 ## Bootstrap Credentials Used During Base Template Install
 
@@ -234,6 +284,8 @@ The template is only considered ready when all of these are true:
 3. it can boot from disk without the install flow
 4. AVA’s live smoke can inspect it successfully
 5. AVA can clone it and configure NAT SSH/HTTP forwarding
+6. AVA can attach clone-specific cloud-init seed media
+7. AVA can boot the clone and verify SSH access through the seeded user
 
 Only after that can we say Phase 1 is truly closed.
 
@@ -249,15 +301,6 @@ Verified:
 - AVA’s VirtualBox adapter command flow is tested in mocked smoke
 - live bootstrap VM shell creation works
 - VirtualBox VISO overlays are supported locally
-
-Not yet fully verified:
-
-- first boot customization of cloned cloud-init guest
-- SSH login into a started clone
-- web role bootstrap on a clone
-
-Verified:
-
 - official Canonical Ubuntu 22.04 cloud-image OVA download
 - VirtualBox import as `ubuntu-cloud-image`
 - template marked as `AVA:template=ready`
@@ -265,6 +308,17 @@ Verified:
 - NAT SSH forwarding metadata
 - NAT HTTP forwarding metadata
 - cleanup of the smoke clone
+- Windows-native `CIDATA` cloud-init seed ISO creation
+- first-boot customization of a cloned cloud-init guest
+- seed ISO attachment through `VirtualBoxAdapter.inject_access`
+- SSH TCP reachability through NAT forwarding
+- SSH command execution through the seeded cloud-init user
+- cloud-init marker verification inside the started clone
+- cleanup of the cloud-init access smoke clone
+
+Not yet fully verified:
+
+- web role bootstrap on a clone
 
 ## First Real Autoinstall Failure Found
 
@@ -310,7 +364,8 @@ The intended clean sequence from here is:
 
 ## Verified Cloud-Image Run
 
-The preferred cloud-image import path was verified on 2026-04-30.
+The preferred cloud-image import and clone-access path was verified on
+2026-04-30.
 
 Source:
 
@@ -330,6 +385,16 @@ Live smoke result:
 - clone registered successfully
 - SSH host forwarding exposed `127.0.0.1:2222`
 - HTTP host forwarding exposed `127.0.0.1:8080`
+- smoke VM was destroyed after the check
+
+Cloud-init access smoke result:
+
+- NoCloud seed ISO created with `CIDATA` volume label
+- clone-specific `user-data` and `meta-data` attached before first boot
+- clone started headlessly
+- SSH became reachable through `127.0.0.1:2222`
+- seeded user executed an SSH command successfully
+- `/var/tmp/ava-cloud-init-ready` marker was verified
 - smoke VM was destroyed after the check
 
 ## Finalization Rule
