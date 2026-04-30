@@ -2,7 +2,7 @@
 
 Date: 2026-04-30  
 Branch: `v2-development`  
-Status: In progress
+Status: Cloud-image OVA path verified
 
 ## Purpose
 
@@ -112,7 +112,27 @@ the solution cannot depend on external ISO-building tools.
 
 ## Current Chosen Approach
 
-Use a **VirtualBox VISO overlay** plus Ubuntu **autoinstall** data.
+Use the official Canonical Ubuntu cloud-image OVA as the preferred template
+source.
+
+The ISO autoinstall path remains documented because it was useful while
+learning the host behavior, but it is no longer the preferred path for Phase 1.
+
+Why the cloud-image OVA is preferred:
+
+- it is already a cloud-ready Ubuntu image
+- it avoids a long interactive installer path
+- it matches the locked "cloud image / template" v2 decision
+- it is easier to import, clone, and test repeatedly
+
+Official image source:
+
+- `https://cloud-images.ubuntu.com/releases/jammy/release/ubuntu-22.04-server-cloudimg-amd64.ova`
+
+## Previous Autoinstall Approach
+
+The explored fallback path used a **VirtualBox VISO overlay** plus Ubuntu
+**autoinstall** data.
 
 This works because VirtualBox already proved locally that it can mount a VISO
 file that:
@@ -129,6 +149,10 @@ So instead of using VirtualBox preseed unattended mode, AVA now prepares:
 4. a `.viso` file that overlays those onto the original ISO
 
 Then the VM boots from that VISO-backed install media.
+
+The VISO path successfully reached real `subiquity` autoinstall execution, but
+the host then hit installer/runtime fragility around snapd seeding and late
+installer behavior. That made it less suitable as the primary v2 template path.
 
 ## Files Created For The New Autoinstall Path
 
@@ -157,6 +181,20 @@ powered off. It:
 - switches boot order to disk-only
 - detaches the installer media from SATA port 1
 - marks the template as `ready` through VirtualBox extradata
+
+### Preferred cloud-image import script
+
+- [C:\Users\mmc\Documents\New project 3\devops-agent\scripts\prepare_virtualbox_ubuntu_cloud_ova_template.ps1](C:/Users/mmc/Documents/New%20project%203/devops-agent/scripts/prepare_virtualbox_ubuntu_cloud_ova_template.ps1)
+
+This script:
+
+- downloads the official Ubuntu 22.04 cloud-image OVA if it is not already
+  cached
+- imports it into VirtualBox
+- renames it to `ubuntu-cloud-image`
+- configures NAT networking
+- sets disk-only boot order
+- marks the VM as `AVA:template=ready`
 
 ### Adapter and test files already prepared
 
@@ -214,22 +252,85 @@ Verified:
 
 Not yet fully verified:
 
-- custom autoinstall VISO path end to end
-- final installed template boot
-- post-install live adapter smoke
+- first boot customization of cloned cloud-init guest
+- SSH login into a started clone
+- web role bootstrap on a clone
+
+Verified:
+
+- official Canonical Ubuntu 22.04 cloud-image OVA download
+- VirtualBox import as `ubuntu-cloud-image`
+- template marked as `AVA:template=ready`
+- live adapter smoke clone
+- NAT SSH forwarding metadata
+- NAT HTTP forwarding metadata
+- cleanup of the smoke clone
+
+## First Real Autoinstall Failure Found
+
+During the first full autoinstall run, the installer reached late-stage
+configuration and then failed on one of AVA’s own late commands.
+
+The failing command was the earlier attempt to modify:
+
+- `/etc/ssh/sshd_config`
+
+with an inline `sed -i ...` expression through `curtin in-target`.
+
+That failed because the quoting and regex were too brittle for the installer’s
+execution environment.
+
+### Fix applied
+
+Instead of editing the main SSH config file inline, the bootstrap script now
+creates a dedicated SSH drop-in file:
+
+- `/etc/ssh/sshd_config.d/99-ava-password-auth.conf`
+
+with:
+
+- `PasswordAuthentication yes`
+
+Why this is better:
+
+- less quoting complexity
+- safer than rewriting the base config
+- easier to audit
+- easier to remove later if AVA moves to key-only bootstrap modes
 
 ## Practical Sequence
 
 The intended clean sequence from here is:
 
-1. stop/remove the current partially interactive bootstrap run
-2. generate the autoinstall overlay files
-3. recreate `ubuntu-cloud-image` with the autoinstall VISO
-4. start the VM headless
-5. wait for the install to complete
-6. run `finalize_virtualbox_ubuntu_template.ps1`
-7. verify the machine boots from disk
-8. run the live adapter smoke
+1. remove any partial `ubuntu-cloud-image` installer VM
+2. import the official Ubuntu cloud-image OVA
+3. mark the imported VM as `AVA:template=ready`
+4. run the live adapter smoke
+5. use the imported template as the source for AVA clones
+
+## Verified Cloud-Image Run
+
+The preferred cloud-image import path was verified on 2026-04-30.
+
+Source:
+
+- `https://cloud-images.ubuntu.com/releases/jammy/release/ubuntu-22.04-server-cloudimg-amd64.ova`
+
+Local cache:
+
+- `I:\ai-lab\downloads\ubuntu-22.04-server-cloudimg-amd64.ova`
+
+Imported template:
+
+- `ubuntu-cloud-image`
+
+Live smoke result:
+
+- template clone succeeded
+- clone registered successfully
+- SSH host forwarding exposed `127.0.0.1:2222`
+- HTTP host forwarding exposed `127.0.0.1:8080`
+- smoke VM was destroyed after the check
 
 ## Finalization Rule
 
