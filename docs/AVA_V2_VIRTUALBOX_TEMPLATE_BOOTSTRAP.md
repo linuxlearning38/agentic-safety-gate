@@ -146,6 +146,18 @@ This script creates:
 - a VirtualBox `.viso` overlay file
 - a headless unattended start, when requested
 
+### Finalization script
+
+- [C:\Users\mmc\Documents\New project 3\devops-agent\scripts\finalize_virtualbox_ubuntu_template.ps1](C:/Users/mmc/Documents/New%20project%203/devops-agent/scripts/finalize_virtualbox_ubuntu_template.ps1)
+
+This script is meant to run **after** the autoinstall VM has finished and
+powered off. It:
+
+- verifies the template VM is no longer running
+- switches boot order to disk-only
+- detaches the installer media from SATA port 1
+- marks the template as `ready` through VirtualBox extradata
+
 ### Adapter and test files already prepared
 
 - [C:\Users\mmc\Documents\New project 3\devops-agent\provisioning\adapters\virtualbox.py](C:/Users/mmc/Documents/New%20project%203/devops-agent/provisioning/adapters/virtualbox.py)
@@ -215,8 +227,21 @@ The intended clean sequence from here is:
 3. recreate `ubuntu-cloud-image` with the autoinstall VISO
 4. start the VM headless
 5. wait for the install to complete
-6. verify the machine boots from disk
-7. run the live adapter smoke
+6. run `finalize_virtualbox_ubuntu_template.ps1`
+7. verify the machine boots from disk
+8. run the live adapter smoke
+
+## Finalization Rule
+
+The template is not considered clone-ready just because the install ran.
+
+It becomes clone-ready only after:
+
+- the VM powers off cleanly
+- installer media is detached
+- boot order is disk-first only
+- the template is marked `AVA:template=ready`
+- the live smoke can inspect it successfully
 
 ## Why This Matters For Later AVA UX
 
