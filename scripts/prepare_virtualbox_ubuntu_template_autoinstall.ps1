@@ -151,7 +151,8 @@ autoinstall:
     - cloud-init
   late-commands:
     - curtin in-target --target=/target systemctl enable ssh
-    - curtin in-target --target=/target sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+    - curtin in-target --target=/target mkdir -p /etc/ssh/sshd_config.d
+    - curtin in-target --target=/target sh -c "printf 'PasswordAuthentication yes\n' > /etc/ssh/sshd_config.d/99-ava-password-auth.conf"
     - curtin in-target --target=/target systemctl enable cloud-init
   shutdown: poweroff
 "@
