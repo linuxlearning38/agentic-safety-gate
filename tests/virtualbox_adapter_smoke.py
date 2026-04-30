@@ -66,6 +66,16 @@ def fake_run_factory(command_log: list[list[str]]):
         if "showvminfo missing-vm --machinereadable" in command:
             return FakeCompletedProcess(returncode=1, stderr="Could not find a registered machine named 'missing-vm'")
 
+        if "showvminfo ava-seed-vm --machinereadable" in command:
+            return FakeCompletedProcess(
+                stdout="\n".join(
+                    [
+                        'name="ava-seed-vm"',
+                        'VMState="poweroff"',
+                    ]
+                )
+            )
+
         if "getextradata ava-web-server-001 enumerate" in command:
             return FakeCompletedProcess(
                 stdout="\n".join(
@@ -75,6 +85,7 @@ def fake_run_factory(command_log: list[list[str]]):
                         "Key: AVA:connection:ssh_port, Value: 2222",
                         "Key: AVA:connection:http_port, Value: 8080",
                         "Key: AVA:connection:username, Value: ubuntu",
+                        "Key: AVA:access:seed_iso_path, Value: C:\\\\tmp\\\\seed.iso",
                     ]
                 )
             )
@@ -174,6 +185,33 @@ def main() -> int:
                 check("connection info returns localhost host", connection_info.host == "127.0.0.1"),
                 check("connection info returns SSH port", connection_info.port == 2222),
                 check("connection info exposes HTTP host port metadata", connection_info.metadata.get("http_host_port") == 8080),
+                check("connection info exposes seed attachment metadata", connection_info.metadata.get("seed_iso_attached") is True),
+            ]
+        )
+
+        access_state = adapter.inject_access(
+            "ava-seed-vm",
+            {
+                "seed_iso_path": r"C:\tmp\seed.iso",
+                "username": "avaadmin",
+                "temporary_password": "present-but-not-returned",
+            },
+        )
+        failures.extend(
+            [
+                check("inject_access reports seed attachment", access_state == "cloud_init_seed_attached"),
+                check(
+                    "inject_access creates seed storage controller",
+                    any(cmd[1:5] == ["storagectl", "ava-seed-vm", "--name", "AVA-Seed"] for cmd in command_log),
+                ),
+                check(
+                    "inject_access attaches seed ISO",
+                    any(cmd[1:4] == ["storageattach", "ava-seed-vm", "--storagectl"] and r"C:\tmp\seed.iso" in cmd for cmd in command_log),
+                ),
+                check(
+                    "inject_access records seed extradata",
+                    any(cmd[1:4] == ["setextradata", "ava-seed-vm", "AVA:access:seed_iso_path"] for cmd in command_log),
+                ),
             ]
         )
 
