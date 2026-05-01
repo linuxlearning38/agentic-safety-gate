@@ -203,7 +203,8 @@ Create the stateful guided workflow foundation before role bootstrap begins.
 
 ## Phase 3 — Policy, Approval, And Credential Flow
 
-Status: implemented as a standalone regression checkpoint on 2026-05-01.
+Status: implemented as a standalone regression checkpoint on 2026-05-01. See
+`docs/AVA_V2_PHASE3_POLICY_CREDENTIALS.md`.
 
 ### Goal
 
@@ -229,24 +230,6 @@ Wire provisioning into AVA’s policy and approval model while defining the temp
 - approval-aware provisioning gate
 - temporary credential workflow
 - deterministic continuation from approval to provisioning and from login confirmation to post-login actions
-
-### Implemented Files
-
-- `provisioning/policy.py`
-- `provisioning/credentials.py`
-- `tests/provisioning_phase3_policy_credentials_regression.py`
-
-### Verified Behavior
-
-- provisioning desired state evaluates to `require_approval`
-- unsupported desired state is blocked before approval
-- approval requests use AVA's existing approval queue
-- pending approval blocks provisioning continuation
-- approved requests advance to `awaiting_first_login`
-- temporary credentials are returned once and stored only as audit metadata plus
-  hash
-- credential password is not recoverable after initial issuance
-- first-login confirmation advances to `awaiting_post_login_choices`
 
 ### Exit Criteria
 
