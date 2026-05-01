@@ -380,7 +380,8 @@ Make AVA prove that it succeeded and persist the resulting lifecycle state.
 
 ## Phase 6 — AVA Integration
 
-Status: implemented as guided `/ask` serving integration on 2026-05-01.
+Status: implemented as guided `/ask` serving integration on 2026-05-01. See
+`docs/AVA_V2_PHASE6_SERVING_INTEGRATION.md`.
 
 ### Goal
 
