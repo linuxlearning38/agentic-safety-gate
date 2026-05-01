@@ -447,6 +447,9 @@ Connect the provisioning modules to the actual AVA serving contract and guided c
 
 ## Phase 7 — Failure Modes And Rollback
 
+Status: implemented as provider-agnostic rollback/reporting primitive on
+2026-05-01. See `docs/AVA_V2_PHASE7_DESIGN.md`.
+
 ### Goal
 
 Make the first slice operationally safe under expected failures.
@@ -475,6 +478,20 @@ Make the first slice operationally safe under expected failures.
 
 - rollback and failure-handling behavior
 - predictable error reporting path
+
+### Implemented Files
+
+- `provisioning/rollback.py`
+- `tests/provisioning_phase7_rollback_regression.py`
+
+### Verified Behavior
+
+- failure before VM creation needs no cleanup
+- failure after VM creation destroys the partial VM by default
+- missing VM cleanup is treated as already clean
+- rollback destroy errors are reported cleanly
+- retain-for-debug skips destroy only when explicit
+- reports contain failure and rollback evidence
 
 ### Exit Criteria
 
