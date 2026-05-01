@@ -95,7 +95,15 @@ def _wait_for_ssh_command(
             f"{username}@{host}",
             remote_command,
         ]
-        last_proc = subprocess.run(command, capture_output=True, text=True, timeout=20)
+        try:
+            last_proc = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            last_proc = subprocess.CompletedProcess(
+                command,
+                124,
+                stdout=exc.stdout if isinstance(exc.stdout, str) else "",
+                stderr=exc.stderr if isinstance(exc.stderr, str) else "SSH cloud-init wait command timed out",
+            )
         if last_proc.returncode == 0:
             return last_proc
         time.sleep(8)
