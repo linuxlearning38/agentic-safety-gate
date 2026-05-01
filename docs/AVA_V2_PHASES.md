@@ -133,6 +133,8 @@ Create the minimal VirtualBox provider adapter that can manage one Ubuntu VM lif
 
 ## Phase 2 — Session State And Desired State
 
+Status: implemented as a standalone regression checkpoint on 2026-05-01.
+
 ### Goal
 
 Create the stateful guided workflow foundation before role bootstrap begins.
@@ -168,6 +170,24 @@ Create the stateful guided workflow foundation before role bootstrap begins.
 - persistent session model
 - desired-state dataclass and validator
 - resume/cancel support for provisioning conversations
+
+### Implemented Files
+
+- `provisioning/desired_state.py`
+- `provisioning/conversation/session_manager.py`
+- `provisioning/conversation/flow_engine.py`
+- `tests/provisioning_phase2_state_regression.py`
+
+### Verified Behavior
+
+- guided web-server requests move to `awaiting_specs`
+- missing `cpu`, `ram_gb`, and `disk_gb` are requested deterministically
+- completed specs produce a validated desired state
+- desired state defaults remain locked to VirtualBox, Ubuntu, `web_server`,
+  NAT, `web_public`, and `baseline_linux`
+- sessions survive SQLite manager reload
+- cancel moves a session to a terminal state
+- unsupported roles are rejected before provider execution
 
 ### Exit Criteria
 
