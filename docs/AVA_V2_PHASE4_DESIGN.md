@@ -2,7 +2,7 @@
 
 Date: 2026-05-01  
 Branch: `v2-development`  
-Status: Design checkpoint before implementation
+Status: Implemented after live VirtualBox web bootstrap smoke
 
 ## Purpose
 
@@ -41,6 +41,14 @@ Phase 4 should produce:
 
 Phase 4 is complete only when a real clone can be accessed over SSH, configured
 with the web role, and serve HTTP 200 through the existing NAT HTTP forwarding.
+
+Implemented files:
+
+- `provisioning/bootstrap/ssh_executor.py`
+- `provisioning/roles/base.py`
+- `provisioning/roles/web_server.py`
+- `tests/provisioning_phase4_role_bootstrap_regression.py`
+- `tests/virtualbox_web_server_bootstrap_smoke.py`
 
 ## Baseline Linux Profile
 
@@ -224,3 +232,29 @@ contract.
 
 If implementation discovers that one of these assumptions is wrong, stop and
 update this design note before continuing.
+
+## Verified Live Result
+
+Verified on 2026-05-01 with:
+
+- `python tests\virtualbox_web_server_bootstrap_smoke.py`
+
+Observed result:
+
+- cloud-init seed ISO created
+- clone created from `ubuntu-cloud-image`
+- cloud-init seed attached
+- VM started headlessly
+- SSH became reachable through `127.0.0.1:2222`
+- cloud-init marker verified
+- sudo preflight passed
+- `apt-get update` passed
+- `nginx` and `ufw` installed
+- UFW allowed `22/tcp`
+- UFW allowed `80/tcp`
+- UFW enabled
+- nginx enabled and started
+- guest-local `systemctl is-active nginx` passed
+- guest-local HTTP check passed
+- host NAT HTTP returned `HTTP 200` on `127.0.0.1:8080`
+- smoke VM was destroyed after verification
