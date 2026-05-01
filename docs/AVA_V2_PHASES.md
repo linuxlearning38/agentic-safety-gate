@@ -262,6 +262,9 @@ Wire provisioning into AVA’s policy and approval model while defining the temp
 
 ## Phase 4 — Web Server Role And Bootstrap
 
+Status: design locked before implementation on 2026-05-01. See
+`docs/AVA_V2_PHASE4_DESIGN.md`.
+
 ### Goal
 
 Build the first full role: `web_server`.
@@ -273,6 +276,7 @@ Build the first full role: `web_server`.
 
 ### Work
 
+- use `docs/AVA_V2_PHASE4_DESIGN.md` as the Phase 4 implementation contract
 - create `provisioning/roles/base.py`
 - create `provisioning/roles/web_server.py`
 - create `provisioning/bootstrap/ssh_executor.py`
