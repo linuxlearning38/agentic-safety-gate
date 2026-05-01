@@ -313,6 +313,8 @@ Build the first full role: `web_server`.
 
 ## Phase 5 — Verification And State Recording
 
+Status: implemented after Phase 5 regression and live VirtualBox web smoke on 2026-05-01.
+
 ### Goal
 
 Make AVA prove that it succeeded and persist the resulting lifecycle state.
@@ -345,6 +347,24 @@ Make AVA prove that it succeeded and persist the resulting lifecycle state.
 - verification engine
 - provisioning state store
 - evidence-backed completion report
+
+### Implemented Files
+
+- `provisioning/verify/engine.py`
+- `provisioning/state/store.py`
+- `tests/provisioning_phase5_verification_state_regression.py`
+- `tests/virtualbox_web_server_bootstrap_smoke.py`
+
+### Verified Behavior
+
+- verification requires VM existence, running state, connection metadata, SSH reachability, nginx activity, guest HTTP, and host HTTP
+- every verification check records status, timestamp, evidence, and failure class where applicable
+- stopped or unreachable VMs fail cleanly before role-level checks
+- host HTTP failure produces a failed report instead of a success assumption
+- successful verification persists as a `completed` provisioning record
+- failed verification persists as a `failed` provisioning record
+- desired state, actual state, verification evidence, and timestamps are stored in SQLite
+- live VirtualBox web smoke now saves verification evidence after nginx returns `HTTP 200`
 
 ### Exit Criteria
 

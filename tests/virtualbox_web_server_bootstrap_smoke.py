@@ -21,6 +21,8 @@ sys.path.insert(0, str(ROOT))
 from provisioning.adapters.virtualbox import VirtualBoxAdapter  # noqa: E402
 from provisioning.bootstrap import SSHConnection, SSHExecutor  # noqa: E402
 from provisioning.roles.web_server import WebServerRole  # noqa: E402
+from provisioning.state import ProvisioningStateStore  # noqa: E402
+from provisioning.verify import VerificationEngine  # noqa: E402
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -179,21 +181,20 @@ def main() -> int:
         )
         _check("cloud-init seed ISO created", seed_iso.exists() and seed_iso.stat().st_size > 0, str(seed_iso))
 
-        plan = adapter.plan_instance(
-            {
-                "provider": "virtualbox",
-                "os": "ubuntu",
-                "role": "web_server",
-                "vm_name": vm_name,
-                "cpu": int(os.getenv("AVA_VBOX_WEB_CPU", "2")),
-                "ram_gb": int(os.getenv("AVA_VBOX_WEB_RAM_GB", "2")),
-                "disk_gb": int(os.getenv("AVA_VBOX_WEB_DISK_GB", "30")),
-                "network_mode": "nat",
-                "firewall_profile": "web_public",
-                "hardening_profile": "baseline_linux",
-                "username": username,
-            }
-        )
+        desired_state = {
+            "provider": "virtualbox",
+            "os": "ubuntu",
+            "role": "web_server",
+            "vm_name": vm_name,
+            "cpu": int(os.getenv("AVA_VBOX_WEB_CPU", "2")),
+            "ram_gb": int(os.getenv("AVA_VBOX_WEB_RAM_GB", "2")),
+            "disk_gb": int(os.getenv("AVA_VBOX_WEB_DISK_GB", "30")),
+            "network_mode": "nat",
+            "firewall_profile": "web_public",
+            "hardening_profile": "baseline_linux",
+            "username": username,
+        }
+        plan = adapter.plan_instance(desired_state)
         created_vm = adapter.create_instance(plan)
         _check("instance created", created_vm == vm_name, created_vm)
         access_result = adapter.inject_access(
@@ -249,6 +250,27 @@ def main() -> int:
         _check("host HTTP 200 verified", ok, detail)
         if not ok:
             return 1
+
+        verification = VerificationEngine(
+            adapter,
+            executor_factory=lambda _connection: executor,
+        )
+        verification_report = verification.verify_web_server(created_vm)
+        _check("verification engine passed", verification_report.passed, verification_report.status)
+        if not verification_report.passed:
+            for check in verification_report.checks:
+                print(f"[VERIFY] {check.name}: {check.status} {check.evidence}")
+            return 1
+
+        store = ProvisioningStateStore(work_dir / "provisioning-state.sqlite3")
+        record = store.save_verification(
+            session_id=f"smoke-{created_vm}",
+            desired_state=desired_state,
+            actual_state=adapter.get_instance_state(created_vm).raw,
+            verification_report=verification_report,
+        )
+        reloaded_record = store.get(created_vm)
+        _check("verification state persisted", bool(reloaded_record and reloaded_record.outcome == "completed"), record.instance_id)
 
         print("\nVirtualBox web_server bootstrap smoke passed.")
         print(f"VM name: {created_vm}")
