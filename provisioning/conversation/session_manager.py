@@ -57,6 +57,7 @@ class ProvisioningSession:
     collected_answers: Dict[str, Any] = field(default_factory=dict)
     desired_state: Dict[str, Any] = field(default_factory=dict)
     approval_id: str | None = None
+    credential_id: str | None = None
     instance_id: str | None = None
     created_at: str = field(default_factory=_utc_now)
     updated_at: str = field(default_factory=_utc_now)
@@ -95,12 +96,19 @@ class SessionManager:
                     collected_answers TEXT NOT NULL,
                     desired_state TEXT NOT NULL,
                     approval_id TEXT,
+                    credential_id TEXT,
                     instance_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(provisioning_sessions)").fetchall()
+            }
+            if "credential_id" not in columns:
+                conn.execute("ALTER TABLE provisioning_sessions ADD COLUMN credential_id TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_provisioning_sessions_user_phase "
                 "ON provisioning_sessions(user_id, phase)"
@@ -122,10 +130,10 @@ class SessionManager:
                 """
                 INSERT INTO provisioning_sessions (
                     session_id, user_id, phase, intent, role, provider,
-                    collected_answers, desired_state, approval_id, instance_id,
+                    collected_answers, desired_state, approval_id, credential_id, instance_id,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     user_id=excluded.user_id,
                     phase=excluded.phase,
@@ -135,6 +143,7 @@ class SessionManager:
                     collected_answers=excluded.collected_answers,
                     desired_state=excluded.desired_state,
                     approval_id=excluded.approval_id,
+                    credential_id=excluded.credential_id,
                     instance_id=excluded.instance_id,
                     updated_at=excluded.updated_at
                 """,
@@ -148,6 +157,7 @@ class SessionManager:
                     _json_dumps(session.collected_answers),
                     _json_dumps(session.desired_state),
                     session.approval_id,
+                    session.credential_id,
                     session.instance_id,
                     session.created_at,
                     session.updated_at,
@@ -207,6 +217,7 @@ class SessionManager:
             collected_answers=_json_loads(row["collected_answers"]),
             desired_state=_json_loads(row["desired_state"]),
             approval_id=row["approval_id"],
+            credential_id=row["credential_id"],
             instance_id=row["instance_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
