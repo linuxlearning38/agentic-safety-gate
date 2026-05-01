@@ -62,6 +62,8 @@ from flask_limiter.util import get_remote_address
 from flask_limiter.errors import RateLimitExceeded
 from control.security_layer import security_audit_log
 from control.capability_router import route_capability
+from control.runtime_paths import get_runtime_path
+from provisioning.serving import ProvisioningChatService
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -69,6 +71,17 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
+
+_provisioning_chat_service = None
+
+
+def _get_provisioning_chat_service():
+    global _provisioning_chat_service
+    if _provisioning_chat_service is None:
+        _provisioning_chat_service = ProvisioningChatService(
+            get_runtime_path("PROVISIONING_SESSION_DB", "provisioning_sessions.sqlite3")
+        )
+    return _provisioning_chat_service
 
 # ── Day 5: JWT Authentication ─────────────────────────────────────────────────
 jwt_manager = init_jwt(app)
@@ -2296,8 +2309,37 @@ def _record_query(query, response, intent, elapsed, sources_used=0, confidence=N
         logger.warning(f"[DB] save_query failed: {_dbe}")
 
 
+def _resolve_provisioning_chat(query, *, controlled_route=None):
+    route_intent = controlled_route.intent if controlled_route else None
+    try:
+        user_id = get_jwt_identity() or "default"
+    except Exception:
+        user_id = "default"
+    result = _get_provisioning_chat_service().handle(
+        str(user_id),
+        query,
+        route_intent=route_intent,
+    )
+    if not result.handled:
+        return None
+    return {
+        "type": "knowledge",
+        "intent": "provisioning",
+        "response": result.response,
+        "confidence": result.confidence,
+        "sources_used": 0,
+        "metadata": result.metadata,
+    }
+
+
 def _resolve_controlled_query(query, *, controlled_route=None, prior_messages=None):
     controlled_route = controlled_route or _route_query(query)
+
+    provisioning_resolver = globals().get("_resolve_provisioning_chat")
+    if provisioning_resolver:
+        provisioning_resolved = provisioning_resolver(query, controlled_route=controlled_route)
+        if provisioning_resolved:
+            return provisioning_resolved
 
     if controlled_route.intent == "architecture":
         resolved = _resolve_architecture_response(query)
@@ -3094,7 +3136,7 @@ def _build_healing_response(query):
 def detect_query_intent(query):
     q = _normalize_user_query(query).lower().strip()
     controlled_route = _route_query(query)
-    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting", "architecture", "follow_up", "comparison", "definition", "general_qwen"):
+    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting", "architecture", "follow_up", "comparison", "definition", "provisioning", "general_qwen"):
         return controlled_route.intent
     if _is_healing_query(q):
         return "healing_incident"

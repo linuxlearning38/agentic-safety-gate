@@ -51,6 +51,26 @@ DIAGRAM_MARKERS = (
     "flow chart", "sequence", "graph ",
 )
 
+PROVISIONING_REQUEST_MARKERS = (
+    "i want a vm",
+    "i need a vm",
+    "create a vm",
+    "create vm",
+    "provision a vm",
+    "provision vm",
+    "build a vm",
+    "build vm",
+    "new vm",
+    "ubuntu vm",
+    "ubuntu virtual machine",
+    "web server in ubuntu",
+    "ubuntu web server",
+    "nginx server in ubuntu",
+    "create a web server",
+    "i want a web server",
+    "i need a web server",
+)
+
 TROUBLESHOOTING_TOPIC_PATTERNS = {
     "oomkilled": ["oomkilled", "oom killed"],
     "crashloopbackoff": ["crashloopbackoff", "crashloop"],
@@ -182,6 +202,15 @@ def classify_architecture_topic(normalized_query: str, entities: list[str] | Non
     return topic, response_mode
 
 
+def classify_provisioning_topic(normalized_query: str) -> str | None:
+    q = f" {(normalized_query or '').lower().strip()} "
+    if any(marker in q for marker in DIAGRAM_MARKERS):
+        return None
+    if any(marker in q for marker in PROVISIONING_REQUEST_MARKERS):
+        return "create_vm"
+    return None
+
+
 def is_follow_up_query(normalized_query: str) -> bool:
     q = (normalized_query or "").lower().strip()
     return any(marker in q for marker in FOLLOW_UP_MARKERS)
@@ -306,6 +335,18 @@ def route_query(
                 recall_label=recall_label,
                 reason="matched deterministic memory recall request",
             )
+
+    provisioning_topic = classify_provisioning_topic(normalized_query)
+    if provisioning_topic:
+        return IntentRoute(
+            raw_query=raw_query,
+            normalized_query=normalized_query,
+            intent="provisioning",
+            confidence="high",
+            entities=entities,
+            topic=provisioning_topic,
+            reason=f"matched provisioning topic '{provisioning_topic}'",
+        )
 
     architecture_match = classify_architecture_topic(normalized_query, entities)
     if architecture_match:

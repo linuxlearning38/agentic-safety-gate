@@ -380,6 +380,8 @@ Make AVA prove that it succeeded and persist the resulting lifecycle state.
 
 ## Phase 6 — AVA Integration
 
+Status: implemented as guided `/ask` serving integration on 2026-05-01.
+
 ### Goal
 
 Connect the provisioning modules to the actual AVA serving contract and guided conversation experience.
@@ -410,6 +412,25 @@ Connect the provisioning modules to the actual AVA serving contract and guided c
 ### Output
 
 - user-facing guided provisioning flow inside AVA
+
+### Implemented Files
+
+- `provisioning/serving.py`
+- `control/input_router.py`
+- `web_agent_v2.1_guardrail.py`
+- `tests/provisioning_phase6_serving_regression.py`
+
+### Verified Behavior
+
+- provisioning requests such as `I want a web server in Ubuntu` route to the v2 guided flow
+- provisioning diagrams remain on the architecture/diagram path instead of starting a VM session
+- active provisioning sessions accept spec answers without requiring the user to repeat the original request
+- AVA queues approval once CPU, RAM, and disk specs are collected
+- AVA does not issue temporary credentials while approval is pending
+- approved sessions issue temporary credentials once and move to first-login confirmation
+- first-login confirmation moves the session to post-login hardening choices
+- hardening choice is recorded and moves the session to the bootstrapping checkpoint
+- unrelated knowledge prompts are not hijacked when no provisioning session is active
 
 ### Exit Criteria
 
