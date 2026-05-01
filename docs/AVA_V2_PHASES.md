@@ -245,7 +245,7 @@ Wire provisioning into AVA’s policy and approval model while defining the temp
 
 ## Phase 4 — Web Server Role And Bootstrap
 
-Status: design locked before implementation on 2026-05-01. See
+Status: implemented after live VirtualBox web bootstrap smoke on 2026-05-01. See
 `docs/AVA_V2_PHASE4_DESIGN.md`.
 
 ### Goal
@@ -276,6 +276,28 @@ Build the first full role: `web_server`.
 - role contract
 - working web server bootstrap
 - hardening-capable post-login continuation
+
+### Implemented Files
+
+- `provisioning/roles/base.py`
+- `provisioning/roles/web_server.py`
+- `provisioning/bootstrap/ssh_executor.py`
+- `tests/provisioning_phase4_role_bootstrap_regression.py`
+- `tests/virtualbox_web_server_bootstrap_smoke.py`
+
+### Verified Behavior
+
+- `web_server` role is locked to `nginx`, `ufw`, `ssh`, `22/tcp`, and `80/tcp`
+- SSH executor returns structured command evidence
+- command failures are classified into the Phase 4 failure vocabulary
+- live clone accepts cloud-init access
+- live SSH bootstrap installs nginx and ufw
+- UFW allows SSH before enablement
+- UFW allows HTTP before nginx verification
+- nginx is enabled and active
+- guest-local HTTP check passes
+- host NAT HTTP returns `HTTP 200`
+- smoke VM is destroyed after verification
 
 ### Exit Criteria
 
