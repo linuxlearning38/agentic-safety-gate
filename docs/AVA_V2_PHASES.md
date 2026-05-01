@@ -507,6 +507,9 @@ Make the first slice operationally safe under expected failures.
 
 ## Phase 8 — End-to-End Test And Release Gate
 
+Status: implemented and passed live VirtualBox release gate on 2026-05-01. See
+`docs/AVA_V2_PHASE8_E2E_RELEASE_GATE.md`.
+
 ### Goal
 
 Prove that `v2.0.0` works as a repeatable system, not a one-off demo.
@@ -534,6 +537,28 @@ Prove that `v2.0.0` works as a repeatable system, not a one-off demo.
 
 - repeatable `v2.0.0` end-to-end test
 - release gate for tagging
+
+### Implemented Files
+
+- `tests/v2_e2e_test.py`
+
+### Verified Behavior
+
+- guided provisioning starts from `I want a web server in Ubuntu`
+- AVA collects CPU, RAM, and disk specs
+- approval is queued before infrastructure changes
+- pending approval does not expose credentials
+- approved session issues temporary credentials once
+- VirtualBox clone is created from the Ubuntu cloud-image template
+- cloud-init access media is injected
+- first-access marker is confirmed over SSH
+- first-login confirmation and hardening choice are accepted by the guided flow
+- nginx and ufw are bootstrapped on the guest
+- host NAT HTTP returns `HTTP 200`
+- verification engine passes
+- completion evidence is persisted in SQLite
+- wall time is under the 10-minute release gate
+- test VM is destroyed during cleanup
 
 ### Exit Criteria
 
