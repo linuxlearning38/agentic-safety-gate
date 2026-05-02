@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,6 +84,7 @@ def test_seed_iso_cleanup_ordering() -> list[bool]:
             call_log.append(args)
             if args and args[0] == "closemedium":
                 file_present_at_closemedium.append(seed_iso.exists())
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     runner = HostRunner.__new__(HostRunner)
     runner.adapter = TrackingAdapter()
@@ -100,10 +102,45 @@ def test_seed_iso_cleanup_ordering() -> list[bool]:
 
     return [
         check("storageattach --medium none was issued", storageattach_idx != -1),
+        check("storageattach uses forceunmount", any(c[0] == "storageattach" and "--forceunmount" in c for c in call_log)),
         check("closemedium dvd was issued", closemedium_idx != -1 and "dvd" in closemedium_args),
         check("storageattach precedes closemedium in call order", 0 <= storageattach_idx < closemedium_idx),
         check("seed ISO still existed when closemedium was called", bool(file_present_at_closemedium) and file_present_at_closemedium[0]),
         check("seed ISO deleted after cleanup", not seed_iso.exists()),
+    ]
+
+
+def test_seed_iso_closemedium_uuid_fallback() -> list[bool]:
+    tmp = Path(tempfile.mkdtemp())
+    seed_iso = tmp / "seed.iso"
+    seed_iso.write_bytes(b"fake-iso-content")
+    seed_uuid = "bfc35d86-b0a4-4e7a-878a-4ed956991433"
+    call_log: list[tuple[str, ...]] = []
+
+    class TrackingAdapter:
+        def _run_vboxmanage(self, *args: str, check: bool = True, timeout: int = 120):
+            call_log.append(args)
+            if args[:3] == ("closemedium", "dvd", str(seed_iso)):
+                return SimpleNamespace(returncode=1, stdout="", stderr="medium is still locked")
+            if args == ("list", "dvds"):
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f"UUID:           {seed_uuid}\nLocation:       {seed_iso}\n",
+                    stderr="",
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.adapter = TrackingAdapter()
+
+    try:
+        runner._detach_seed_iso("test-vm-01", seed_iso)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return [
+        check("failed path close triggers dvd list fallback", any(c == ("list", "dvds") for c in call_log)),
+        check("uuid closemedium fallback is issued", ("closemedium", "dvd", seed_uuid) in call_log),
     ]
 
 
@@ -185,6 +222,7 @@ def main() -> int:
 
     print("\n--- cleanup ordering (Phase 9 fix: closemedium before unlink) ---")
     failures.extend(test_seed_iso_cleanup_ordering())
+    failures.extend(test_seed_iso_closemedium_uuid_fallback())
 
     failed_count = len([item for item in failures if not item])
     if failed_count:
