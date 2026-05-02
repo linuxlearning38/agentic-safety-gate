@@ -221,6 +221,7 @@ class VirtualBoxAdapter(ProviderAdapter):
                 "vm_group": self.vm_group,
                 "firewall_profile": desired_state.get("firewall_profile"),
                 "hardening_profile": desired_state.get("hardening_profile"),
+                "hostname": vm_name,
                 "ssh_host_port": desired_state.get("ssh_host_port"),
                 "http_host_port": desired_state.get("http_host_port"),
                 "username": desired_state.get("username") or "ubuntu",

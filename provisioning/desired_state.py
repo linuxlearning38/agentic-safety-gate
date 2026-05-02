@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import re
 from typing import Any, Dict, Iterable
 
 
@@ -13,6 +14,7 @@ ALLOWED_NETWORK_MODES = {"nat", "bridged", "hostonly"}
 ALLOWED_FIREWALL_PROFILES = {"web_public", "internal_only"}
 ALLOWED_HARDENING_PROFILES = {"baseline_linux", "none"}
 REQUIRED_SPEC_FIELDS = ("cpu", "ram_gb", "disk_gb")
+HOSTNAME_PATTERN = r"^[a-z][a-z0-9-]{0,62}$"
 
 
 class DesiredStateError(ValueError):
@@ -31,6 +33,20 @@ def _coerce_positive_int(value: Any, field_name: str) -> int:
 
 def _normalize_text(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def _normalize_hostname(value: Any) -> str | None:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    normalized = raw.replace("_", "-")
+    if not re.fullmatch(HOSTNAME_PATTERN, normalized):
+        raise DesiredStateError(
+            "hostname must start with a letter and contain only lowercase letters, numbers, and hyphens"
+        )
+    if normalized.endswith("-"):
+        raise DesiredStateError("hostname must not end with a hyphen")
+    return normalized
 
 
 @dataclass(slots=True)
@@ -64,7 +80,7 @@ class DesiredState:
             "firewall_profile": _normalize_text(answers.get("firewall_profile") or "web_public"),
             "hardening_profile": _normalize_text(answers.get("hardening_profile") or "baseline_linux"),
             "post_login_actions": list(answers.get("post_login_actions") or []),
-            "vm_name": str(answers.get("vm_name")).strip() if answers.get("vm_name") else None,
+            "vm_name": _normalize_hostname(answers.get("vm_name") or answers.get("hostname")),
         }
         desired = cls(**normalized)
         desired.validate()

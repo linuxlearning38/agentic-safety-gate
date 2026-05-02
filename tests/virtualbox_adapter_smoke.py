@@ -133,6 +133,7 @@ def main() -> int:
             check("plan converts RAM GB to MB", plan.memory_mb == 4096),
             check("plan preserves disk size", plan.disk_gb == 40),
             check("plan preserves network mode", plan.network_mode == "nat"),
+            check("plan preserves hostname metadata", plan.metadata.get("hostname") == "ava-web-server-001"),
             check("plan preserves requested SSH host port", plan.metadata.get("ssh_host_port") == 2222),
             check("parsed showvminfo extracts VM state", parsed.get("VMState") == "running"),
         ]
