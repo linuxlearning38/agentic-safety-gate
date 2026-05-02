@@ -1764,6 +1764,13 @@ def _normalize_user_query(query):
     text = _normalize_text(query).strip()
     if not text:
         return ""
+    starts_with_infra_quantity = bool(
+        re.match(
+            r"^\s*\d+\s*(?:cpu|cpus|core|cores|vcpu|vcpus|gb|g\b|ram|memory|disk|storage|volume)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
     # Strip repeated list, outline, and punctuation-heavy prefixes such as:
     # "1. ", "2) ", "2.1.2. ", "a.b.c. ", "--- ", or mixed copied numbering junk.
     patterns = [
@@ -1775,7 +1782,9 @@ def _normalize_user_query(query):
     previous = None
     while text and text != previous:
         previous = text
-        for pattern in patterns:
+        for index, pattern in enumerate(patterns):
+            if index == 0 and starts_with_infra_quantity:
+                continue
             text = re.sub(pattern, '', text).strip()
     # If the query still contains a question trigger later in the string, trim to it.
     question_markers = [
