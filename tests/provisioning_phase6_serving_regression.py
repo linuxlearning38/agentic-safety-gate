@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 from control import approval  # noqa: E402
 from control.input_router import route_query  # noqa: E402
 from provisioning.conversation import SessionPhase  # noqa: E402
+from provisioning.runner import ProvisioningJob, ProvisioningJobResult  # noqa: E402
 from provisioning.serving import ProvisioningChatService  # noqa: E402
 
 
@@ -26,12 +27,55 @@ def check(name: str, condition: bool, detail: str = "") -> bool:
     return condition
 
 
+class FakeProvisioningJobQueue:
+    def __init__(self):
+        self.jobs: dict[str, ProvisioningJob] = {}
+        self.statuses: dict[str, str] = {}
+        self.results: dict[str, ProvisioningJobResult] = {}
+        self.counter = 0
+
+    def enqueue_approved_job(self, *, session_id, desired_state, credential_id, username, temporary_password):
+        self.counter += 1
+        job_id = f"job-{self.counter:04d}"
+        job = ProvisioningJob(
+            job_id=job_id,
+            session_id=session_id,
+            desired_state=dict(desired_state),
+            credentials_seed_data={
+                "credential_id": credential_id,
+                "username": username,
+                "temporary_password": temporary_password,
+            },
+            enqueued_at="2026-05-02T00:00:00+00:00",
+            expires_at="2026-05-02T00:30:00+00:00",
+        )
+        self.jobs[job_id] = job
+        self.statuses[job_id] = "queued"
+        return job
+
+    def claim_next_job(self, *, timeout_seconds=30):
+        return None
+
+    def get_status(self, job_id):
+        return self.statuses.get(job_id)
+
+    def write_status(self, job_id, status):
+        self.statuses[job_id] = status
+
+    def get_result(self, job_id):
+        return self.results.get(job_id)
+
+    def write_result(self, result):
+        self.results[result.job_id] = result
+
+
 def main() -> int:
     temp_dir = Path(tempfile.mkdtemp(prefix="ava-phase6-serving-"))
     old_queue = os.environ.get("APPROVAL_QUEUE_PATH")
     os.environ["APPROVAL_QUEUE_PATH"] = str(temp_dir / "approval_queue.json")
     try:
-        service = ProvisioningChatService(temp_dir / "provisioning_sessions.sqlite3")
+        job_queue = FakeProvisioningJobQueue()
+        service = ProvisioningChatService(temp_dir / "provisioning_sessions.sqlite3", job_queue=job_queue)
         failures: list[bool] = []
 
         start_route = route_query("I want a web server in Ubuntu")
@@ -129,8 +173,10 @@ def main() -> int:
                 check("chat approval with separator is handled", approved.handled),
                 check("chat approval updates queue", approval.get_by_id(approval_id).get("status") == "approved"),
                 check("chat approval issues one-time credential", "temporary password" in approved.response.lower()),
+                check("chat approval queues runner job", "runner job queued" in approved.response.lower()),
                 check("chat approval clarifies runner boundary", "host-side" in approved.response.lower()),
                 check("chat approval explains putty endpoint later", "putty connection host/ip" in approved.response.lower()),
+                check("runner job contains temporary seed secret", bool(job_queue.jobs["job-0001"].credentials_seed_data.get("temporary_password"))),
                 check("approved phase awaits first login", approved_session.phase == SessionPhase.AWAITING_FIRST_LOGIN, approved_session.phase.value),
             ]
         )
@@ -161,11 +207,39 @@ def main() -> int:
         failures.extend(
             [
                 check("web verification follow-up stays in provisioning session", verify.handled),
-                check("web verification reports no attached VM honestly", "no vm instance is attached" in verify.response.lower()),
+                check("web verification reports queued runner honestly", "runner status" in verify.response.lower()),
                 check("status follow-up stays in provisioning session", status.handled),
                 check("status reports current phase", "bootstrapping" in status.response.lower()),
                 check("evidence follow-up stays in provisioning session", evidence.handled),
-                check("evidence distinguishes conversation from VM creation", "conversation and approval evidence" in evidence.response.lower()),
+                check("evidence reports runner job", "runner job id" in evidence.response.lower()),
+            ]
+        )
+
+        job_queue.write_status("job-0001", "completed")
+        job_queue.write_result(
+            ProvisioningJobResult(
+                job_id="job-0001",
+                instance_id="ava-web-01",
+                instance_name="ava-web-01",
+                ssh_host="127.0.0.1",
+                ssh_port=2222,
+                http_port=8080,
+                verification_evidence={
+                    "checks": [
+                        {"name": "host_http_200", "passed": True, "evidence": "HTTP 200"},
+                    ]
+                },
+                completion_timestamp="2026-05-02T00:10:00+00:00",
+                error=None,
+            )
+        )
+        completed_status = service.handle("user-1", "show me the provisioning status", route_intent=None)
+        completed_verify = service.handle("user-1", "verify the web server", route_intent=None)
+        failures.extend(
+            [
+                check("completed status shows putty ssh host", "ssh host/ip: `127.0.0.1`" in completed_status.response.lower()),
+                check("completed status shows putty ssh port", "ssh port: `2222`" in completed_status.response.lower()),
+                check("completed verify shows http evidence", "http://127.0.0.1:8080/" in completed_verify.response.lower()),
             ]
         )
 

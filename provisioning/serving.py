@@ -10,6 +10,7 @@ from typing import Any
 
 from control import approval
 from provisioning.conversation import ProvisioningFlowEngine, SessionManager, SessionPhase
+from provisioning.runner import ProvisioningJobQueue, ProvisioningJobResult, RedisProvisioningJobQueue
 
 
 @dataclass(slots=True)
@@ -25,9 +26,10 @@ class ProvisioningServingResult:
 class ProvisioningChatService:
     """Bridge natural chat turns into the v2 provisioning FSM."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, job_queue: ProvisioningJobQueue | None = None):
         self.sessions = SessionManager(db_path)
         self.flow = ProvisioningFlowEngine(self.sessions)
+        self.job_queue = job_queue or RedisProvisioningJobQueue()
 
     def handle(self, user_id: str, query: str, *, route_intent: str | None = None) -> ProvisioningServingResult:
         user_id = str(user_id or "default")
@@ -36,6 +38,12 @@ class ProvisioningChatService:
         active = self._active_session(user_id)
 
         if active and _is_cancel(normalized):
+            job_id = (active.collected_answers or {}).get("runner_job_id")
+            if job_id:
+                try:
+                    self.job_queue.write_status(job_id, "cancelled")
+                except Exception:
+                    pass
             response = self.flow.cancel(active.session_id)
             return self._result(response.message, response.session)
 
@@ -49,13 +57,13 @@ class ProvisioningChatService:
             return ProvisioningServingResult(handled=False)
 
         if _is_status_query(normalized):
-            return self._result(_format_status_response(active), active)
+            return self._result(_format_status_response(active, self._runner_snapshot(active)), active)
 
         if _is_evidence_query(normalized):
-            return self._result(_format_evidence_response(active), active)
+            return self._result(_format_evidence_response(active, self._runner_snapshot(active)), active)
 
         if _is_web_verification_query(normalized):
-            return self._result(_format_verification_response(active), active)
+            return self._result(_format_verification_response(active, self._runner_snapshot(active)), active)
 
         phase = active.phase
         if phase == SessionPhase.AWAITING_VM_TYPE:
@@ -102,11 +110,13 @@ class ProvisioningChatService:
                     )
                 approval.update_status(approval_id, "approved")
                 response = self.flow.continue_after_approval(active.session_id)
-                return self._result(_format_flow_response(response), response.session, approval_id=response.approval_id)
+                message = self._format_approval_and_enqueue(response)
+                return self._result(message, response.session, approval_id=response.approval_id)
             if not _is_approval_continuation(normalized):
                 return ProvisioningServingResult(handled=False)
             response = self.flow.continue_after_approval(active.session_id)
-            return self._result(_format_flow_response(response), response.session, approval_id=response.approval_id)
+            message = self._format_approval_and_enqueue(response)
+            return self._result(message, response.session, approval_id=response.approval_id)
 
         if phase == SessionPhase.AWAITING_FIRST_LOGIN:
             if not _is_first_login_confirmation(normalized):
@@ -147,6 +157,49 @@ class ProvisioningChatService:
         if response.requires_approval and response.desired_state_ready:
             response = self.flow.request_approval(response.session.session_id)
         return self._result(_format_flow_response(response), response.session, approval_id=response.approval_id)
+
+    def _format_approval_and_enqueue(self, response) -> str:
+        message = _format_flow_response(response)
+        credential = response.credential
+        if not credential:
+            return message
+        try:
+            job = self.job_queue.enqueue_approved_job(
+                session_id=response.session.session_id,
+                desired_state=response.session.desired_state,
+                credential_id=credential.credential_id,
+                username=credential.username,
+                temporary_password=credential.temporary_password or "",
+            )
+            session = self.sessions.record_answers(response.session.session_id, {"runner_job_id": job.job_id})
+            response.session = session
+            return (
+                message
+                + "\n\nRunner job queued for host-side VirtualBox execution.\n"
+                + f"Job ID: `{job.job_id}`\n"
+                + "AVA will report the PuTTY SSH host/IP and port after the host runner creates the VM."
+            )
+        except Exception as exc:
+            session = self.sessions.record_answers(
+                response.session.session_id,
+                {"runner_enqueue_error": str(exc)},
+            )
+            response.session = session
+            return (
+                message
+                + "\n\nRunner job could not be queued, so no VM will be created yet.\n"
+                + f"Queue error: `{exc}`"
+            )
+
+    def _runner_snapshot(self, session) -> dict[str, Any]:
+        job_id = (session.collected_answers or {}).get("runner_job_id")
+        if not job_id:
+            return {"job_id": None, "status": None, "result": None}
+        status = self.job_queue.get_status(job_id)
+        result = self.job_queue.get_result(job_id)
+        if result and result.instance_id and not session.instance_id:
+            self.sessions.save(session.with_updates(instance_id=result.instance_id))
+        return {"job_id": job_id, "status": status, "result": result}
 
     def _result(self, message: str, session, *, approval_id: str | None = None) -> ProvisioningServingResult:
         metadata = {
@@ -313,24 +366,47 @@ def _format_desired_state(desired: dict[str, Any]) -> str:
     )
 
 
-def _format_status_response(session) -> str:
+def _format_status_response(session, runner: dict[str, Any] | None = None) -> str:
     answers = session.collected_answers or {}
+    runner = runner or {}
+    result = runner.get("result")
     lines = [
         "Provisioning status for the active AVA v2 web-server session:",
         "",
         f"- Session ID: `{session.session_id}`",
         f"- Phase: `{session.phase.value}`",
-            f"- Approval ID: `{session.approval_id or 'not queued yet'}`",
-            f"- Hostname: `{(session.desired_state or {}).get('vm_name') or 'auto-generated'}`",
-            f"- Temporary credential issued: `{'yes' if session.credential_id else 'no'}`",
+        f"- Approval ID: `{session.approval_id or 'not queued yet'}`",
+        f"- Runner job ID: `{runner.get('job_id') or 'not queued yet'}`",
+        f"- Runner status: `{runner.get('status') or 'not available yet'}`",
+        f"- Hostname: `{(session.desired_state or {}).get('vm_name') or 'auto-generated'}`",
+        f"- Temporary credential issued: `{'yes' if session.credential_id else 'no'}`",
         f"- First-login confirmation: `{'yes' if session.phase in {SessionPhase.AWAITING_POST_LOGIN_CHOICES, SessionPhase.BOOTSTRAPPING, SessionPhase.VERIFYING, SessionPhase.COMPLETED} else 'pending'}`",
         f"- Hardening choice: `{answers.get('hardening_profile', 'not recorded yet')}`",
-        f"- Attached VM instance: `{session.instance_id or 'none yet'}`",
+        f"- Attached VM instance: `{session.instance_id or (result.instance_id if result else None) or 'none yet'}`",
         f"- Timestamp: `{_utc_now()}`",
         "",
         _format_desired_state(session.desired_state or {}),
     ]
-    if not session.instance_id:
+    if result and result.instance_id:
+        lines.extend(
+            [
+                "",
+                "Connection details:",
+                f"- SSH host/IP: `{result.ssh_host or 'unknown'}`",
+                f"- SSH port: `{result.ssh_port or 'unknown'}`",
+                f"- Username: `{answers.get('username', 'avaadmin')}`",
+                f"- HTTP port: `{result.http_port or 'unknown'}`",
+            ]
+        )
+    elif runner.get("job_id"):
+        lines.extend(
+            [
+                "",
+                "Runner boundary: the approved job is queued or running. AVA will show PuTTY "
+                "connection details after the host runner writes the result.",
+            ]
+        )
+    else:
         lines.extend(
             [
                 "",
@@ -342,7 +418,41 @@ def _format_status_response(session) -> str:
     return "\n".join(lines)
 
 
-def _format_verification_response(session) -> str:
+def _format_verification_response(session, runner: dict[str, Any] | None = None) -> str:
+    runner = runner or {}
+    result = runner.get("result")
+    if result and result.error:
+        return (
+            "Web-server verification failed for the host runner job.\n\n"
+            f"- Job ID: `{runner.get('job_id')}`\n"
+            f"- Status: `{runner.get('status') or 'failed'}`\n"
+            f"- Error: `{result.error.get('message') or result.error.get('failure_class') or 'runner_failed'}`\n"
+            f"- Timestamp: `{result.completion_timestamp}`"
+        )
+    if result and result.instance_id:
+        checks = (result.verification_evidence or {}).get("checks") or []
+        check_lines = [
+            f"- {check.get('name')}: `{'passed' if check.get('passed') else 'failed'}` ({check.get('evidence', '')})"
+            for check in checks[:8]
+            if isinstance(check, dict)
+        ]
+        if not check_lines:
+            check_lines = ["- verification evidence recorded by host runner"]
+        return (
+            "Web-server verification evidence from the host runner:\n\n"
+            f"- Instance: `{result.instance_id}`\n"
+            f"- SSH: `{result.ssh_host}:{result.ssh_port}`\n"
+            f"- HTTP: `http://127.0.0.1:{result.http_port}/`\n"
+            f"- Completed: `{result.completion_timestamp}`\n\n"
+            + "\n".join(check_lines)
+        )
+    if runner.get("job_id"):
+        return (
+            "The web-server verification is not complete yet.\n\n"
+            f"- Job ID: `{runner.get('job_id')}`\n"
+            f"- Runner status: `{runner.get('status') or 'queued'}`\n"
+            "- PuTTY details will be available after the host runner completes VM creation and verification."
+        )
     if not session.instance_id:
         return (
             "I cannot verify nginx/web health for this chat-created session yet because no VM "
@@ -365,8 +475,10 @@ def _format_verification_response(session) -> str:
     )
 
 
-def _format_evidence_response(session) -> str:
+def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> str:
     answers = session.collected_answers or {}
+    runner = runner or {}
+    result = runner.get("result")
     evidence = [
         "Provisioning evidence for the active AVA v2 session:",
         "",
@@ -375,15 +487,29 @@ def _format_evidence_response(session) -> str:
         f"- Hostname: `{(session.desired_state or {}).get('vm_name') or 'auto-generated'}`",
         f"- Desired state ready: `{'yes' if session.desired_state else 'no'}`",
         f"- Approval queued: `{'yes' if session.approval_id else 'no'}`",
+        f"- Runner job ID: `{runner.get('job_id') or 'not queued yet'}`",
+        f"- Runner status: `{runner.get('status') or 'not available yet'}`",
         f"- Temporary credential issued once: `{'yes' if session.credential_id else 'no'}`",
         f"- First-login/hardening phase: `{session.phase.value}`",
         f"- Recorded hardening profile: `{answers.get('hardening_profile', 'not recorded yet')}`",
-        f"- Attached VM instance: `{session.instance_id or 'none yet'}`",
+        f"- Attached VM instance: `{session.instance_id or (result.instance_id if result else None) or 'none yet'}`",
         f"- Evidence timestamp: `{_utc_now()}`",
         "",
         _format_desired_state(session.desired_state or {}),
     ]
-    if not session.instance_id:
+    if result and result.instance_id:
+        evidence.extend(
+            [
+                "",
+                "Runner result evidence:",
+                f"- Instance name: `{result.instance_name or result.instance_id}`",
+                f"- SSH host/IP: `{result.ssh_host or 'unknown'}`",
+                f"- SSH port: `{result.ssh_port or 'unknown'}`",
+                f"- HTTP port: `{result.http_port or 'unknown'}`",
+                f"- Completion timestamp: `{result.completion_timestamp}`",
+            ]
+        )
+    elif not session.instance_id:
         evidence.extend(
             [
                 "",
