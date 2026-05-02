@@ -114,10 +114,19 @@ Once a job moves to `picked_up`, it cannot be cancelled through chat (v2.0.0 lim
   "job_id": "<uuid>",
   "session_id": "<session_id>",
   "desired_state": { ... },
-  "credentials_seed_data": { "username": "...", "password_hash": "..." },
-  "enqueued_at": "<iso8601>"
+  "credentials_seed_data": {
+    "credential_id": "<credential_id>",
+    "username": "...",
+    "temporary_password": "<short-lived provisioning secret>"
+  },
+  "enqueued_at": "<iso8601>",
+  "expires_at": "<iso8601>"
 }
 ```
+
+`temporary_password` is intentionally a short-lived provisioning secret, not a durable stored
+credential. The host runner needs it to build the cloud-init seed for the VM. It must not appear
+in result messages, logs, status output, or evidence output.
 
 ### Result Message (written by host_runner.py)
 
@@ -126,6 +135,7 @@ Once a job moves to `picked_up`, it cannot be cancelled through chat (v2.0.0 lim
   "job_id": "<uuid>",
   "instance_id": "<vbox-vm-name>",
   "instance_name": "<hostname>",
+  "ssh_host": "127.0.0.1",
   "ssh_port": 2222,
   "http_port": 8080,
   "verification_evidence": { ... },
@@ -136,6 +146,21 @@ Once a job moves to `picked_up`, it cannot be cancelled through chat (v2.0.0 lim
 
 On failure, `instance_id` may be null if the VM was never created or was rolled back.
 `error` contains the failure class and message.
+
+## Credential Handling Contract
+
+- Redis may contain recoverable temporary passwords only inside `credentials_seed_data`, only
+  until the runner builds the cloud-init seed or the job expires.
+- The approved-job queue entry and any related secret-bearing status must have a TTL. Default:
+  30 minutes.
+- Result messages must never include temporary passwords.
+- Runner logs must never print temporary passwords or rendered cloud-init user-data.
+- Host-side cloud-init seed files containing secrets must be deleted after the VM starts unless
+  retain-debug is explicitly enabled.
+- If seed cleanup fails, the runner must mark the job `failed`, warn clearly, and avoid hiding
+  possible secret residue.
+- AVA chat may display the temporary password once to the user. Later status/evidence prompts
+  must report only `credential issued: yes/no`.
 
 ## Host Runner Contract
 
@@ -179,6 +204,7 @@ Two changes are required in `provisioning/serving.py`:
 | Redis connection lost | Runner exits cleanly; requires manual restart |
 | Docker container crash mid-job | Runner continues; chat session shows stale state until reconnect (v2.0.0 acceptable) |
 | User cancels before `picked_up` | serving.py writes `cancelled` status; runner skips the job |
+| Secret cleanup failure | Job marked `failed`; warning reports possible secret residue without printing the secret |
 
 ## Implementation Order
 
@@ -204,6 +230,7 @@ Two changes are required in `provisioning/serving.py`:
 - approving a provisioning request from chat triggers actual VM creation on Windows host within
   30 seconds of approval
 - AVA chat session attaches the real `instance_id` after VM creation
+- AVA provides PuTTY connection details: SSH host/IP, SSH port, and username
 - nginx is bootstrapped on the created VM
 - `baseline_linux` hardening is applied if user accepted it
 - HTTP 200 is verified from the host
@@ -221,6 +248,7 @@ Two changes are required in `provisioning/serving.py`:
 3. Should the runner write logs to a file or to Windows Event Log?
 4. What is the timeout for a job between `picked_up` and `completed` before it is considered
    stuck? (Default proposal: 15 minutes.)
+5. Should v2.0.0 support only one active job globally, or one active job per user?
 
 ## Go / No-Go Rule
 

@@ -626,11 +626,23 @@ Redis keys and message format:
 - queue key: `ava:provisioning:jobs:approved`
 - result key prefix: `ava:provisioning:jobs:result:<job_id>`
 - status key prefix: `ava:provisioning:jobs:status:<job_id>`
-- job message: `{ job_id, session_id, desired_state, credentials_seed_data, enqueued_at }`
+- job message: `{ job_id, session_id, desired_state, credentials_seed_data, enqueued_at, expires_at }`
 - status values: `queued`, `picked_up`, `provisioning`, `bootstrapping`, `hardening`,
   `verifying`, `completed`, `failed`, `cancelled`
-- result message: `{ job_id, instance_id, instance_name, ssh_port, http_port,
+- result message: `{ job_id, instance_id, instance_name, ssh_host, ssh_port, http_port,
   verification_evidence, completion_timestamp, error (if failed) }`
+
+### Credential Handling Contract
+
+- `credentials_seed_data` may contain a short-lived temporary password only long enough for
+  the host runner to build the cloud-init seed.
+- Redis result messages must never contain the temporary password.
+- Runner logs must never print temporary passwords or rendered cloud-init user-data.
+- Local cloud-init seed files containing secrets must be deleted after the VM starts unless
+  retain-debug is explicitly enabled.
+- If secret cleanup fails, the job must be marked `failed` with a clear warning; AVA must not
+  hide possible secret residue.
+- AVA status/evidence prompts report credential state as issued yes/no only.
 
 ### Host Runner Contract
 
@@ -652,11 +664,14 @@ Redis keys and message format:
 - Redis connection lost: runner exits cleanly, requires manual restart
 - Docker container crash mid-job: runner continues, but chat session may show stale state until
   reconnect (v2.0.0 acceptable; v2.1 will add reconciliation)
+- secret cleanup failure: mark the job `failed`, warn clearly, and do not hide possible
+  secret residue
 
 ### Output
 
 - working host-side runner that creates VMs from approved chat jobs
 - chat session updates with real `instance_id` and verification evidence
+- chat session provides PuTTY connection details: SSH host/IP, SSH port, and username
 - verify/status/evidence prompts return real data instead of "no VM attached yet"
 - end-to-end test (HTTP `/ask` through real chat path) passes
 
@@ -665,6 +680,7 @@ Redis keys and message format:
 - approving a provisioning request from chat triggers actual VM creation on Windows host within
   30 seconds of approval
 - AVA chat session attaches the real `instance_id` after VM creation
+- AVA provides PuTTY connection details: SSH host/IP, SSH port, and username
 - nginx is bootstrapped on the created VM
 - `baseline_linux` hardening is applied if user accepted it
 - HTTP 200 is verified from the host
@@ -686,6 +702,7 @@ Redis keys and message format:
 - should the runner write logs to a file or to Windows Event Log?
 - what's the timeout for a job between `picked_up` and `completed` before it's considered stuck
   (default proposal: 15 minutes)?
+- should v2.0.0 support only one active job globally, or one active job per user?
 
 ---
 
