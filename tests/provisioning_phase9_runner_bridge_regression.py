@@ -19,7 +19,7 @@ from provisioning.runner import (  # noqa: E402
     ProvisioningResultWriter,
     RedisProvisioningJobQueue,
 )
-from provisioning.runner.host_runner import HostRunner  # noqa: E402
+from provisioning.runner.host_runner import HostRunner, _write_cloud_init_seed  # noqa: E402
 
 
 class FakeRedis:
@@ -144,6 +144,25 @@ def test_seed_iso_closemedium_uuid_fallback() -> list[bool]:
     ]
 
 
+def test_cloud_init_seed_quotes_generated_values() -> list[bool]:
+    tmp = Path(tempfile.mkdtemp())
+    password = 'xE:two#bad"chars'
+    public_key = "ssh-ed25519 AAAATEST/with+symbols ava-runner"
+    try:
+        _write_cloud_init_seed(tmp, "ava-web-test", "avaadmin", password, public_key)
+        user_data = (tmp / "user-data").read_text(encoding="utf-8")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return [
+        check("cloud-init hostname is quoted", 'hostname: "ava-web-test"' in user_data),
+        check("cloud-init username is quoted", 'name: "avaadmin"' in user_data),
+        check("cloud-init password is quoted", 'password: "xE:two#bad\\"chars"' in user_data),
+        check("cloud-init forces password change", "expire: true" in user_data),
+        check("cloud-init public key is quoted", f"- {public_key!r}".replace("'", '"') in user_data),
+    ]
+
+
 def main() -> int:
     fake = FakeRedis()
     queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
@@ -223,6 +242,7 @@ def main() -> int:
     print("\n--- cleanup ordering (Phase 9 fix: closemedium before unlink) ---")
     failures.extend(test_seed_iso_cleanup_ordering())
     failures.extend(test_seed_iso_closemedium_uuid_fallback())
+    failures.extend(test_cloud_init_seed_quotes_generated_values())
 
     failed_count = len([item for item in failures if not item])
     if failed_count:

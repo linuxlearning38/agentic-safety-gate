@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import logging
 import os
 from pathlib import Path
@@ -88,27 +89,31 @@ def _wait_for_executor_command(executor: SSHExecutor, command: str, timeout_seco
 def _write_cloud_init_seed(seed_dir: Path, vm_name: str, username: str, password: str, public_key: str) -> None:
     seed_dir.mkdir(parents=True, exist_ok=True)
     marker = f"AVA_CLOUD_INIT_READY {vm_name}"
+    safe_vm_name = json.dumps(vm_name)
+    safe_username = json.dumps(username)
+    safe_password = json.dumps(password)
+    safe_public_key = json.dumps(public_key)
     user_data = f"""#cloud-config
 preserve_hostname: false
-hostname: {vm_name}
+hostname: {safe_vm_name}
 manage_etc_hosts: true
 ssh_pwauth: true
 disable_root: true
 users:
   - default
-  - name: {username}
+  - name: {safe_username}
     gecos: AVA v2 provisioned user
     groups: adm, sudo
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false
     ssh_authorized_keys:
-      - {public_key}
+      - {safe_public_key}
 chpasswd:
-  expire: false
+  expire: true
   users:
-    - name: {username}
-      password: {password}
+    - name: {safe_username}
+      password: {safe_password}
       type: text
 write_files:
   - path: /var/tmp/ava-cloud-init-ready
@@ -277,7 +282,15 @@ class HostRunner:
                 redact=secret_patterns,
             )
             if not cloud_init or cloud_init.exit_code != 0 or f"AVA_CLOUD_INIT_READY {vm_name}" not in cloud_init.stdout:
-                raise RuntimeError("cloud-init first-access marker was not confirmed")
+                if cloud_init:
+                    detail = (
+                        f"cloud-init first-access marker was not confirmed "
+                        f"(exit_code={cloud_init.exit_code}, failure_class={cloud_init.failure_class}, "
+                        f"stdout={cloud_init.stdout[-300:]!r}, stderr={cloud_init.stderr[-300:]!r})"
+                    )
+                else:
+                    detail = "cloud-init first-access marker was not confirmed (no SSH command result)"
+                raise RuntimeError(detail)
 
             self._detach_seed_iso(instance_id, seed_iso)
             self._cleanup_secret_files(work_dir, seed_dir, seed_iso)
