@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 from typing import Any
@@ -46,6 +47,15 @@ class ProvisioningChatService:
 
         if not active:
             return ProvisioningServingResult(handled=False)
+
+        if _is_status_query(normalized):
+            return self._result(_format_status_response(active), active)
+
+        if _is_evidence_query(normalized):
+            return self._result(_format_evidence_response(active), active)
+
+        if _is_web_verification_query(normalized):
+            return self._result(_format_verification_response(active), active)
 
         phase = active.phase
         if phase == SessionPhase.AWAITING_VM_TYPE:
@@ -156,6 +166,10 @@ def _normalize(query: str) -> str:
     return re.sub(r"\s+", " ", (query or "").lower()).strip(" ?!.")
 
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def _is_cancel(query: str) -> bool:
     return query in {"cancel", "cancel provisioning", "stop provisioning", "abort provisioning"}
 
@@ -234,6 +248,128 @@ def _extract_post_login_answers(query: str) -> dict[str, Any]:
     if "yes" in query or "harden" in query or "baseline" in query:
         return {"hardening_profile": "baseline_linux", "post_login_actions": ["baseline_linux"]}
     return {}
+
+
+def _is_status_query(query: str) -> bool:
+    return (
+        "provisioning status" in query
+        or "status of provisioning" in query
+        or query in {"status", "show status"}
+    )
+
+
+def _is_evidence_query(query: str) -> bool:
+    return (
+        "what did you do" in query
+        or "evidence" in query
+        or "completion report" in query
+        or "what have you done" in query
+    )
+
+
+def _is_web_verification_query(query: str) -> bool:
+    return (
+        "verify the web server" in query
+        or "verify web server" in query
+        or "check the web server" in query
+        or "check web server" in query
+    )
+
+
+def _format_desired_state(desired: dict[str, Any]) -> str:
+    if not desired:
+        return "Desired state: not ready yet."
+    return (
+        "Desired state:\n"
+        f"- Provider: `{desired.get('provider', 'virtualbox')}`\n"
+        f"- OS: `{desired.get('os', 'ubuntu')}`\n"
+        f"- Role: `{desired.get('role', 'web_server')}`\n"
+        f"- CPU: `{desired.get('cpu')}`\n"
+        f"- RAM: `{desired.get('ram_gb')} GB`\n"
+        f"- Disk: `{desired.get('disk_gb')} GB`\n"
+        f"- Network: `{desired.get('network_mode', 'nat')}`\n"
+        f"- Firewall: `{desired.get('firewall_profile', 'web_public')}`\n"
+        f"- Hardening: `{desired.get('hardening_profile', 'baseline_linux')}`"
+    )
+
+
+def _format_status_response(session) -> str:
+    answers = session.collected_answers or {}
+    lines = [
+        "Provisioning status for the active AVA v2 web-server session:",
+        "",
+        f"- Session ID: `{session.session_id}`",
+        f"- Phase: `{session.phase.value}`",
+        f"- Approval ID: `{session.approval_id or 'not queued yet'}`",
+        f"- Temporary credential issued: `{'yes' if session.credential_id else 'no'}`",
+        f"- First-login confirmation: `{'yes' if session.phase in {SessionPhase.AWAITING_POST_LOGIN_CHOICES, SessionPhase.BOOTSTRAPPING, SessionPhase.VERIFYING, SessionPhase.COMPLETED} else 'pending'}`",
+        f"- Hardening choice: `{answers.get('hardening_profile', 'not recorded yet')}`",
+        f"- Attached VM instance: `{session.instance_id or 'none yet'}`",
+        f"- Timestamp: `{_utc_now()}`",
+        "",
+        _format_desired_state(session.desired_state or {}),
+    ]
+    if not session.instance_id:
+        lines.extend(
+            [
+                "",
+                "Execution boundary: this live chat session has collected and approved the plan, "
+                "but no VM instance is attached yet. The host-side VirtualBox runner must execute "
+                "the approved plan before AVA can report a created VM.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _format_verification_response(session) -> str:
+    if not session.instance_id:
+        return (
+            "I cannot verify nginx/web health for this chat-created session yet because no VM "
+            "instance is attached to it.\n\n"
+            "Current evidence:\n"
+            f"- Session phase: `{session.phase.value}`\n"
+            f"- Approval ID: `{session.approval_id or 'not queued yet'}`\n"
+            f"- Desired role: `{(session.desired_state or {}).get('role', session.role or 'web_server')}`\n"
+            f"- Attached VM instance: `none yet`\n"
+            f"- Timestamp: `{_utc_now()}`\n\n"
+            "Next required step: run the host-side VirtualBox provisioning runner for this approved "
+            "plan. After a VM is created and attached to the session, AVA can verify SSH, nginx, "
+            "guest HTTP, and host HTTP evidence."
+        )
+    return (
+        "Verification is ready to run for the attached VM, but this chat route currently reports "
+        "stored session evidence only. Full live verification is performed by the host-side "
+        "VirtualBox runner and verification engine."
+    )
+
+
+def _format_evidence_response(session) -> str:
+    answers = session.collected_answers or {}
+    evidence = [
+        "Provisioning evidence for the active AVA v2 session:",
+        "",
+        f"- Intent captured: `create_vm`",
+        f"- Role selected: `{session.role or (session.desired_state or {}).get('role', 'web_server')}`",
+        f"- Desired state ready: `{'yes' if session.desired_state else 'no'}`",
+        f"- Approval queued: `{'yes' if session.approval_id else 'no'}`",
+        f"- Temporary credential issued once: `{'yes' if session.credential_id else 'no'}`",
+        f"- First-login/hardening phase: `{session.phase.value}`",
+        f"- Recorded hardening profile: `{answers.get('hardening_profile', 'not recorded yet')}`",
+        f"- Attached VM instance: `{session.instance_id or 'none yet'}`",
+        f"- Evidence timestamp: `{_utc_now()}`",
+        "",
+        _format_desired_state(session.desired_state or {}),
+    ]
+    if not session.instance_id:
+        evidence.extend(
+            [
+                "",
+                "Important: this is conversation and approval evidence, not VM creation evidence. "
+                "No VM creation evidence exists for this chat session until the host-side "
+                "VirtualBox runner executes the approved plan.",
+            ]
+        )
+    return "\n".join(evidence)
 
 
 def _format_flow_response(response) -> str:

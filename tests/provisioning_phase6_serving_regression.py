@@ -138,6 +138,20 @@ def main() -> int:
             ]
         )
 
+        verify = service.handle("user-1", "verify the web server", route_intent=None)
+        status = service.handle("user-1", "show me the provisioning status", route_intent=None)
+        evidence = service.handle("user-1", "what did you do and what evidence do you have?", route_intent=None)
+        failures.extend(
+            [
+                check("web verification follow-up stays in provisioning session", verify.handled),
+                check("web verification reports no attached VM honestly", "no vm instance is attached" in verify.response.lower()),
+                check("status follow-up stays in provisioning session", status.handled),
+                check("status reports current phase", "bootstrapping" in status.response.lower()),
+                check("evidence follow-up stays in provisioning session", evidence.handled),
+                check("evidence distinguishes conversation from VM creation", "conversation and approval evidence" in evidence.response.lower()),
+            ]
+        )
+
         unrelated = service.handle("user-2", "What is Kubernetes?", route_intent=route_query("What is Kubernetes?").intent)
         failures.append(check("unrelated knowledge prompt is not hijacked", unrelated.handled is False))
 
