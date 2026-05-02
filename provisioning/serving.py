@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 from typing import Any
 
+from control import approval
 from provisioning.conversation import ProvisioningFlowEngine, SessionManager, SessionPhase
 
 
@@ -68,6 +69,30 @@ class ProvisioningChatService:
             return self._maybe_queue_approval(response)
 
         if phase == SessionPhase.AWAITING_APPROVAL:
+            approval_id = _extract_chat_approval_id(normalized)
+            if approval_id:
+                expected_id = active.approval_id
+                if not expected_id:
+                    return self._result(
+                        "This provisioning session does not have an approval request yet.",
+                        active,
+                    )
+                if approval_id != expected_id:
+                    return self._result(
+                        f"Approval ID `{approval_id}` does not match this provisioning request. "
+                        f"Use `approve {expected_id}` to approve the active request.",
+                        active,
+                    )
+                queue_entry = approval.get_by_id(approval_id)
+                if not queue_entry or queue_entry.get("status") != "pending":
+                    status = queue_entry.get("status") if queue_entry else "not_found"
+                    return self._result(
+                        f"Approval `{approval_id}` is not pending; current status is `{status}`.",
+                        active,
+                    )
+                approval.update_status(approval_id, "approved")
+                response = self.flow.continue_after_approval(active.session_id)
+                return self._result(_format_flow_response(response), response.session, approval_id=response.approval_id)
             if not _is_approval_continuation(normalized):
                 return ProvisioningServingResult(handled=False)
             response = self.flow.continue_after_approval(active.session_id)
@@ -187,6 +212,11 @@ def _extract_spec_answers(query: str) -> dict[str, Any]:
 
 def _is_approval_continuation(query: str) -> bool:
     return any(marker in query for marker in ("continue", "proceed", "approved", "approval", "go ahead", "check approval"))
+
+
+def _extract_chat_approval_id(query: str) -> str | None:
+    match = re.fullmatch(r"(?:approve|approved|confirm approval|approve request)\s+([a-f0-9]{8})", query or "")
+    return match.group(1) if match else None
 
 
 def _is_first_login_confirmation(query: str) -> bool:

@@ -97,13 +97,22 @@ def main() -> int:
             ]
         )
 
-        approval.update_status(approval_id, "approved")
-        approved = service.handle("user-1", "continue provisioning", route_intent=None)
+        wrong_approval = service.handle("user-1", "approve deadbeef", route_intent=None)
+        failures.extend(
+            [
+                check("wrong chat approval id is handled", wrong_approval.handled),
+                check("wrong chat approval id is rejected", "does not match" in wrong_approval.response.lower()),
+                check("wrong chat approval does not approve queue", approval.get_by_id(approval_id).get("status") == "pending"),
+            ]
+        )
+
+        approved = service.handle("user-1", f"approve {approval_id}", route_intent=None)
         approved_session = service.sessions.list_active("user-1")[0]
         failures.extend(
             [
-                check("approved continuation is handled", approved.handled),
-                check("approved continuation issues one-time credential", "temporary password" in approved.response.lower()),
+                check("chat approval is handled", approved.handled),
+                check("chat approval updates queue", approval.get_by_id(approval_id).get("status") == "approved"),
+                check("chat approval issues one-time credential", "temporary password" in approved.response.lower()),
                 check("approved phase awaits first login", approved_session.phase == SessionPhase.AWAITING_FIRST_LOGIN, approved_session.phase.value),
             ]
         )
