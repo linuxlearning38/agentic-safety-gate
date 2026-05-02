@@ -221,6 +221,10 @@ def _extract_spec_answers(query: str) -> dict[str, Any]:
         answers["hardening_profile"] = "none"
     elif "harden" in query or "baseline" in query:
         answers["hardening_profile"] = "baseline_linux"
+
+    hostname = _extract_hostname(query)
+    if hostname:
+        answers["vm_name"] = hostname
     return answers
 
 
@@ -248,6 +252,21 @@ def _extract_post_login_answers(query: str) -> dict[str, Any]:
     if "yes" in query or "harden" in query or "baseline" in query:
         return {"hardening_profile": "baseline_linux", "post_login_actions": ["baseline_linux"]}
     return {}
+
+
+def _extract_hostname(query: str) -> str | None:
+    patterns = (
+        r"\bhostname\s*[:=]?\s*([a-z0-9][a-z0-9_-]{0,62})\b",
+        r"\bhost\s+name\s*[:=]?\s*([a-z0-9][a-z0-9_-]{0,62})\b",
+        r"\bvm\s+name\s*[:=]?\s*([a-z0-9][a-z0-9_-]{0,62})\b",
+        r"\bname\s+it\s+([a-z0-9][a-z0-9_-]{0,62})\b",
+        r"\bcalled\s+([a-z0-9][a-z0-9_-]{0,62})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, query)
+        if match:
+            return match.group(1).replace("_", "-").lower()
+    return None
 
 
 def _is_status_query(query: str) -> bool:
@@ -284,6 +303,7 @@ def _format_desired_state(desired: dict[str, Any]) -> str:
         f"- Provider: `{desired.get('provider', 'virtualbox')}`\n"
         f"- OS: `{desired.get('os', 'ubuntu')}`\n"
         f"- Role: `{desired.get('role', 'web_server')}`\n"
+        f"- Hostname: `{desired.get('vm_name') or 'auto-generated'}`\n"
         f"- CPU: `{desired.get('cpu')}`\n"
         f"- RAM: `{desired.get('ram_gb')} GB`\n"
         f"- Disk: `{desired.get('disk_gb')} GB`\n"
@@ -300,8 +320,9 @@ def _format_status_response(session) -> str:
         "",
         f"- Session ID: `{session.session_id}`",
         f"- Phase: `{session.phase.value}`",
-        f"- Approval ID: `{session.approval_id or 'not queued yet'}`",
-        f"- Temporary credential issued: `{'yes' if session.credential_id else 'no'}`",
+            f"- Approval ID: `{session.approval_id or 'not queued yet'}`",
+            f"- Hostname: `{(session.desired_state or {}).get('vm_name') or 'auto-generated'}`",
+            f"- Temporary credential issued: `{'yes' if session.credential_id else 'no'}`",
         f"- First-login confirmation: `{'yes' if session.phase in {SessionPhase.AWAITING_POST_LOGIN_CHOICES, SessionPhase.BOOTSTRAPPING, SessionPhase.VERIFYING, SessionPhase.COMPLETED} else 'pending'}`",
         f"- Hardening choice: `{answers.get('hardening_profile', 'not recorded yet')}`",
         f"- Attached VM instance: `{session.instance_id or 'none yet'}`",
@@ -333,8 +354,9 @@ def _format_verification_response(session) -> str:
             f"- Attached VM instance: `none yet`\n"
             f"- Timestamp: `{_utc_now()}`\n\n"
             "Next required step: run the host-side VirtualBox provisioning runner for this approved "
-            "plan. After a VM is created and attached to the session, AVA can verify SSH, nginx, "
-            "guest HTTP, and host HTTP evidence."
+            "plan. After a VM is created and attached to the session, AVA can provide the PuTTY "
+            "connection host/IP, SSH port, username, and then verify SSH, nginx, guest HTTP, and "
+            "host HTTP evidence."
         )
     return (
         "Verification is ready to run for the attached VM, but this chat route currently reports "
@@ -350,6 +372,7 @@ def _format_evidence_response(session) -> str:
         "",
         f"- Intent captured: `create_vm`",
         f"- Role selected: `{session.role or (session.desired_state or {}).get('role', 'web_server')}`",
+        f"- Hostname: `{(session.desired_state or {}).get('vm_name') or 'auto-generated'}`",
         f"- Desired state ready: `{'yes' if session.desired_state else 'no'}`",
         f"- Approval queued: `{'yes' if session.approval_id else 'no'}`",
         f"- Temporary credential issued once: `{'yes' if session.credential_id else 'no'}`",
@@ -382,7 +405,8 @@ def _format_flow_response(response) -> str:
             f"Temporary password: `{credential.temporary_password}`\n\n"
             "Important: approval unlocks provisioning, but the VM is created only when the host-side "
             "VirtualBox runner executes the approved plan. Do not expect a new VM in VirtualBox until "
-            "AVA reports that the VM was created and started.\n\n"
+            "AVA reports that the VM was created and started. The PuTTY connection host/IP and SSH "
+            "port will be reported after the VM is created and attached to this session.\n\n"
             "Change this password on first login. After you log in and change it, reply: "
             "`I logged in and changed the password`."
         )
@@ -393,6 +417,7 @@ def _format_flow_response(response) -> str:
             f"Provider: `{desired.get('provider', 'virtualbox')}`\n"
             f"OS: `{desired.get('os', 'ubuntu')}`\n"
             f"Role: `{desired.get('role', 'web_server')}`\n"
+            f"Hostname: `{desired.get('vm_name') or 'auto-generated'}`\n"
             f"CPU: `{desired.get('cpu')}`\n"
             f"RAM: `{desired.get('ram_gb')} GB`\n"
             f"Disk: `{desired.get('disk_gb')} GB`\n"
@@ -406,7 +431,8 @@ def _format_flow_response(response) -> str:
         return (
             f"{response.message}\n\n"
             f"Please provide: {readable}.\n"
-            "Example: `2 CPU, 4 GB RAM, 30 GB disk`."
+            "Example: `2 CPU, 4 GB RAM, 30 GB disk, hostname ava-web-01`.\n"
+            "Optional: include `hostname <name>` if you want a specific VM hostname."
         )
     if session.phase == SessionPhase.AWAITING_VM_TYPE:
         return response.message + "\n\nAvailable in v2.0.0: `web_server` only."

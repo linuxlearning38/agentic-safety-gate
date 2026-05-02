@@ -404,3 +404,49 @@ Expected design:
 7. AVA status/evidence/verify prompts report real VM evidence.
 
 This is the next blocker for full v2.0.0 live browser provisioning.
+
+## Follow-Up Enhancement: Hostname And PuTTY Connection Details
+
+Timestamp: 2026-05-02
+
+User request:
+
+```text
+Allow the user to provide a hostname now, and later provide the VM IP/connection details with the temporary username/password so PuTTY can connect.
+```
+
+Implemented now:
+
+- AVA accepts optional hostname input during the spec collection step.
+- Supported forms include:
+  - `hostname ava-web-01`
+  - `host name ava-web-01`
+  - `vm name ava-web-01`
+  - `name it ava-web-01`
+- Hostnames are normalized to lowercase.
+- Underscores are converted to hyphens.
+- Hostnames must start with a letter and contain only letters, numbers, and hyphens.
+- The hostname is stored as `vm_name` in desired state.
+- The hostname is displayed in the approval plan.
+- The hostname is included in status and evidence responses.
+- The VirtualBox plan metadata now carries the hostname.
+
+Important current boundary:
+
+- AVA cannot honestly provide a PuTTY IP/host at approval time until the VM is actually created.
+- In NAT mode, the likely PuTTY endpoint will be host `127.0.0.1` plus the generated SSH port.
+- After the host-side VirtualBox runner creates the VM and attaches connection info, AVA should report:
+  - hostname
+  - username
+  - temporary password or password-change status
+  - SSH host/IP
+  - SSH port
+  - HTTP URL/port if a web role is installed
+
+Validation added:
+
+- Desired-state regression verifies hostname normalization.
+- Desired-state regression rejects invalid hostnames.
+- Serving regression verifies that hostname appears in the approval plan.
+- Serving regression verifies AVA tells the user that PuTTY host/IP is reported after VM creation.
+- VirtualBox adapter smoke verifies hostname metadata is preserved in the provider plan.

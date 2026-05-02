@@ -55,6 +55,7 @@ def main() -> int:
                 "cpu": "2",
                 "ram_gb": "4",
                 "disk_gb": "30",
+                "hostname": "AVA_WEB_01",
             },
         )
         failures.extend(
@@ -64,6 +65,7 @@ def main() -> int:
                 check("desired state is ready", ready.desired_state_ready is True),
                 check("desired state provider defaulted", ready.session.desired_state.get("provider") == "virtualbox"),
                 check("desired state hardening defaulted", ready.session.desired_state.get("hardening_profile") == "baseline_linux"),
+                check("desired state hostname normalized", ready.session.desired_state.get("vm_name") == "ava-web-01"),
             ]
         )
 
@@ -100,6 +102,12 @@ def main() -> int:
         failures.append(check("unsupported role is rejected", False))
     except DesiredStateError:
         failures.append(check("unsupported role is rejected", True))
+
+    try:
+        DesiredState.from_answers({"cpu": 2, "ram_gb": 4, "disk_gb": 30, "hostname": "01-bad-host"})
+        failures.append(check("invalid hostname is rejected", False))
+    except DesiredStateError:
+        failures.append(check("invalid hostname is rejected", True))
 
     failures.append(
         check(

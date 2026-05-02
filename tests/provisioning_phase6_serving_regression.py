@@ -61,6 +61,22 @@ def main() -> int:
             ]
         )
 
+        start_named = service.handle("user-named", "I want a web server", route_intent="provisioning")
+        named_specs = service.handle(
+            "user-named",
+            "2 CPU, 4 GB RAM, 30 GB disk, hostname ava-web-01",
+            route_intent=None,
+        )
+        named_session = service.sessions.list_active("user-named")[0]
+        failures.extend(
+            [
+                check("named host start is handled", start_named.handled),
+                check("hostname spec answer is handled", named_specs.handled),
+                check("hostname is recorded in desired state", named_session.desired_state.get("vm_name") == "ava-web-01"),
+                check("plan response displays hostname", "hostname: `ava-web-01`" in named_specs.response.lower()),
+            ]
+        )
+
         start_alt = service.handle("user-alt", "I want a web server", route_intent="provisioning")
         alt_specs = service.handle("user-alt", "3 CPU, 8gb RAM, 40 GB disk", route_intent=None)
         alt_session = service.sessions.list_active("user-alt")[0]
@@ -114,6 +130,7 @@ def main() -> int:
                 check("chat approval updates queue", approval.get_by_id(approval_id).get("status") == "approved"),
                 check("chat approval issues one-time credential", "temporary password" in approved.response.lower()),
                 check("chat approval clarifies runner boundary", "host-side" in approved.response.lower()),
+                check("chat approval explains putty endpoint later", "putty connection host/ip" in approved.response.lower()),
                 check("approved phase awaits first login", approved_session.phase == SessionPhase.AWAITING_FIRST_LOGIN, approved_session.phase.value),
             ]
         )
