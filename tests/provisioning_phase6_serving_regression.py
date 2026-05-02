@@ -61,6 +61,34 @@ def main() -> int:
             ]
         )
 
+        start_alt = service.handle("user-alt", "I want a web server", route_intent="provisioning")
+        alt_specs = service.handle("user-alt", "3 CPU, 8gb RAM, 40 GB disk", route_intent=None)
+        alt_session = service.sessions.list_active("user-alt")[0]
+        failures.extend(
+            [
+                check("alternate start is handled", start_alt.handled),
+                check("uppercase cpu spec answer is handled", alt_specs.handled),
+                check("uppercase cpu spec queues approval", bool(alt_specs.metadata["provisioning"]["approval_id"])),
+                check("uppercase cpu spec records cpu", alt_session.desired_state.get("cpu") == 3),
+                check("uppercase cpu spec records ram", alt_session.desired_state.get("ram_gb") == 8),
+                check("uppercase cpu spec records disk", alt_session.desired_state.get("disk_gb") == 40),
+            ]
+        )
+
+        start_lower = service.handle("user-lower", "I want a web server", route_intent="provisioning")
+        lower_specs = service.handle("user-lower", "3 cpu, 8gb ram, 60 gb disk", route_intent=None)
+        lower_session = service.sessions.list_active("user-lower")[0]
+        failures.extend(
+            [
+                check("lowercase cpu start is handled", start_lower.handled),
+                check("lowercase cpu spec answer is handled", lower_specs.handled),
+                check("lowercase cpu spec queues approval", bool(lower_specs.metadata["provisioning"]["approval_id"])),
+                check("lowercase cpu spec records cpu", lower_session.desired_state.get("cpu") == 3),
+                check("lowercase cpu spec records ram", lower_session.desired_state.get("ram_gb") == 8),
+                check("lowercase cpu spec records disk", lower_session.desired_state.get("disk_gb") == 60),
+            ]
+        )
+
         pending = service.handle("user-1", "continue provisioning", route_intent=None)
         failures.extend(
             [

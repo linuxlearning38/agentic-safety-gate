@@ -103,6 +103,18 @@ def main() -> int:
                 "deployment name" in (guardrail["extract_operational_clarification"]("ava, restart my pod now") or "").lower(),
             ),
             check(
+                "normalizer preserves leading cpu quantity",
+                guardrail["_normalize_user_query"]("3 CPU, 8gb RAM, 40 GB disk").startswith("3 CPU"),
+            ),
+            check(
+                "normalizer preserves lowercase cpu quantity",
+                guardrail["_normalize_user_query"]("3 cpu, 8gb ram, 60 gb disk").startswith("3 cpu"),
+            ),
+            check(
+                "normalizer still strips copied numbered question prefix",
+                guardrail["_normalize_user_query"]("3. What is Kubernetes?") == "What is Kubernetes?",
+            ),
+            check(
                 "ava mention alone no longer forces ava-self topic",
                 router["classify_ava_self_topic"]("ava please tcp vs udp now") is None,
             ),
