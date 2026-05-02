@@ -163,6 +163,40 @@ def test_cloud_init_seed_quotes_generated_values() -> list[bool]:
     ]
 
 
+def test_runner_verification_uses_key_auth() -> list[bool]:
+    """ava-runner holds the SSH key; avaadmin has chage -d 0 (password expired by design).
+
+    PAM blocks ALL SSH sessions—key auth included—when a password change is
+    required but no TTY is available.  The fix seeds the runner public key into a
+    separate ava-runner user that is NOT in the chpasswd expire list, so the
+    runner can SSH in without hitting the PAM account check.
+    """
+    tmp = Path(tempfile.mkdtemp())
+    public_key = "ssh-ed25519 AAAATEST/runner+key ava-runner-test"
+    try:
+        _write_cloud_init_seed(tmp, "ava-web-test", "avaadmin", "Temp!Pass1", public_key)
+        user_data = (tmp / "user-data").read_text(encoding="utf-8")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    avaadmin_block_start = user_data.find('name: "avaadmin"')
+    ava_runner_block_start = user_data.find("name: ava-runner")
+    key_pos = user_data.find(public_key)
+
+    return [
+        check("ava-runner user is present in user-data", ava_runner_block_start != -1),
+        check("runner public key is seeded for ava-runner (not avaadmin)",
+              key_pos != -1 and key_pos > ava_runner_block_start),
+        check("avaadmin does not hold the runner public key",
+              avaadmin_block_start == -1 or key_pos > avaadmin_block_start + (ava_runner_block_start - avaadmin_block_start)),
+        check("ava-runner has sudo in user-data",
+              user_data.count("sudo: ALL=(ALL) NOPASSWD:ALL") >= 2),
+        check("ava-runner is not in chpasswd expire list",
+              "ava-runner" not in user_data[user_data.find("chpasswd"):]),
+        check("avaadmin password expiry is still enforced", "expire: true" in user_data),
+    ]
+
+
 def main() -> int:
     fake = FakeRedis()
     queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
@@ -243,6 +277,9 @@ def main() -> int:
     failures.extend(test_seed_iso_cleanup_ordering())
     failures.extend(test_seed_iso_closemedium_uuid_fallback())
     failures.extend(test_cloud_init_seed_quotes_generated_values())
+
+    print("\n--- runner verification key auth (Phase 9 fix: ava-runner user, no PAM expiry) ---")
+    failures.extend(test_runner_verification_uses_key_auth())
 
     failed_count = len([item for item in failures if not item])
     if failed_count:

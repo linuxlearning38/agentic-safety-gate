@@ -107,6 +107,12 @@ users:
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false
+  - name: ava-runner
+    gecos: AVA runner automation
+    groups: adm, sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
     ssh_authorized_keys:
       - {safe_public_key}
 chpasswd:
@@ -265,11 +271,13 @@ class HostRunner:
             if not _wait_for_tcp(connection.host, connection.port, self.config.timeout_seconds):
                 raise RuntimeError(f"SSH TCP did not become reachable at {connection.host}:{connection.port}")
 
+            # ava-runner holds the key; avaadmin has chage -d 0 (expired by design)
+            # which blocks PAM account validation for all SSH sessions, key auth included.
             executor = SSHExecutor(
                 SSHConnection(
                     host=connection.host,
                     port=connection.port,
-                    username=username,
+                    username="ava-runner",
                     private_key_path=str(key_path),
                     known_hosts_path=str(known_hosts_path),
                     ssh_binary=self.config.ssh_binary,
