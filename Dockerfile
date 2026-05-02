@@ -62,6 +62,7 @@ COPY gunicorn.conf.py .
 COPY users.json .
 COPY control/ ./control/
 COPY knowledge_updater/ ./knowledge_updater/
+COPY provisioning/ ./provisioning/
 
 # Create mount-point directories so volume mounts don't land as root-owned
 RUN mkdir -p \
