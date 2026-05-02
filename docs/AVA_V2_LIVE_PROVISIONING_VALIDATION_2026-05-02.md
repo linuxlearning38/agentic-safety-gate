@@ -405,6 +405,24 @@ Expected design:
 
 This is the next blocker for full v2.0.0 live browser provisioning.
 
+## Follow-Up Decision: Phase 9 Required
+
+Timestamp: 2026-05-02
+
+Live validation proved that AVA chat does not create a VirtualBox VM yet. The module-level
+end-to-end test remains valuable because it proves the provisioning modules can create,
+bootstrap, harden, and verify a VM when running natively on Windows. It is not enough for
+`v2.0.0`, because the user-facing path goes through `/ask` inside the Docker container.
+
+Decision:
+
+- Phase 8 is reopened as a module-level release gate, not the final user-facing release gate.
+- Phase 9 is mandatory before `v2.0.0`.
+- Phase 9 must add a host-side runner bridge from AVA chat approval to Windows VirtualBox
+  execution.
+- `v2.0.0` cannot tag until the full HTTP `/ask` chat-to-VM test passes and AVA returns real
+  instance ID, PuTTY SSH host/IP, SSH port, web verification evidence, and completion status.
+
 ## Follow-Up Enhancement: Hostname And PuTTY Connection Details
 
 Timestamp: 2026-05-02
