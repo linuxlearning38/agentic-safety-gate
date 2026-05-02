@@ -92,6 +92,9 @@ Keep `AGENTS.md` as the short operational truth, not the full history.
 - `V1_0_3_RELEASE_NOTES.md` - repo polish and professionalism snapshot.
 - `V1_0_4_RELEASE_NOTES.md` - runtime quality, vulnerability, and validation snapshot.
 
+- `docs/AVA_V2_PHASE9_RUNNER_BRIDGE_DESIGN.md` - Phase 9 design contract: host-side runner
+  bridge that closes the chat-to-VM gap discovered in live validation on 2026-05-02.
+
 Rule of thumb:
 
 - Update `AGENTS.md` when the serving contract, scope boundary, or durable product truth changes.

@@ -507,8 +507,8 @@ Make the first slice operationally safe under expected failures.
 
 ## Phase 8 — End-to-End Test And Release Gate
 
-Status: implemented and passed live VirtualBox release gate on 2026-05-01. See
-`docs/AVA_V2_PHASE8_E2E_RELEASE_GATE.md`.
+Status: Reopened on 2026-05-02 — module-level e2e passed, but live
+chat-to-VM path is incomplete. See `docs/AVA_V2_PHASE8_E2E_RELEASE_GATE.md`.
 
 ### Goal
 
@@ -562,14 +562,130 @@ Prove that `v2.0.0` works as a repeatable system, not a one-off demo.
 
 ### Exit Criteria
 
-- `tests/v2_e2e_test.py` passes repeatably
-- total flow completes in under 10 minutes
-- audit log and completion report are complete
-- `v2.0.0` is eligible for tag only after this phase passes
+| Criterion | Status |
+| --- | --- |
+| `tests/v2_e2e_test.py` passes repeatably | Met at module level (Windows native, direct module calls) |
+| Total flow completes in under 10 minutes | Met at module level (`147.6s`) |
+| Audit log and completion report are complete | Met at module level |
+| Guided provisioning flow works end to end via live chat | **NOT MET** — chat path stops before VM creation |
+| `v2.0.0` eligible for tag | **Blocked** — requires Phase 9 exit criteria first |
 
 ### Estimate
 
 - 1 to 2 working days
+
+### Why Phase 8 Was Reopened
+
+Reopened on 2026-05-02 after live validation against the running AVA chat service.
+
+- Phase 8's e2e test (`tests/v2_e2e_test.py`) is a module-integration test that runs Python
+  natively on Windows and calls `VBoxManage` directly. It bypasses the `/ask` chat path entirely.
+- The actual user-facing flow goes through `/ask` in AVA chat, which runs inside the Docker
+  container. The container cannot reach `VBoxManage` on the Windows host.
+- Live validation on 2026-05-02 confirmed: chat collects specs, gates approval, issues
+  credentials, records first-login confirmation, and records the hardening choice — but never
+  creates a VM.
+- Therefore the Phase 8 exit criterion "guided provisioning flow works end to end" is met at
+  module level but **NOT** at user-facing chat level.
+- Phase 9 (runner bridge) must close this gap before `v2.0.0` can tag.
+
+---
+
+## Phase 9 — Host-Side Runner Bridge
+
+### Goal
+
+Close the gap between AVA chat (in Docker) and VirtualBox (on Windows host) so that approval
+through chat triggers actual VM creation, bootstrap, hardening, verification, and result
+reporting back to the chat session.
+
+### Input
+
+- Phase 6 serving integration (chat path through `/ask`)
+- Phase 7 rollback manager (provider-agnostic)
+- Phase 8 e2e module integration (proves the modules work)
+- Existing Redis instance (already in `docker-compose`)
+- Existing host-side `VBoxManage` path (already proven by `tests/v2_e2e_test.py`)
+
+### Work
+
+- create `provisioning/runner/job_queue.py` (Redis-backed approved-job queue)
+- create `provisioning/runner/host_runner.py` (Windows-side worker process)
+- create `provisioning/runner/result_writer.py` (writes results back to AVA state store)
+- update `provisioning/serving.py` to enqueue jobs after approval
+- update `provisioning/serving.py` to read job status for verify/evidence/status prompts
+- create `scripts/start_host_runner.ps1` (start the worker on Windows)
+- create `tests/provisioning_phase9_runner_bridge_regression.py`
+- create `tests/v2_chat_to_vm_e2e_test.py` (the real user-flow e2e: drive through HTTP `/ask`,
+  approve, wait for runner, verify HTTP 200)
+
+### Job Queue Contract
+
+Redis keys and message format:
+
+- queue key: `ava:provisioning:jobs:approved`
+- result key prefix: `ava:provisioning:jobs:result:<job_id>`
+- status key prefix: `ava:provisioning:jobs:status:<job_id>`
+- job message: `{ job_id, session_id, desired_state, credentials_seed_data, enqueued_at }`
+- status values: `queued`, `picked_up`, `provisioning`, `bootstrapping`, `hardening`,
+  `verifying`, `completed`, `failed`, `cancelled`
+- result message: `{ job_id, instance_id, instance_name, ssh_port, http_port,
+  verification_evidence, completion_timestamp, error (if failed) }`
+
+### Host Runner Contract
+
+- runs as a long-lived Python process on Windows host (NOT in Docker)
+- polls Redis for approved jobs (`BLPOP` with timeout)
+- picks up one job at a time (single-worker for v2.0.0; multi-worker is v2.1+)
+- executes the same module sequence that `tests/v2_e2e_test.py` executes today
+- writes status updates to Redis after each phase
+- writes final result to Redis on completion or failure
+- handles its own crash recovery: if it restarts, it does NOT re-pick a job already marked
+  `picked_up` (job becomes orphaned and requires manual cleanup for v2.0.0)
+- logs every action to a host-side log file
+
+### Failure Handling
+
+- runner crash mid-job: orphaned job, manual cleanup required for v2.0.0
+- `VBoxManage` failure: rollback via Phase 7 manager, write `failed` result, next job picked
+  up normally
+- Redis connection lost: runner exits cleanly, requires manual restart
+- Docker container crash mid-job: runner continues, but chat session may show stale state until
+  reconnect (v2.0.0 acceptable; v2.1 will add reconciliation)
+
+### Output
+
+- working host-side runner that creates VMs from approved chat jobs
+- chat session updates with real `instance_id` and verification evidence
+- verify/status/evidence prompts return real data instead of "no VM attached yet"
+- end-to-end test (HTTP `/ask` through real chat path) passes
+
+### Exit Criteria
+
+- approving a provisioning request from chat triggers actual VM creation on Windows host within
+  30 seconds of approval
+- AVA chat session attaches the real `instance_id` after VM creation
+- nginx is bootstrapped on the created VM
+- `baseline_linux` hardening is applied if user accepted it
+- HTTP 200 is verified from the host
+- chat session shows completion status and evidence
+- `tests/v2_chat_to_vm_e2e_test.py` passes by driving the full flow through HTTP `/ask` only —
+  NO direct module calls
+- runner survives at least one `VBoxManage` failure cleanly via Phase 7 rollback
+- `v2.0.0` tags only AFTER this exit criteria is met
+
+### Estimate
+
+3 to 5 working days
+
+### Open Design Questions (for user to answer before implementation)
+
+- should the runner run as a Windows service, or as a manually-started PowerShell session for
+  v2.0.0?
+- should Redis credentials be passed via environment variable or config file on Windows?
+- should the runner write logs to a file or to Windows Event Log?
+- what's the timeout for a job between `picked_up` and `completed` before it's considered stuck
+  (default proposal: 15 minutes)?
 
 ---
 
@@ -583,7 +699,12 @@ Prove that `v2.0.0` works as a repeatable system, not a one-off demo.
 6. Phase 5 — verification and state
 7. Phase 6 — AVA integration
 8. Phase 7 — failure modes and rollback
-9. Phase 8 — end-to-end release gate
+9. Phase 8 — module-level end-to-end release gate (passed; reopened — chat path incomplete)
+10. Phase 9 — host-side runner bridge (required user-facing release gate)
+
+Phase 8 remains valuable as the module-level release gate.
+Phase 9 is now required as the user-facing release gate.
+`v2.0.0` cannot be tagged until Phase 9 exit criteria are met.
 
 ---
 
