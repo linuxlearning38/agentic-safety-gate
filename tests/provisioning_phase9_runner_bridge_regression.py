@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Regression checks for Phase 9 runner bridge queue/result contracts."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from provisioning.runner import (  # noqa: E402
+    JOB_QUEUE_KEY,
+    ProvisioningJobResult,
+    ProvisioningResultWriter,
+    RedisProvisioningJobQueue,
+)
+from provisioning.runner.host_runner import HostRunner  # noqa: E402
+
+
+class FakeRedis:
+    def __init__(self):
+        self.values: dict[str, str] = {}
+        self.lists: dict[str, list[str]] = {}
+        self.expirations: dict[str, int] = {}
+
+    def rpush(self, key, value):
+        self.lists.setdefault(key, []).append(value)
+
+    def blpop(self, key, timeout=0):
+        values = self.lists.get(key) or []
+        if not values:
+            return None
+        return (key, values.pop(0))
+
+    def set(self, key, value, ex=None):
+        self.values[key] = value
+        if ex:
+            self.expirations[key] = ex
+
+    def get(self, key):
+        return self.values.get(key)
+
+    def expire(self, key, ttl):
+        self.expirations[key] = ttl
+
+
+def check(name: str, condition: bool, detail: str = "") -> bool:
+    status = "PASS" if condition else "FAIL"
+    suffix = f" :: {detail}" if detail else ""
+    print(f"[{status}] {name}{suffix}")
+    return condition
+
+
+def test_seed_iso_cleanup_ordering() -> list[bool]:
+    """closemedium dvd must be called before seed_iso.unlink().
+
+    VBoxSVC on Windows holds an open file handle for any medium registered in
+    VirtualBox's global media registry.  storageattach --medium none removes the
+    ISO from the storage controller but does NOT remove it from the registry.
+    closemedium dvd <path> does remove it, which releases the handle so that
+    the file can be deleted with unlink().
+
+    This test verifies:
+    - storageattach --medium none is issued first
+    - closemedium dvd is issued second (and the file still exists at that point)
+    - seed ISO file is gone after _cleanup_secret_files runs
+    """
+    tmp = Path(tempfile.mkdtemp())
+    seed_iso = tmp / "seed.iso"
+    seed_dir = tmp / "seed"
+    seed_dir.mkdir()
+    seed_iso.write_bytes(b"fake-iso-content")
+
+    call_log: list[tuple[str, ...]] = []
+    file_present_at_closemedium: list[bool] = []
+
+    class TrackingAdapter:
+        def _run_vboxmanage(self, *args: str, check: bool = True, timeout: int = 120):
+            call_log.append(args)
+            if args and args[0] == "closemedium":
+                file_present_at_closemedium.append(seed_iso.exists())
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.adapter = TrackingAdapter()
+
+    try:
+        runner._detach_seed_iso("test-vm-01", seed_iso)
+        runner._cleanup_secret_files(tmp, seed_dir, seed_iso)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    commands = [c[0] for c in call_log]
+    storageattach_idx = next((i for i, c in enumerate(commands) if c == "storageattach"), -1)
+    closemedium_idx = next((i for i, c in enumerate(commands) if c == "closemedium"), -1)
+    closemedium_args = next((c for c in call_log if c[0] == "closemedium"), ())
+
+    return [
+        check("storageattach --medium none was issued", storageattach_idx != -1),
+        check("closemedium dvd was issued", closemedium_idx != -1 and "dvd" in closemedium_args),
+        check("storageattach precedes closemedium in call order", 0 <= storageattach_idx < closemedium_idx),
+        check("seed ISO still existed when closemedium was called", bool(file_present_at_closemedium) and file_present_at_closemedium[0]),
+        check("seed ISO deleted after cleanup", not seed_iso.exists()),
+    ]
+
+
+def main() -> int:
+    fake = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
+    failures: list[bool] = []
+
+    job = queue.enqueue_approved_job(
+        session_id="session-1",
+        desired_state={
+            "provider": "virtualbox",
+            "os": "ubuntu",
+            "role": "web_server",
+            "vm_name": "ava-web-01",
+            "cpu": 2,
+            "ram_gb": 4,
+            "disk_gb": 30,
+            "network_mode": "nat",
+            "firewall_profile": "web_public",
+            "hardening_profile": "baseline_linux",
+        },
+        credential_id="cred-1",
+        username="avaadmin",
+        temporary_password="DoNotLogThis123!",
+    )
+    failures.extend(
+        [
+            check("job is enqueued", len(fake.lists.get(JOB_QUEUE_KEY, [])) == 1),
+            check("queue key has ttl", fake.expirations.get(JOB_QUEUE_KEY) == 1800),
+            check("job status is queued", queue.get_status(job.job_id) == "queued"),
+            check("job contains short-lived seed secret", job.credentials_seed_data.get("temporary_password") == "DoNotLogThis123!"),
+            check("redacted job view hides seed secret", "DoNotLogThis123!" not in str(job.to_dict(include_secret=False))),
+        ]
+    )
+
+    claimed = queue.claim_next_job(timeout_seconds=1)
+    failures.extend(
+        [
+            check("runner can claim job", claimed is not None),
+            check("claim updates status", queue.get_status(job.job_id) == "picked_up"),
+            check("claimed job preserves desired hostname", claimed.desired_state.get("vm_name") == "ava-web-01" if claimed else False),
+        ]
+    )
+
+    writer = ProvisioningResultWriter(queue)
+    writer.status(job.job_id, "provisioning")
+    result = writer.completed(
+        job_id=job.job_id,
+        instance_id="ava-web-01",
+        instance_name="ava-web-01",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+        http_port=8080,
+        verification_evidence={"checks": [{"name": "host_http_200", "passed": True}]},
+    )
+    loaded = queue.get_result(job.job_id)
+    failures.extend(
+        [
+            check("writer marks completed", queue.get_status(job.job_id) == "completed"),
+            check("result includes ssh host", loaded is not None and loaded.ssh_host == "127.0.0.1"),
+            check("result includes ssh port", loaded is not None and loaded.ssh_port == 2222),
+            check("result excludes temporary password", "DoNotLogThis123!" not in str(result.to_dict())),
+        ]
+    )
+
+    failed = writer.failed(
+        job_id="failed-job",
+        instance_id=None,
+        instance_name=None,
+        error={"message": "bad password DoNotLogThis123!", "temporary_password": "DoNotLogThis123!"},
+    )
+    failures.extend(
+        [
+            check("failed result redacts password field", failed.error.get("temporary_password") == "[REDACTED]"),
+            check("failed result redacts message secret", "DoNotLogThis123!" not in str(failed.to_dict())),
+        ]
+    )
+
+    print("\n--- cleanup ordering (Phase 9 fix: closemedium before unlink) ---")
+    failures.extend(test_seed_iso_cleanup_ordering())
+
+    failed_count = len([item for item in failures if not item])
+    if failed_count:
+        print(f"\nPhase 9 runner bridge regression failed: {failed_count} issue(s)")
+        return 1
+    print("\nPhase 9 runner bridge regression passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
