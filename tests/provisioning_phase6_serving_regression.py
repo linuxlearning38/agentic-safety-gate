@@ -106,13 +106,14 @@ def main() -> int:
             ]
         )
 
-        approved = service.handle("user-1", f"approve {approval_id}", route_intent=None)
+        approved = service.handle("user-1", f"approve - {approval_id}", route_intent=None)
         approved_session = service.sessions.list_active("user-1")[0]
         failures.extend(
             [
-                check("chat approval is handled", approved.handled),
+                check("chat approval with separator is handled", approved.handled),
                 check("chat approval updates queue", approval.get_by_id(approval_id).get("status") == "approved"),
                 check("chat approval issues one-time credential", "temporary password" in approved.response.lower()),
+                check("chat approval clarifies runner boundary", "host-side" in approved.response.lower()),
                 check("approved phase awaits first login", approved_session.phase == SessionPhase.AWAITING_FIRST_LOGIN, approved_session.phase.value),
             ]
         )

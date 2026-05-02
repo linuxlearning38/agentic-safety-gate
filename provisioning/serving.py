@@ -215,7 +215,7 @@ def _is_approval_continuation(query: str) -> bool:
 
 
 def _extract_chat_approval_id(query: str) -> str | None:
-    match = re.fullmatch(r"(?:approve|approved|confirm approval|approve request)\s+([a-f0-9]{8})", query or "")
+    match = re.fullmatch(r"(?:approve|approved|confirm approval|approve request)\s+[-:#]?\s*([a-f0-9]{8})", query or "")
     return match.group(1) if match else None
 
 
@@ -241,9 +241,12 @@ def _format_flow_response(response) -> str:
     if response.credential:
         credential = response.credential
         return (
-            "Approval confirmed. Temporary access has been issued once.\n\n"
+            "Approval confirmed. Temporary access has been issued once for this approved provisioning plan.\n\n"
             f"Username: `{credential.username}`\n"
             f"Temporary password: `{credential.temporary_password}`\n\n"
+            "Important: approval unlocks provisioning, but the VM is created only when the host-side "
+            "VirtualBox runner executes the approved plan. Do not expect a new VM in VirtualBox until "
+            "AVA reports that the VM was created and started.\n\n"
             "Change this password on first login. After you log in and change it, reply: "
             "`I logged in and changed the password`."
         )
