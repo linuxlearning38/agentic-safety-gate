@@ -385,6 +385,8 @@ class VirtualBoxAdapter(ProviderAdapter):
             "dvddrive",
             "--medium",
             seed_iso_path,
+            "--tempeject",
+            "on",
         )
 
         username = str(access_spec.get("username") or "ubuntu").strip() or "ubuntu"

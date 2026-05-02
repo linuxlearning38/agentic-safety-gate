@@ -360,18 +360,37 @@ class HostRunner:
             "0",
             "--medium",
             "none",
+            "--forceunmount",
             check=False,
         )
         # storageattach --medium none disconnects the ISO from the storage
         # controller but VBoxSVC on Windows keeps the file handle open until
         # the medium is removed from VirtualBox's global registry.
         # closemedium dvd releases that handle so seed_iso.unlink() can succeed.
-        self.adapter._run_vboxmanage(
+        close_proc = self.adapter._run_vboxmanage(
             "closemedium",
             "dvd",
             str(seed_iso),
             check=False,
         )
+        if close_proc.returncode != 0:
+            seed_uuid = self._find_registered_seed_dvd_uuid(seed_iso)
+            if seed_uuid:
+                self.adapter._run_vboxmanage("closemedium", "dvd", seed_uuid, check=False)
+
+    def _find_registered_seed_dvd_uuid(self, seed_iso: Path) -> str | None:
+        proc = self.adapter._run_vboxmanage("list", "dvds", check=False)
+        if proc.returncode != 0:
+            return None
+        target = str(seed_iso).lower()
+        current_uuid: str | None = None
+        for raw_line in (proc.stdout or "").splitlines():
+            line = raw_line.strip()
+            if line.startswith("UUID:"):
+                current_uuid = line.split(":", 1)[1].strip()
+            elif line.startswith("Location:") and line.split(":", 1)[1].strip().lower() == target:
+                return current_uuid
+        return None
 
     def _cleanup_secret_files(self, work_dir: Path, seed_dir: Path, seed_iso: Path) -> None:
         try:
