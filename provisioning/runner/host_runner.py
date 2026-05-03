@@ -170,6 +170,10 @@ class HostRunnerConfig:
         )
 
 
+_ISO_UNLINK_ATTEMPTS = 8
+_ISO_UNLINK_DELAY_SECONDS = 2.0
+
+
 class HostRunner:
     """Consume approved Redis jobs and execute them through Windows VirtualBox."""
 
@@ -414,9 +418,26 @@ class HostRunner:
         return None
 
     def _cleanup_secret_files(self, work_dir: Path, seed_dir: Path, seed_iso: Path) -> None:
-        try:
-            if seed_iso.exists():
+        # VBoxSVC releases its file handle on seed.iso asynchronously after
+        # closemedium returns (WinError 32 race). Retry on PermissionError only;
+        # any other exception propagates immediately.
+        last_exc: Exception | None = None
+        for attempt in range(1, _ISO_UNLINK_ATTEMPTS + 1):
+            if not seed_iso.exists():
+                break
+            try:
                 seed_iso.unlink()
+                break
+            except PermissionError as exc:
+                last_exc = exc
+                self.logger.warning(
+                    "seed.iso locked by another process (attempt %d/%d), retrying in %.0fs",
+                    attempt, _ISO_UNLINK_ATTEMPTS, _ISO_UNLINK_DELAY_SECONDS,
+                )
+                time.sleep(_ISO_UNLINK_DELAY_SECONDS)
+        else:
+            raise RuntimeError(f"Secret cleanup failed in {work_dir}: {last_exc}") from last_exc
+        try:
             if seed_dir.exists():
                 shutil.rmtree(seed_dir)
         except Exception as exc:

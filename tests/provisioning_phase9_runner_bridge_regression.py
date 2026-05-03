@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 
 
@@ -19,7 +21,11 @@ from provisioning.runner import (  # noqa: E402
     ProvisioningResultWriter,
     RedisProvisioningJobQueue,
 )
-from provisioning.runner.host_runner import HostRunner, _write_cloud_init_seed  # noqa: E402
+from provisioning.runner.host_runner import (  # noqa: E402
+    HostRunner,
+    _ISO_UNLINK_ATTEMPTS,
+    _write_cloud_init_seed,
+)
 
 
 class FakeRedis:
@@ -197,6 +203,93 @@ def test_runner_verification_uses_key_auth() -> list[bool]:
     ]
 
 
+def test_seed_iso_cleanup_retries_on_permission_error() -> list[bool]:
+    """_cleanup_secret_files retries seed_iso.unlink() on PermissionError.
+
+    VBoxSVC releases its file handle asynchronously after closemedium returns.
+    The first few unlink attempts may raise PermissionError (WinError 32) before
+    VBoxSVC surrenders the handle.  The runner must retry with backoff rather
+    than immediately failing the job.
+    """
+    tmp = Path(tempfile.mkdtemp())
+    seed_iso = tmp / "seed.iso"
+    seed_dir = tmp / "seed"
+    seed_dir.mkdir()
+    seed_iso.write_bytes(b"fake-iso-content")
+
+    fail_for = 3  # first 3 calls raise PermissionError; 4th succeeds
+    unlink_calls = [0]
+    original_unlink = Path.unlink
+    original_sleep = time.sleep
+
+    def tracked_unlink(self, missing_ok=False):
+        if self == seed_iso:
+            unlink_calls[0] += 1
+            if unlink_calls[0] <= fail_for:
+                raise PermissionError("[WinError 32] file is locked by another process")
+        return original_unlink(self, missing_ok=missing_ok)
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.logger = logging.getLogger("ava.test.cleanup_retry")
+
+    raised = False
+    try:
+        Path.unlink = tracked_unlink
+        time.sleep = lambda _: None
+        runner._cleanup_secret_files(tmp, seed_dir, seed_iso)
+    except Exception:
+        raised = True
+    finally:
+        Path.unlink = original_unlink
+        time.sleep = original_sleep
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return [
+        check("no exception raised after retries succeeded", not raised),
+        check(f"unlink retried until success ({fail_for} fails + 1 success)", unlink_calls[0] == fail_for + 1),
+        check("seed ISO deleted after retries", not seed_iso.exists()),
+    ]
+
+
+def test_seed_iso_cleanup_fails_after_all_retries() -> list[bool]:
+    """_cleanup_secret_files raises RuntimeError when every retry attempt fails."""
+    tmp = Path(tempfile.mkdtemp())
+    seed_iso = tmp / "seed.iso"
+    seed_dir = tmp / "seed"
+    seed_dir.mkdir()
+    seed_iso.write_bytes(b"fake-iso-content")
+
+    unlink_calls = [0]
+    original_unlink = Path.unlink
+    original_sleep = time.sleep
+
+    def always_locked(self, missing_ok=False):
+        if self == seed_iso:
+            unlink_calls[0] += 1
+            raise PermissionError("[WinError 32] file is locked by another process")
+        return original_unlink(self, missing_ok=missing_ok)
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.logger = logging.getLogger("ava.test.cleanup_fail")
+
+    raised_cleanup_error = False
+    try:
+        Path.unlink = always_locked
+        time.sleep = lambda _: None
+        runner._cleanup_secret_files(tmp, seed_dir, seed_iso)
+    except RuntimeError as exc:
+        raised_cleanup_error = "Secret cleanup failed" in str(exc)
+    finally:
+        Path.unlink = original_unlink
+        time.sleep = original_sleep
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return [
+        check("RuntimeError raised after all retries exhausted", raised_cleanup_error),
+        check(f"unlink attempted exactly {_ISO_UNLINK_ATTEMPTS} times", unlink_calls[0] == _ISO_UNLINK_ATTEMPTS),
+    ]
+
+
 def main() -> int:
     fake = FakeRedis()
     queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
@@ -280,6 +373,10 @@ def main() -> int:
 
     print("\n--- runner verification key auth (Phase 9 fix: ava-runner user, no PAM expiry) ---")
     failures.extend(test_runner_verification_uses_key_auth())
+
+    print("\n--- seed.iso cleanup retry (Phase 9 fix: WinError 32 race with VBoxSVC) ---")
+    failures.extend(test_seed_iso_cleanup_retries_on_permission_error())
+    failures.extend(test_seed_iso_cleanup_fails_after_all_retries())
 
     failed_count = len([item for item in failures if not item])
     if failed_count:
