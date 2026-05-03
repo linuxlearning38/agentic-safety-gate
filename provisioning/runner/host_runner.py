@@ -170,8 +170,8 @@ class HostRunnerConfig:
         )
 
 
-_ISO_UNLINK_ATTEMPTS = 8
-_ISO_UNLINK_DELAY_SECONDS = 2.0
+_ISO_UNLINK_ATTEMPTS = 20
+_ISO_UNLINK_DELAY_SECONDS = 3.0
 
 
 class HostRunner:
@@ -305,7 +305,9 @@ class HostRunner:
                 raise RuntimeError(detail)
 
             self._detach_seed_iso(instance_id, seed_iso)
-            self._cleanup_secret_files(work_dir, seed_dir, seed_iso)
+            # seed.iso is detached from the VM; cleanup is deferred to after
+            # verification so that a VBoxSVC file-lock race does not destroy
+            # a fully working VM.
 
             self.writer.status(job.job_id, "bootstrapping")
             role = WebServerRole()
@@ -332,6 +334,25 @@ class HostRunner:
             if not report.passed:
                 raise RuntimeError("verification engine reported failure")
 
+            # VM is fully verified. Attempt secret file cleanup now that bootstrap
+            # and verification are complete. VBoxSVC may still hold seed.iso after
+            # closemedium returns — this is a known Windows file-lock race. A failure
+            # here must NOT destroy a working VM; log and continue.
+            cleanup_warning: str | None = None
+            try:
+                self._cleanup_secret_files(work_dir, seed_dir, seed_iso)
+            except Exception as cleanup_exc:
+                cleanup_warning = str(cleanup_exc)
+                self.logger.warning(
+                    "Job %s: VM provisioned successfully but seed.iso cleanup failed — "
+                    "manual cleanup required at %s. Job marked completed.",
+                    job.job_id, work_dir,
+                )
+
+            evidence = report.to_dict()
+            if cleanup_warning:
+                evidence["cleanup_warning"] = cleanup_warning
+
             self.writer.completed(
                 job_id=job.job_id,
                 instance_id=instance_id,
@@ -339,7 +360,7 @@ class HostRunner:
                 ssh_host=connection.host,
                 ssh_port=connection.port,
                 http_port=int(http_port),
-                verification_evidence=report.to_dict(),
+                verification_evidence=evidence,
             )
             self.logger.info("Completed job %s instance=%s", job.job_id, instance_id)
         except Exception as exc:

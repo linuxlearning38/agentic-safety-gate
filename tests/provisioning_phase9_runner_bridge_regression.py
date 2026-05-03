@@ -23,9 +23,11 @@ from provisioning.runner import (  # noqa: E402
 )
 from provisioning.runner.host_runner import (  # noqa: E402
     HostRunner,
+    HostRunnerConfig,
     _ISO_UNLINK_ATTEMPTS,
     _write_cloud_init_seed,
 )
+from provisioning.runner.result_writer import ProvisioningResultWriter as _ResultWriter  # noqa: E402
 
 
 class FakeRedis:
@@ -290,6 +292,158 @@ def test_seed_iso_cleanup_fails_after_all_retries() -> list[bool]:
     ]
 
 
+def test_cleanup_failure_after_verification_does_not_rollback() -> list[bool]:
+    """Cleanup failure after full verification marks the job completed, not failed.
+
+    VBoxSVC may hold seed.iso for longer than the retry window. When the VM is
+    already verified (HTTP 200 + VerificationEngine passed), the cleanup failure
+    must NOT trigger Phase 7 rollback or call writer.failed. The job must be
+    marked completed with a cleanup_warning in verification_evidence.
+    """
+    import provisioning.runner.host_runner as hr_mod
+
+    tmp = Path(tempfile.mkdtemp())
+    work_root = tmp / "runner-work"
+
+    fake_redis = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake_redis, ttl_seconds=1800)
+    queue.enqueue_approved_job(
+        session_id="session-cleanup-race-test",
+        desired_state={
+            "provider": "virtualbox", "os": "ubuntu", "role": "web_server",
+            "vm_name": "ava-web-cleanup-test", "cpu": 2, "ram_gb": 4, "disk_gb": 30,
+            "network_mode": "nat", "firewall_profile": "web_public",
+            "hardening_profile": "baseline_linux",
+        },
+        credential_id="cred-cleanup-race",
+        username="avaadmin",
+        temporary_password="CleanupRace1!",
+    )
+    job = queue.claim_next_job(timeout_seconds=1)
+
+    # Pre-create work_dir so execute_job's mkdir(exist_ok=True) is a no-op.
+    # This lets us seed the files that mocked _run would otherwise create.
+    work_dir = work_root / job.job_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "ava_runner_ed25519.pub").write_text("ssh-ed25519 AAAAFAKEKEY ava-runner-test", encoding="utf-8")
+    seed_iso = work_dir / "seed.iso"
+    seed_iso.write_bytes(b"fake-iso-secret-content")
+
+    destroy_called = [False]
+
+    class MockAdapter:
+        image_name = "ubuntu-cloud-image"
+        def plan_instance(self, ds): return SimpleNamespace(vm_name="ava-web-cleanup-test")
+        def create_instance(self, plan): return "ava-web-cleanup-test"
+        def inject_access(self, iid, cfg): return "cloud_init_seed_attached"
+        def get_connection_info(self, iid):
+            return SimpleNamespace(host="127.0.0.1", port=2222, metadata={"http_host_port": 8080})
+        def start_instance(self, iid): pass
+        def _run_vboxmanage(self, *args, check=True, timeout=120):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        def get_instance_state(self, iid): return SimpleNamespace(exists=True)
+        def destroy_instance(self, iid):
+            destroy_called[0] = True
+            return "destroyed"
+
+    config = HostRunnerConfig(
+        vboxmanage="VBoxManage", ssh_binary="ssh", ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image", work_root=work_root,
+        log_path=tmp / "test_runner.log", retain_debug=False,
+        timeout_seconds=30, max_jobs=1,
+    )
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.queue = queue
+    runner.writer = _ResultWriter(queue)
+    runner.config = config
+    runner.adapter = MockAdapter()
+    runner.logger = logging.getLogger("ava.test.cleanup_race")
+
+    warnings_logged: list[str] = []
+
+    class _CapturingHandler(logging.Handler):
+        def emit(self, record):
+            if record.levelno >= logging.WARNING:
+                warnings_logged.append(record.getMessage())
+
+    cap_handler = _CapturingHandler()
+    runner.logger.addHandler(cap_handler)
+
+    cloud_init_result = SimpleNamespace(
+        exit_code=0,
+        stdout="AVA_CLOUD_INIT_READY ava-web-cleanup-test\n",
+        stderr="", failure_class="none",
+    )
+    mock_report = SimpleNamespace(
+        passed=True,
+        to_dict=lambda: {"checks": [{"name": "host_http_200", "passed": True}]},
+    )
+
+    class _MockWebServerRole:
+        def bootstrap(self, executor):
+            return [SimpleNamespace(exit_code=0, stdout="", stderr="", command="apt install nginx")]
+
+    class _MockVerificationEngine:
+        def __init__(self, adapter, executor_factory=None): pass
+        def verify_web_server(self, iid): return mock_report
+
+    original_validate = HostRunner._validate_binaries
+    original_run = hr_mod._run
+    original_wait_tcp = hr_mod._wait_for_tcp
+    original_wait_exec = hr_mod._wait_for_executor_command
+    original_wait_http = hr_mod._wait_for_http_200
+    original_ssh_executor = hr_mod.SSHExecutor
+    original_web_server_role = hr_mod.WebServerRole
+    original_verification_engine = hr_mod.VerificationEngine
+    original_unlink = Path.unlink
+    original_sleep = time.sleep
+
+    def always_locked_iso(self_path, missing_ok=False):
+        if self_path.suffix == ".iso":
+            raise PermissionError("[WinError 32] seed.iso locked by VBoxSVC")
+        return original_unlink(self_path, missing_ok=missing_ok)
+
+    try:
+        HostRunner._validate_binaries = lambda self: None
+        hr_mod._run = lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr="")
+        hr_mod._wait_for_tcp = lambda host, port, timeout: True
+        hr_mod._wait_for_executor_command = lambda executor, cmd, timeout, *, redact: cloud_init_result
+        hr_mod._wait_for_http_200 = lambda url, timeout_seconds: (True, "HTTP 200")
+        hr_mod.SSHExecutor = lambda conn: SimpleNamespace(run=lambda cmd, **kw: cloud_init_result)
+        hr_mod.WebServerRole = _MockWebServerRole
+        hr_mod.VerificationEngine = _MockVerificationEngine
+        Path.unlink = always_locked_iso
+        time.sleep = lambda _: None
+        runner.execute_job(job)
+    finally:
+        HostRunner._validate_binaries = original_validate
+        hr_mod._run = original_run
+        hr_mod._wait_for_tcp = original_wait_tcp
+        hr_mod._wait_for_executor_command = original_wait_exec
+        hr_mod._wait_for_http_200 = original_wait_http
+        hr_mod.SSHExecutor = original_ssh_executor
+        hr_mod.WebServerRole = original_web_server_role
+        hr_mod.VerificationEngine = original_verification_engine
+        Path.unlink = original_unlink
+        time.sleep = original_sleep
+        runner.logger.removeHandler(cap_handler)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    final_status = queue.get_status(job.job_id)
+    final_result = queue.get_result(job.job_id)
+
+    return [
+        check("VM not destroyed by Phase 7 rollback", not destroy_called[0]),
+        check("job status is completed (not failed)", final_status == "completed"),
+        check("result includes ssh_host", final_result is not None and final_result.ssh_host == "127.0.0.1"),
+        check("cleanup_warning recorded in verification_evidence",
+              final_result is not None and "cleanup_warning" in (final_result.verification_evidence or {})),
+        check("warning was logged about manual cleanup",
+              any("seed.iso cleanup failed" in w or "manual cleanup" in w for w in warnings_logged)),
+    ]
+
+
 def main() -> int:
     fake = FakeRedis()
     queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
@@ -377,6 +531,9 @@ def main() -> int:
     print("\n--- seed.iso cleanup retry (Phase 9 fix: WinError 32 race with VBoxSVC) ---")
     failures.extend(test_seed_iso_cleanup_retries_on_permission_error())
     failures.extend(test_seed_iso_cleanup_fails_after_all_retries())
+
+    print("\n--- cleanup race must not destroy verified VM (Phase 9 critical fix) ---")
+    failures.extend(test_cleanup_failure_after_verification_does_not_rollback())
 
     failed_count = len([item for item in failures if not item])
     if failed_count:
