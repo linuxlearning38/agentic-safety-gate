@@ -63,6 +63,7 @@ COPY users.json .
 COPY control/ ./control/
 COPY knowledge_updater/ ./knowledge_updater/
 COPY provisioning/ ./provisioning/
+COPY scripts/docker-entrypoint.sh /app/entrypoint.sh
 
 # Create mount-point directories so volume mounts don't land as root-owned
 RUN mkdir -p \
@@ -70,7 +71,8 @@ RUN mkdir -p \
         /data/chromadb \
         /data/logs \
         /data/history \
-    && chown -R ava:ava /app /data
+    && chown -R ava:ava /app /data \
+    && chmod +x /app/entrypoint.sh
 
 # Switch to non-root
 USER ava
@@ -87,8 +89,9 @@ ctx.verify_mode = ssl.CERT_NONE; \
 urllib.request.urlopen('https://localhost:5443/health', context=ctx, timeout=5)" \
     || exit 1
 
-# Run a single HTTPS Gunicorn process.
-# HTTP :5002 remains available via start_ava.sh on bare-metal only.
+# Entrypoint fixes /data permissions on every start (prevents WSL bind-mount
+# mode drift) then execs the gunicorn command passed as CMD.
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["gunicorn", \
      "--config", "/app/gunicorn.conf.py", \
      "--bind",    "0.0.0.0:5443", \

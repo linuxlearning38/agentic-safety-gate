@@ -4,7 +4,7 @@ param(
     [string]$TemplateName = "ubuntu-cloud-image",
     [string]$WorkDir = "",
     [switch]$RetainDebug,
-    [int]$MaxJobs = 0
+    [int]$MaxJobs = 1
 )
 
 Set-StrictMode -Version Latest
@@ -14,6 +14,11 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $WorkDir) {
     $WorkDir = Join-Path $repoRoot ".ava-runner"
 }
+
+# Kill any stale runner process so the new launch gets fresh code.
+Get-Process -Name python -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'host_runner' } |
+    ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
 
 $env:AVA_PROVISIONING_REDIS_URL = $RedisUrl
 $env:AVA_VBOXMANAGE_PATH = $VBoxManagePath
