@@ -90,7 +90,7 @@ services:
       MEMORY_PATH:         /data/ava_memory.json
       GUNICORN_ACCESS_LOG: /tmp/ava_access.log
       GUNICORN_ERROR_LOG:  /tmp/ava_error.log
-      OLLAMA_HOST:         http://host.docker.internal:11434
+      OLLAMA_HOST:         ${OLLAMA_HOST:-http://172.24.212.81:11434}
       AVA_HOST_PROC:       /host/proc
       FLASK_ENV:           production
       LLM_WARMUP_ENABLED:  "false"
