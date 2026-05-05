@@ -175,7 +175,7 @@ def main() -> int:
                 check("chat approval issues one-time credential", "temporary password" in approved.response.lower()),
                 check("chat approval queues runner job", "runner job queued" in approved.response.lower()),
                 check("chat approval clarifies runner boundary", "host-side" in approved.response.lower()),
-                check("chat approval explains putty endpoint later", "putty connection host/ip" in approved.response.lower()),
+                check("chat approval explains putty endpoint later", "putty ssh host/ip" in approved.response.lower()),
                 check("runner job contains temporary seed secret", bool(job_queue.jobs["job-0001"].credentials_seed_data.get("temporary_password"))),
                 check("approved phase awaits first login", approved_session.phase == SessionPhase.AWAITING_FIRST_LOGIN, approved_session.phase.value),
             ]
@@ -242,12 +242,46 @@ def main() -> int:
             [
                 check("completed status shows putty ssh host", "ssh host/ip: `127.0.0.1`" in completed_status.response.lower()),
                 check("completed status shows putty ssh port", "ssh port: `2222`" in completed_status.response.lower()),
+                check("completed status reports effective phase", "phase: `completed`" in completed_status.response.lower()),
+                check("completed status keeps conversation checkpoint visible", "conversation checkpoint:" in completed_status.response.lower()),
                 check("completed verify shows http evidence", "http://127.0.0.1:8080/" in completed_verify.response.lower()),
                 check("connection query shows putty host", "putty host name" in completed_connection.response.lower()),
                 check("connection query shows username", "username: `avaadmin`" in completed_connection.response.lower()),
                 check("connection query does not reprint actual password", issued_secret not in completed_connection.response),
                 check("evidence includes hardening summary", "hardening summary" in completed_evidence.response.lower()),
+                check("evidence reports effective completed phase", "effective phase: `completed`" in completed_evidence.response.lower()),
                 check("evidence states apache not applied", "apache hardening" in completed_evidence.response.lower()),
+            ]
+        )
+
+        late_start = service.handle("user-late", "I want a web server in Ubuntu", route_intent="provisioning")
+        late_specs = service.handle("user-late", "2 CPU, 4 GB RAM, 30 GB disk, hostname ava-web-late", route_intent=None)
+        late_approval_id = late_specs.metadata["provisioning"]["approval_id"]
+        late_approved = service.handle("user-late", f"approve {late_approval_id}", route_intent=None)
+        job_queue.write_status("job-0002", "completed")
+        job_queue.write_result(
+            ProvisioningJobResult(
+                job_id="job-0002",
+                instance_id="ava-web-late",
+                instance_name="ava-web-late",
+                ssh_host="127.0.0.1",
+                ssh_port=2223,
+                http_port=8081,
+                verification_evidence={"checks": [{"name": "host_http_200", "passed": True, "evidence": "HTTP 200"}]},
+                completion_timestamp="2026-05-02T00:20:00+00:00",
+                error=None,
+            )
+        )
+        late_login = service.handle("user-late", "I logged in and changed the password", route_intent=None)
+        late_hardening = service.handle("user-late", "yes harden it", route_intent=None)
+        failures.extend(
+            [
+                check("late completed start is handled", late_start.handled),
+                check("late completed approval is handled", late_approved.handled),
+                check("late login does not ask for hardening again", "reply `yes harden it`" not in late_login.response.lower()),
+                check("late login reports runner already completed", "already completed" in late_login.response.lower()),
+                check("late hardening does not claim next execution step", "next execution step" not in late_hardening.response.lower()),
+                check("late hardening reports runner-applied baseline", "already applied" in late_hardening.response.lower()),
             ]
         )
 
