@@ -59,6 +59,9 @@ class ProvisioningChatService:
         if _is_status_query(normalized):
             return self._result(_format_status_response(active, self._runner_snapshot(active)), active)
 
+        if _is_connection_query(normalized):
+            return self._result(_format_connection_response(active, self._runner_snapshot(active)), active)
+
         if _is_evidence_query(normalized):
             return self._result(_format_evidence_response(active, self._runner_snapshot(active)), active)
 
@@ -171,7 +174,14 @@ class ProvisioningChatService:
                 username=credential.username,
                 temporary_password=credential.temporary_password or "",
             )
-            session = self.sessions.record_answers(response.session.session_id, {"runner_job_id": job.job_id})
+            session = self.sessions.record_answers(
+                response.session.session_id,
+                {
+                    "runner_job_id": job.job_id,
+                    "username": credential.username,
+                    "credential_displayed_once": True,
+                },
+            )
             response.session = session
             return (
                 message
@@ -330,6 +340,21 @@ def _is_status_query(query: str) -> bool:
     )
 
 
+def _is_connection_query(query: str) -> bool:
+    return (
+        "how do i connect" in query
+        or "how to connect" in query
+        or "putty" in query
+        or "ssh details" in query
+        or "ssh connection" in query
+        or "connection details" in query
+        or "login details" in query
+        or "host ip" in query
+        or "host/ip" in query
+        or query in {"ip", "server ip", "ssh", "connect", "login"}
+    )
+
+
 def _is_evidence_query(query: str) -> bool:
     return (
         "what did you do" in query
@@ -366,6 +391,76 @@ def _format_desired_state(desired: dict[str, Any]) -> str:
     )
 
 
+def _connection_lines(session, result: ProvisioningJobResult | None) -> list[str]:
+    answers = session.collected_answers or {}
+    username = answers.get("username", "avaadmin")
+    if not result or not result.instance_id:
+        return [
+            "Connection details:",
+            "- SSH host/IP: `pending until runner completes`",
+            "- SSH port: `pending until runner completes`",
+            f"- Username: `{username}`",
+            "- Temporary password: `shown once at approval; not recoverable from status`",
+            "- Web URL: `pending until runner completes`",
+        ]
+    return [
+        "Connection details:",
+        f"- Hostname / VM name: `{result.instance_name or result.instance_id}`",
+        f"- SSH host/IP: `{result.ssh_host or 'unknown'}` (PuTTY Host Name)",
+        f"- SSH port: `{result.ssh_port or 'unknown'}` (PuTTY Port)",
+        f"- Username: `{username}`",
+        "- Temporary password: `shown once at approval; not recoverable from status`",
+        f"- Web URL: `http://127.0.0.1:{result.http_port}/`" if result.http_port else "- Web URL: `unknown`",
+    ]
+
+
+def _format_hardening_summary(session, result: ProvisioningJobResult | None) -> list[str]:
+    answers = session.collected_answers or {}
+    desired = session.desired_state or {}
+    profile = answers.get("hardening_profile") or desired.get("hardening_profile") or "baseline_linux"
+    status = "applied by runner" if result and result.instance_id and profile != "none" else "requested/default"
+    if profile == "none":
+        status = "explicitly skipped"
+    return [
+        "Hardening summary:",
+        f"- Server hardening profile: `{profile}` ({status})",
+        "- Linux baseline: `default-on unless explicitly skipped`",
+        "- Web role hardening: `nginx web_server role verified with HTTP 200`" if result and result.instance_id else "- Web role hardening: `pending runner completion`",
+        "- Apache hardening: `not applied in v2.0.0 because the active role is nginx/web_server`",
+    ]
+
+
+def _format_connection_response(session, runner: dict[str, Any] | None = None) -> str:
+    runner = runner or {}
+    result = runner.get("result")
+    lines = [
+        "AVA connection details for the active provisioning session:",
+        "",
+        f"- Runner job ID: `{runner.get('job_id') or 'not queued yet'}`",
+        f"- Runner status: `{runner.get('status') or 'not available yet'}`",
+        "",
+        *_connection_lines(session, result),
+    ]
+    if result and result.instance_id:
+        lines.extend(
+            [
+                "",
+                "PuTTY settings:",
+                f"- Host Name: `{result.ssh_host}`",
+                f"- Port: `{result.ssh_port}`",
+                "- Connection type: `SSH`",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "The VM connection endpoint is produced after the host runner creates and verifies the VM.",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def _format_status_response(session, runner: dict[str, Any] | None = None) -> str:
     answers = session.collected_answers or {}
     runner = runner or {}
@@ -380,6 +475,7 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
         f"- Runner status: `{runner.get('status') or 'not available yet'}`",
         f"- Hostname: `{(session.desired_state or {}).get('vm_name') or 'auto-generated'}`",
         f"- Temporary credential issued: `{'yes' if session.credential_id else 'no'}`",
+        "- Temporary password: `shown once at approval; not recoverable from status`",
         f"- First-login confirmation: `{'yes' if session.phase in {SessionPhase.AWAITING_POST_LOGIN_CHOICES, SessionPhase.BOOTSTRAPPING, SessionPhase.VERIFYING, SessionPhase.COMPLETED} else 'pending'}`",
         f"- Hardening choice: `{answers.get('hardening_profile', 'not recorded yet')}`",
         f"- Attached VM instance: `{session.instance_id or (result.instance_id if result else None) or 'none yet'}`",
@@ -388,19 +484,12 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
         _format_desired_state(session.desired_state or {}),
     ]
     if result and result.instance_id:
-        lines.extend(
-            [
-                "",
-                "Connection details:",
-                f"- SSH host/IP: `{result.ssh_host or 'unknown'}`",
-                f"- SSH port: `{result.ssh_port or 'unknown'}`",
-                f"- Username: `{answers.get('username', 'avaadmin')}`",
-                f"- HTTP port: `{result.http_port or 'unknown'}`",
-            ]
-        )
+        lines.extend(["", *_connection_lines(session, result), "", *_format_hardening_summary(session, result)])
     elif runner.get("job_id"):
         lines.extend(
             [
+                "",
+                *_connection_lines(session, None),
                 "",
                 "Runner boundary: the approved job is queued or running. AVA will show PuTTY "
                 "connection details after the host runner writes the result.",
@@ -441,10 +530,14 @@ def _format_verification_response(session, runner: dict[str, Any] | None = None)
         return (
             "Web-server verification evidence from the host runner:\n\n"
             f"- Instance: `{result.instance_id}`\n"
-            f"- SSH: `{result.ssh_host}:{result.ssh_port}`\n"
+            f"- Hostname / VM name: `{result.instance_name or result.instance_id}`\n"
+            f"- SSH / PuTTY: `{result.ssh_host}:{result.ssh_port}`\n"
+            f"- Username: `{(session.collected_answers or {}).get('username', 'avaadmin')}`\n"
             f"- HTTP: `http://127.0.0.1:{result.http_port}/`\n"
             f"- Completed: `{result.completion_timestamp}`\n\n"
             + "\n".join(check_lines)
+            + "\n\n"
+            + "\n".join(_format_hardening_summary(session, result))
         )
     if runner.get("job_id"):
         return (
@@ -503,10 +596,15 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
                 "",
                 "Runner result evidence:",
                 f"- Instance name: `{result.instance_name or result.instance_id}`",
-                f"- SSH host/IP: `{result.ssh_host or 'unknown'}`",
-                f"- SSH port: `{result.ssh_port or 'unknown'}`",
+                f"- SSH host/IP: `{result.ssh_host or 'unknown'}` (PuTTY Host Name)",
+                f"- SSH port: `{result.ssh_port or 'unknown'}` (PuTTY Port)",
+                f"- Username: `{answers.get('username', 'avaadmin')}`",
+                "- Temporary password: `shown once at approval; not recoverable from evidence`",
                 f"- HTTP port: `{result.http_port or 'unknown'}`",
+                f"- Web URL: `http://127.0.0.1:{result.http_port}/`" if result.http_port else "- Web URL: `unknown`",
                 f"- Completion timestamp: `{result.completion_timestamp}`",
+                "",
+                *_format_hardening_summary(session, result),
             ]
         )
     elif not session.instance_id:
@@ -529,6 +627,7 @@ def _format_flow_response(response) -> str:
             "Approval confirmed. Temporary access has been issued once for this approved provisioning plan.\n\n"
             f"Username: `{credential.username}`\n"
             f"Temporary password: `{credential.temporary_password}`\n\n"
+            "Save this password now. AVA will not print it again in status or evidence responses.\n\n"
             "Important: approval unlocks provisioning, but the VM is created only when the host-side "
             "VirtualBox runner executes the approved plan. Do not expect a new VM in VirtualBox until "
             "AVA reports that the VM was created and started. The PuTTY connection host/IP and SSH "

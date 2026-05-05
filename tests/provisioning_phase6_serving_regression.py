@@ -235,11 +235,19 @@ def main() -> int:
         )
         completed_status = service.handle("user-1", "show me the provisioning status", route_intent=None)
         completed_verify = service.handle("user-1", "verify the web server", route_intent=None)
+        completed_connection = service.handle("user-1", "how do I connect with PuTTY?", route_intent=None)
+        completed_evidence = service.handle("user-1", "what did you do and what evidence do you have?", route_intent=None)
+        issued_secret = job_queue.jobs["job-0001"].credentials_seed_data["temporary_password"]
         failures.extend(
             [
                 check("completed status shows putty ssh host", "ssh host/ip: `127.0.0.1`" in completed_status.response.lower()),
                 check("completed status shows putty ssh port", "ssh port: `2222`" in completed_status.response.lower()),
                 check("completed verify shows http evidence", "http://127.0.0.1:8080/" in completed_verify.response.lower()),
+                check("connection query shows putty host", "putty host name" in completed_connection.response.lower()),
+                check("connection query shows username", "username: `avaadmin`" in completed_connection.response.lower()),
+                check("connection query does not reprint actual password", issued_secret not in completed_connection.response),
+                check("evidence includes hardening summary", "hardening summary" in completed_evidence.response.lower()),
+                check("evidence states apache not applied", "apache hardening" in completed_evidence.response.lower()),
             ]
         )
 
