@@ -58,6 +58,16 @@ def _redact(text: str, redact_patterns: Iterable[str]) -> str:
     return redacted
 
 
+def _ssh_config_path_value(path: str | None) -> str:
+    """Quote OpenSSH config path values so Windows paths with spaces survive parsing."""
+
+    if not path:
+        return "NUL"
+    normalized = str(Path(path)).replace("\\", "/")
+    escaped = normalized.replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 @dataclass(slots=True)
 class SSHConnection:
     """SSH connection target for a provisioned guest."""
@@ -121,7 +131,7 @@ class SSHExecutor:
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
-            f"UserKnownHostsFile={self.connection.known_hosts_path or 'NUL'}",
+            f"UserKnownHostsFile={_ssh_config_path_value(self.connection.known_hosts_path)}",
             "-o",
             "ConnectTimeout=10",
             "-p",

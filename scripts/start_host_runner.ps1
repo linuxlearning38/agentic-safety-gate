@@ -4,7 +4,7 @@ param(
     [string]$TemplateName = "ubuntu-cloud-image",
     [string]$WorkDir = "",
     [switch]$RetainDebug,
-    [int]$MaxJobs = 1
+    [int]$MaxJobs = 0
 )
 
 Set-StrictMode -Version Latest

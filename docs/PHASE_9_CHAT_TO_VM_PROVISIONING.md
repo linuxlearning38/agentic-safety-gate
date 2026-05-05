@@ -137,11 +137,17 @@ every login or AVA restart.
 because the long-lived Python process cached it.  Fix was `Stop-Process python`
 manually.
 
-**Fix (2-line change to `start_host_runner.ps1`):**
-1. Added `$MaxJobs = 1` as default — the runner processes one job and exits,
-   so the next job launch always starts a fresh Python process with fresh code.
-2. Added a kill of any existing `host_runner` Python process before starting,
-   preventing two concurrent runners during rapid restarts.
+**Fix:**
+1. `start_host_runner.ps1` now defaults to `$MaxJobs = 0`, which means the
+   product runner stays alive and can process every approved AVA chat job.
+2. `start-ava.ps1` and `install-runner-task.ps1` explicitly launch the runner
+   with `-MaxJobs 0` so approved jobs do not remain stuck in `queued` after the
+   first provisioning request.
+3. For development-only one-job runs, call `.\scripts\start_host_runner.ps1 -MaxJobs 1`.
+
+**Follow-up correction on 2026-05-05:** The earlier one-shot default was useful
+for fresh-code debugging, but it was wrong for product behavior. It caused AVA
+to queue later approved jobs while no runner was alive to execute them.
 
 ---
 
