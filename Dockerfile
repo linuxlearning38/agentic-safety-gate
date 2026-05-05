@@ -89,8 +89,8 @@ ctx.verify_mode = ssl.CERT_NONE; \
 urllib.request.urlopen('https://localhost:5443/health', context=ctx, timeout=5)" \
     || exit 1
 
-# Entrypoint fixes /data permissions on every start (prevents WSL bind-mount
-# mode drift) then execs the gunicorn command passed as CMD.
+# Entrypoint prepares /data on every start, then execs the gunicorn command.
+# /data is a Docker named volume in v2.0.0+ to avoid WSL bind-mount mode drift.
 ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["gunicorn", \
      "--config", "/app/gunicorn.conf.py", \

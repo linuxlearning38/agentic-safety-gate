@@ -3567,7 +3567,8 @@ def _check_dependencies() -> dict:
     # Ollama check
     try:
         import requests as _requests
-        resp = _requests.get("http://host.docker.internal:11434/api/tags", timeout=2)
+        ollama_host = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434").rstrip("/")
+        resp = _requests.get(f"{ollama_host}/api/tags", timeout=2)
         status["ollama"] = resp.status_code == 200
     except Exception:
         pass

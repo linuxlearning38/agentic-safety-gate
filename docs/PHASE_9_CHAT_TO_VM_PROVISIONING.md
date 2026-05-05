@@ -7,10 +7,14 @@ Status: Functional — Phase 9.5 operational hardening complete (2026-05-04)
 
 **One-time setup (run once per Windows user account):**
 ```powershell
+.\scripts\check-ava-storage.ps1
+.\scripts\migrate-ava-data-to-volume.ps1      # dry-run only; optional
 .\scripts\install-runner-task.ps1
 ```
-This registers two Windows Scheduled Tasks: the host runner at login and a
-daily cleanup job at 03:00.
+The storage check is non-destructive. The migration script is dry-run by
+default and does not copy anything unless run later with `-Execute` and an
+explicit `YES` confirmation. The task installer registers two Windows Scheduled
+Tasks: the host runner at login and a daily cleanup job at 03:00.
 
 **Daily startup (or after any reboot):**
 ```powershell
@@ -19,9 +23,11 @@ daily cleanup job at 03:00.
 That is the only command needed.  It:
 1. Detects and waits for Docker; starts Docker Desktop if needed
 2. Auto-detects the current WSL2 IP and writes `OLLAMA_HOST` to `.env`
-3. Brings up all containers with `docker compose up -d`
-4. Polls `https://localhost:5443/health` until healthy (or 120 s timeout)
-5. Starts the host runner in a background minimised window
+3. Verifies the product data volume exists; if legacy WSL data is present but
+   `ava_data` is missing, startup stops and asks for migration first
+4. Brings up all containers with `docker compose up -d`
+5. Polls `https://localhost:5443/health` until healthy (or 120 s timeout)
+6. Starts the host runner in a background minimised window
 
 **Verify everything is up:**
 ```powershell
@@ -64,23 +70,29 @@ AVA chat (/ask)             -- session shows real instance_id and evidence
 ChromaDB's Rust HNSW bindings after a container restart.  `chown -R 999:999`
 fixes it temporarily but the fix decays on the next restart.
 
-**Root cause:** The container's `/data` bind mount (WSL2 `ext4` path
-`/home/manoj/ava-data`) can develop mode-bit drift when runtime processes
-(SQLite WAL writer, ChromaDB HNSW index builder, trivy) create new
-subdirectories without a controlled umask.  On restart a subsequent process
-gets `EACCES` opening those files for write.
+**Root cause:** The previous `/data` mount used a WSL2 host bind path
+(`/home/manoj/ava-data:/data`). That made the container's writeability depend
+on WSL/Docker ownership mapping. In the user's real environment, even when the
+WSL path appeared as UID/GID 999, the container still failed to create
+`/data/logs`, `/data/chromadb`, `/data/tmp`, and other runtime directories.
 
-**Fix:** `scripts/docker-entrypoint.sh` — an ENTRYPOINT script baked into the
-image that runs as user 999 before gunicorn starts:
-- Sets `umask 002` so all runtime-created files inherit group-write
+**Fix:** `docker-compose.yml` now uses the Docker named volume `ava_data:/data`
+instead of the WSL bind mount. Docker initializes the named volume from the
+image's `/data` mount point, preserving stable ownership for the `ava` user
+across Windows, WSL, and Docker restarts.
+
+`scripts/docker-entrypoint.sh` remains in place as a lightweight guard:
+- Sets `umask 002` so runtime-created files inherit group-write
 - Creates all known `/data` subdirectories with `mkdir -p`
-- Runs `chmod -R ug+rwX /data` to correct any existing drift
-- Execs `gunicorn` (the CMD) with no overhead beyond the chmod traverse
+- Runs `chmod -R ug+rwX /data` inside the named volume
+- Execs `gunicorn` (the CMD)
 
-Dockerfile change: added `ENTRYPOINT ["/app/entrypoint.sh"]` before `CMD`.
+**Migration:** The old WSL directory is not deleted. Use
+`scripts/migrate-ava-data-to-volume.ps1` to preview and, only with `-Execute`
+plus an explicit `YES`, copy legacy data into the named volume.
 
-**Verification:** 3 consecutive `docker restart ava-agent` with health check
-after each — all passed on 2026-05-04.
+**Verification target:** 3 consecutive `docker restart ava-agent` with health
+check after each.
 
 ---
 
@@ -98,6 +110,8 @@ longer reach Ollama (`ollama: false` in health check).
   hasn't run yet).
 - `scripts/start-ava.ps1` calls `sync-ollama-host.ps1` before `docker compose
   up`, so the IP is always current on startup.
+- `/health` now checks the same `OLLAMA_HOST` value instead of hardcoding
+  `host.docker.internal`, so health reflects the actual runtime route.
 
 ---
 
@@ -192,13 +206,16 @@ the containers are restarted with the synced `.env`.
 
 | File | Purpose |
 |------|---------|
-| `scripts/docker-entrypoint.sh` | Container entrypoint — fixes `/data` permissions before gunicorn |
+| `scripts/docker-entrypoint.sh` | Container entrypoint — prepares `/data` directories before gunicorn |
+| `scripts/check-ava-storage.ps1` | Non-destructive storage diagnostic |
+| `scripts/migrate-ava-data-to-volume.ps1` | Optional dry-run-first migration from WSL bind path to Docker volume |
 | `scripts/sync-ollama-host.ps1` | Detects WSL2 IP, writes `OLLAMA_HOST` to `.env` |
 | `scripts/start-ava.ps1` | One-command full startup orchestrator |
 | `scripts/install-runner-task.ps1` | Registers Windows Scheduled Tasks (one-time setup) |
 | `scripts/cleanup-stale-seeds.ps1` | Removes stale `seed.iso` files older than 1 hour |
 
-Modified files: `Dockerfile`, `docker-compose.yml`, `scripts/start_host_runner.ps1`
+Modified files: `Dockerfile`, `docker-compose.yml`, `web_agent_v2.1_guardrail.py`,
+`scripts/start-ava.ps1`, `scripts/start_host_runner.ps1`
 
 ---
 

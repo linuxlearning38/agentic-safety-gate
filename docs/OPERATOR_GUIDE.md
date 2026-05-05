@@ -19,10 +19,26 @@ Copy-Item .env.example .env   # if it exists; otherwise .env is already present
 
 **3. Register Scheduled Tasks (so the runner starts automatically at login):**
 ```powershell
+.\scripts\check-ava-storage.ps1
+```
+
+This is read-only. It confirms AVA is using the Docker named volume `ava_data`
+for `/data`, which avoids the old WSL bind-mount permission decay.
+
+Optional legacy-data migration dry run:
+```powershell
+.\scripts\migrate-ava-data-to-volume.ps1
+```
+
+This does not copy or delete anything unless rerun with `-Execute` and explicit
+confirmation.
+
+**4. Register Scheduled Tasks (so the runner starts automatically at login):**
+```powershell
 .\scripts\install-runner-task.ps1
 ```
 
-**4. Start AVA for the first time:**
+**5. Start AVA for the first time:**
 ```powershell
 .\scripts\start-ava.ps1
 ```
@@ -95,9 +111,10 @@ again (it will sync the IP and restart the containers).
 ### Container keeps restarting
 ```powershell
 docker logs ava-agent --tail 50
+.\scripts\check-ava-storage.ps1
 ```
 Most common causes:
-- `/data` permissions: already fixed by the entrypoint script in v2.0.0+
+- `/data` permissions: should be stable through Docker named volume `ava_data`
 - Redis not started: `docker compose up -d` again
 - Cert files missing: ensure `certs/ava.crt` and `certs/ava.key` exist
 
@@ -123,6 +140,9 @@ Or wait for the scheduled daily run at 03:00.
 
 ### Docker Desktop crashed
 Run `.\scripts\start-ava.ps1` — it will detect and restart Docker Desktop.
+It also verifies the `ava_data` Docker volume exists before starting AVA. If
+legacy WSL data is present and the volume is missing, it stops and asks you to
+run the migration script instead of silently starting with empty state.
 
 ---
 
@@ -143,6 +163,8 @@ Run `.\scripts\start-ava.ps1` — it will detect and restart Docker Desktop.
 |--------|-------------|
 | `start-ava.ps1` | Every startup / after reboot |
 | `install-runner-task.ps1` | Once, on first setup |
+| `check-ava-storage.ps1` | Read-only storage and volume diagnostic |
+| `migrate-ava-data-to-volume.ps1` | Optional legacy data migration; dry-run by default |
 | `sync-ollama-host.ps1` | If Ollama is unreachable after WSL restart |
 | `cleanup-stale-seeds.ps1` | If `.ava-runner/` has stale seed.iso files |
 | `start_host_runner.ps1` | If runner is not running (normally automatic) |
