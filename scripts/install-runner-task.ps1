@@ -29,7 +29,7 @@ $psFlags       = "-NoProfile -ExecutionPolicy Bypass"
 
 # ── AVA Host Runner task ──────────────────────────────────────────────────────
 
-$runnerArg    = $psFlags + ' -File "' + $runnerScript + '"'
+$runnerArg    = $psFlags + ' -File "' + $runnerScript + '" -MaxJobs 0'
 $runnerAction = New-ScheduledTaskAction -Execute $psExe -Argument $runnerArg
 $runnerTrigger  = New-ScheduledTaskTrigger -AtLogOn
 $runnerSettings = New-ScheduledTaskSettingsSet `

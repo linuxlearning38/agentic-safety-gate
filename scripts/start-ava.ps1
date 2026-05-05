@@ -212,7 +212,7 @@ $runnerScript = Join-Path $PSScriptRoot "start_host_runner.ps1"
 if (-not $healthy) {
     Write-Warning "Skipping host runner start because AVA is not healthy yet."
 } elseif (Test-Path $runnerScript) {
-    $runnerArg = '-NoProfile -ExecutionPolicy Bypass -File "' + $runnerScript + '"'
+    $runnerArg = '-NoProfile -ExecutionPolicy Bypass -File "' + $runnerScript + '" -MaxJobs 0'
     Start-Process powershell.exe -ArgumentList $runnerArg -WindowStyle Minimized
     Write-Host "  Host runner started (minimised window)"
 } else {

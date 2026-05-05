@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -11,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from provisioning.bootstrap import SSHConnection, SSHExecutor  # noqa: E402
+from provisioning.bootstrap import ssh_executor as ssh_executor_module  # noqa: E402
 from provisioning.bootstrap.ssh_executor import classify_failure  # noqa: E402
 from provisioning.roles.web_server import WEB_SERVER_ROLE, WebServerRole  # noqa: E402
 
@@ -57,6 +59,7 @@ def main() -> int:
             check("executor result has timing evidence", no_key_result.started_at <= no_key_result.finished_at),
         ]
     )
+    failures.extend(test_windows_known_hosts_path_is_quoted())
 
     role = WebServerRole()
     failures.append(check("role wrapper exposes same definition", role.definition == WEB_SERVER_ROLE))
@@ -74,6 +77,38 @@ def _step_index(name: str) -> int:
         if step.name == name:
             return index
     raise AssertionError(f"step not found: {name}")
+
+
+def test_windows_known_hosts_path_is_quoted() -> list[bool]:
+    captured: list[str] = []
+    original_run = ssh_executor_module.subprocess.run
+
+    def fake_run(command, **_kwargs):
+        captured.extend(command)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    try:
+        ssh_executor_module.subprocess.run = fake_run
+        executor = SSHExecutor(
+            SSHConnection(
+                host="127.0.0.1",
+                port=2222,
+                username="ava-runner",
+                private_key_path=r"C:\Users\mmc\Documents\New project 3\.ava-runner\key",
+                known_hosts_path=r"C:\Users\mmc\Documents\New project 3\.ava-runner\known_hosts",
+            )
+        )
+        result = executor.run("whoami", timeout_seconds=1)
+    finally:
+        ssh_executor_module.subprocess.run = original_run
+
+    known_hosts_arg = next((item for item in captured if item.startswith("UserKnownHostsFile=")), "")
+    return [
+        check("executor command completed under fake ssh", result.exit_code == 0),
+        check("known_hosts path is quoted for OpenSSH parser", known_hosts_arg.startswith('UserKnownHostsFile="')),
+        check("known_hosts path keeps folder name with spaces", "New project 3" in known_hosts_arg),
+        check("known_hosts path uses forward slashes", "New project 3/.ava-runner/known_hosts" in known_hosts_arg),
+    ]
 
 
 if __name__ == "__main__":
