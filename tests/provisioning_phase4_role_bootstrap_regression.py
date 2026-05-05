@@ -35,6 +35,11 @@ def main() -> int:
             check("baseline hardening is default", WEB_SERVER_ROLE.hardening_profile == "baseline_linux"),
             check("no generic installer command exists", not any(" install " in step.command and "nginx ufw" not in step.command for step in WEB_SERVER_ROLE.bootstrap_steps)),
             check("SSH is allowed before firewall enable", _step_index("allow_ssh") < _step_index("enable_firewall")),
+            check("network readiness is checked before apt update", _step_index("network_ready") < _step_index("package_update")),
+            check("network readiness checks Ubuntu mirrors", "archive.ubuntu.com" in _step("network_ready").command and "security.ubuntu.com" in _step("network_ready").command),
+            check("apt update has retry loop", "for i in 1 2 3" in _step("package_update").command),
+            check("apt install has retry loop", "for i in 1 2 3" in _step("install_web_packages").command),
+            check("apt install uses fix-missing", "--fix-missing nginx ufw" in _step("install_web_packages").command),
             check("HTTP is allowed before firewall enable", _step_index("allow_http") < _step_index("enable_firewall")),
             check("nginx starts after firewall rules", _step_index("enable_nginx") > _step_index("enable_firewall")),
         ]
@@ -76,6 +81,13 @@ def _step_index(name: str) -> int:
     for index, step in enumerate(WEB_SERVER_ROLE.bootstrap_steps):
         if step.name == name:
             return index
+    raise AssertionError(f"step not found: {name}")
+
+
+def _step(name: str):
+    for step in WEB_SERVER_ROLE.bootstrap_steps:
+        if step.name == name:
+            return step
     raise AssertionError(f"step not found: {name}")
 
 

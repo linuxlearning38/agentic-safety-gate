@@ -24,15 +24,43 @@ WEB_SERVER_ROLE = RoleDefinition(
             failure_class="ssh_auth_failed",
         ),
         BootstrapCommand(
+            name="network_ready",
+            command=(
+                "for i in $(seq 1 36); do "
+                "getent hosts archive.ubuntu.com >/dev/null 2>&1 && "
+                "getent hosts security.ubuntu.com >/dev/null 2>&1 && exit 0; "
+                "sleep 5; "
+                "done; "
+                "echo 'DNS resolution not ready for Ubuntu package mirrors' >&2; "
+                "resolvectl status 2>/dev/null || cat /etc/resolv.conf; "
+                "exit 1"
+            ),
+            timeout_seconds=210,
+            failure_class="package_manager_failed",
+        ),
+        BootstrapCommand(
             name="package_update",
-            command="sudo apt-get update",
-            timeout_seconds=240,
+            command=(
+                "for i in 1 2 3; do "
+                "sudo apt-get update && exit 0; "
+                "sleep 10; "
+                "done; "
+                "sudo apt-get update"
+            ),
+            timeout_seconds=360,
             failure_class="package_manager_failed",
         ),
         BootstrapCommand(
             name="install_web_packages",
-            command="sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nginx ufw",
-            timeout_seconds=300,
+            command=(
+                "for i in 1 2 3; do "
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing nginx ufw && exit 0; "
+                "sudo apt-get update || true; "
+                "sleep 10; "
+                "done; "
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing nginx ufw"
+            ),
+            timeout_seconds=480,
             failure_class="package_manager_failed",
         ),
         BootstrapCommand(
