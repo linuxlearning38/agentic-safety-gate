@@ -55,7 +55,13 @@ def _power_state_from_showvminfo(parsed: Dict[str, str]) -> str:
 
 
 def _find_free_local_port(start: int, end: int) -> int:
+    return _find_free_local_port_excluding(start, end, set())
+
+
+def _find_free_local_port_excluding(start: int, end: int, excluded: set[int]) -> int:
     for port in range(start, end + 1):
+        if port in excluded:
+            continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
@@ -178,6 +184,36 @@ class VirtualBoxAdapter(ProviderAdapter):
         if proc.returncode != 0:
             return None
         return _parse_medium_capacity_mb((proc.stdout or "") + "\n" + (proc.stderr or ""))
+
+    def _list_registered_vm_names(self) -> list[str]:
+        proc = self._run_vboxmanage("list", "vms", timeout=30, check=False)
+        if proc.returncode != 0:
+            return []
+        names: list[str] = []
+        for line in (proc.stdout or "").splitlines():
+            match = re.match(r'^"([^"]+)"\s+\{[^}]+\}', line.strip())
+            if match:
+                names.append(match.group(1))
+        return names
+
+    def _used_nat_host_ports(self, *, exclude_instance_id: str | None = None) -> set[int]:
+        used: set[int] = set()
+        for vm_name in self._list_registered_vm_names():
+            if exclude_instance_id and vm_name == exclude_instance_id:
+                continue
+            state = self.get_instance_state(vm_name)
+            if not state.exists:
+                continue
+            for key, value in state.raw.items():
+                if not key.startswith("Forwarding("):
+                    continue
+                parts = str(value or "").strip().strip('"').split(",")
+                if len(parts) >= 4 and parts[1].lower() == "tcp" and parts[2] == "127.0.0.1":
+                    try:
+                        used.add(int(parts[3]))
+                    except ValueError:
+                        continue
+        return used
 
     def plan_instance(self, desired_state: Dict[str, Any]) -> ProvisioningPlan:
         cpu_count = int(desired_state.get("cpu") or desired_state.get("cpu_count") or 0)
@@ -318,8 +354,16 @@ class VirtualBoxAdapter(ProviderAdapter):
             raise ValueError(f"network_mode must be one of {sorted(ALLOWED_NETWORK_MODES)}")
 
         if network_mode == "nat":
-            ssh_host_port = int(network_spec.get("ssh_host_port") or _find_free_local_port(*SSH_PORT_RANGE))
-            http_host_port = int(network_spec.get("http_host_port") or _find_free_local_port(*HTTP_PORT_RANGE))
+            used_nat_ports = self._used_nat_host_ports(exclude_instance_id=instance_id)
+            ssh_host_port = int(
+                network_spec.get("ssh_host_port")
+                or _find_free_local_port_excluding(*SSH_PORT_RANGE, excluded=used_nat_ports)
+            )
+            used_nat_ports.add(ssh_host_port)
+            http_host_port = int(
+                network_spec.get("http_host_port")
+                or _find_free_local_port_excluding(*HTTP_PORT_RANGE, excluded=used_nat_ports)
+            )
 
             self._run_vboxmanage("modifyvm", instance_id, "--nic1", "nat")
             self._run_vboxmanage("modifyvm", instance_id, "--natpf1", "delete", "guestssh", check=False)

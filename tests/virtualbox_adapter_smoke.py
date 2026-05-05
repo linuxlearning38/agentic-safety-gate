@@ -76,6 +76,29 @@ def fake_run_factory(command_log: list[list[str]]):
                 )
             )
 
+        if "list vms" in command:
+            return FakeCompletedProcess(
+                stdout='\n'.join(
+                    [
+                        '"ubuntu-cloud-image" {template-uuid}',
+                        '"ava-existing" {existing-uuid}',
+                        '"ava-web-server-001" {new-uuid}',
+                    ]
+                )
+            )
+
+        if "showvminfo ava-existing --machinereadable" in command:
+            return FakeCompletedProcess(
+                stdout="\n".join(
+                    [
+                        'name="ava-existing"',
+                        'VMState="running"',
+                        'Forwarding(0)="guestssh,tcp,127.0.0.1,2222,,22"',
+                        'Forwarding(1)="webhttp,tcp,127.0.0.1,8080,,80"',
+                    ]
+                )
+            )
+
         if "getextradata ava-web-server-001 enumerate" in command:
             return FakeCompletedProcess(
                 stdout="\n".join(
@@ -212,6 +235,20 @@ def main() -> int:
                 check(
                     "inject_access records seed extradata",
                     any(cmd[1:4] == ["setextradata", "ava-seed-vm", "AVA:access:seed_iso_path"] for cmd in command_log),
+                ),
+            ]
+        )
+
+        adapter.configure_network("ava-web-server-001", {"network_mode": "nat", "username": "avaadmin"})
+        failures.extend(
+            [
+                check(
+                    "auto NAT SSH port skips existing VM forwarding",
+                    any("guestssh,tcp,127.0.0.1,2223,,22" in " ".join(cmd) for cmd in command_log),
+                ),
+                check(
+                    "auto NAT HTTP port skips existing VM forwarding",
+                    any("webhttp,tcp,127.0.0.1,8081,,80" in " ".join(cmd) for cmd in command_log),
                 ),
             ]
         )
