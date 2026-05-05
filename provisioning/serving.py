@@ -56,17 +56,19 @@ class ProvisioningChatService:
         if not active:
             return ProvisioningServingResult(handled=False)
 
+        runner = self._runner_snapshot(active)
+
         if _is_status_query(normalized):
-            return self._result(_format_status_response(active, self._runner_snapshot(active)), active)
+            return self._result(_format_status_response(active, runner), active)
 
         if _is_connection_query(normalized):
-            return self._result(_format_connection_response(active, self._runner_snapshot(active)), active)
+            return self._result(_format_connection_response(active, runner), active)
 
         if _is_evidence_query(normalized):
-            return self._result(_format_evidence_response(active, self._runner_snapshot(active)), active)
+            return self._result(_format_evidence_response(active, runner), active)
 
         if _is_web_verification_query(normalized):
-            return self._result(_format_verification_response(active, self._runner_snapshot(active)), active)
+            return self._result(_format_verification_response(active, runner), active)
 
         phase = active.phase
         if phase == SessionPhase.AWAITING_VM_TYPE:
@@ -125,6 +127,15 @@ class ProvisioningChatService:
             if not _is_first_login_confirmation(normalized):
                 return ProvisioningServingResult(handled=False)
             response = self.flow.confirm_first_login(active.session_id)
+            if _runner_completed(runner):
+                return self._result(
+                    response.message
+                    + "\n\nRunner status is already completed, so the VM has already been created, "
+                    "bootstrapped, hardened, and verified. No extra execution step is waiting on this "
+                    "chat confirmation.\n\n"
+                    + _format_connection_response(response.session, runner),
+                    response.session,
+                )
             return self._result(
                 response.message
                 + "\n\nHardening is default-on with `baseline_linux`. Reply `yes harden it` to keep hardening, "
@@ -137,6 +148,25 @@ class ProvisioningChatService:
             if not answers:
                 return ProvisioningServingResult(handled=False)
             self.sessions.record_answers(active.session_id, answers)
+            if _runner_completed(runner):
+                session = self.sessions.require(active.session_id)
+                profile = answers.get("hardening_profile", "baseline_linux")
+                if profile == "none":
+                    message = (
+                        "Hardening opt-out recorded in the chat session. The host runner had already "
+                        "completed this VM, so no new execution step is being started."
+                    )
+                else:
+                    message = (
+                        "Baseline hardening recorded in the chat session. The host runner has already "
+                        "applied `baseline_linux`, bootstrapped nginx, and verified the web server."
+                    )
+                return self._result(
+                    message
+                    + "\n\nAsk `show me the provisioning status`, `verify the web server`, or "
+                    "`what did you do and what evidence do you have?` for the completion details.",
+                    session,
+                )
             session = self.sessions.update_phase(active.session_id, SessionPhase.BOOTSTRAPPING)
             if answers.get("hardening_profile") == "none":
                 message = (
@@ -231,6 +261,23 @@ def _normalize(query: str) -> str:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _runner_completed(runner: dict[str, Any] | None) -> bool:
+    if not runner:
+        return False
+    result = runner.get("result")
+    return runner.get("status") == "completed" and bool(result and result.instance_id)
+
+
+def _effective_phase(session, runner: dict[str, Any] | None) -> str:
+    if runner:
+        result = runner.get("result")
+        if result and result.error:
+            return SessionPhase.FAILED.value
+        if _runner_completed(runner):
+            return SessionPhase.COMPLETED.value
+    return session.phase.value
 
 
 def _is_cancel(query: str) -> bool:
@@ -465,11 +512,13 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
     answers = session.collected_answers or {}
     runner = runner or {}
     result = runner.get("result")
+    effective_phase = _effective_phase(session, runner)
     lines = [
         "Provisioning status for the active AVA v2 web-server session:",
         "",
         f"- Session ID: `{session.session_id}`",
-        f"- Phase: `{session.phase.value}`",
+        f"- Phase: `{effective_phase}`",
+        f"- Conversation checkpoint: `{session.phase.value}`",
         f"- Approval ID: `{session.approval_id or 'not queued yet'}`",
         f"- Runner job ID: `{runner.get('job_id') or 'not queued yet'}`",
         f"- Runner status: `{runner.get('status') or 'not available yet'}`",
@@ -572,6 +621,7 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
     answers = session.collected_answers or {}
     runner = runner or {}
     result = runner.get("result")
+    effective_phase = _effective_phase(session, runner)
     evidence = [
         "Provisioning evidence for the active AVA v2 session:",
         "",
@@ -583,7 +633,8 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
         f"- Runner job ID: `{runner.get('job_id') or 'not queued yet'}`",
         f"- Runner status: `{runner.get('status') or 'not available yet'}`",
         f"- Temporary credential issued once: `{'yes' if session.credential_id else 'no'}`",
-        f"- First-login/hardening phase: `{session.phase.value}`",
+        f"- Effective phase: `{effective_phase}`",
+        f"- Conversation checkpoint: `{session.phase.value}`",
         f"- Recorded hardening profile: `{answers.get('hardening_profile', 'not recorded yet')}`",
         f"- Attached VM instance: `{session.instance_id or (result.instance_id if result else None) or 'none yet'}`",
         f"- Evidence timestamp: `{_utc_now()}`",
@@ -628,11 +679,11 @@ def _format_flow_response(response) -> str:
             f"Username: `{credential.username}`\n"
             f"Temporary password: `{credential.temporary_password}`\n\n"
             "Save this password now. AVA will not print it again in status or evidence responses.\n\n"
-            "Important: approval unlocks provisioning, but the VM is created only when the host-side "
-            "VirtualBox runner executes the approved plan. Do not expect a new VM in VirtualBox until "
-            "AVA reports that the VM was created and started. The PuTTY connection host/IP and SSH "
-            "port will be reported after the VM is created and attached to this session.\n\n"
-            "Change this password on first login. After you log in and change it, reply: "
+            "Provisioning has been handed to the host-side VirtualBox runner. AVA will report the "
+            "hostname, PuTTY SSH host/IP, SSH port, and web URL as soon as the runner creates, "
+            "bootstraps, hardens, and verifies the VM.\n\n"
+            "After AVA reports the PuTTY details, log in with the temporary password and change it "
+            "on first login. Then reply: "
             "`I logged in and changed the password`."
         )
     if response.requires_approval and response.approval_id:
