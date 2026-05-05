@@ -78,7 +78,7 @@ services:
 
     volumes:
       - ./certs:/app/certs:ro
-      - /home/manoj/ava-data:/data
+      - ava_data:/data
       - /proc:/host/proc:ro
 
     env_file:
@@ -150,3 +150,8 @@ services:
       retries: 3
 
     restart: unless-stopped
+
+volumes:
+  ava_data:
+    name: ava_data
+    external: true

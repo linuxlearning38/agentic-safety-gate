@@ -32,6 +32,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+if ($PSVersionTable.PSVersion.Major -ge 7) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 
@@ -54,6 +57,91 @@ function Wait-Docker {
         if ($i -lt $MaxRetries) { Start-Sleep -Seconds $DelaySeconds }
     }
     return $false
+}
+
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]]$Arguments
+    )
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $FilePath @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    foreach ($line in $output) {
+        Write-Host "  $line"
+    }
+    if ($exitCode -ne 0) {
+        throw "$FilePath exited with code $exitCode"
+    }
+}
+
+function Test-AvaHealth {
+    param([string]$Url)
+    $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+    if ($curl) {
+        $content = & $curl.Source -k -s --max-time 5 $Url 2>$null
+        if ($LASTEXITCODE -eq 0 -and $content) {
+            return [pscustomobject]@{ Healthy = $true; Content = $content }
+        }
+        return [pscustomobject]@{ Healthy = $false; Content = "" }
+    }
+
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'AvaTrustAllCertsPolicy').Type) {
+            Add-Type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class AvaTrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint srvPoint, X509Certificate certificate, WebRequest request, int certificateProblem) {
+        return true;
+    }
+}
+"@
+        }
+        [System.Net.ServicePointManager]::CertificatePolicy = New-Object AvaTrustAllCertsPolicy
+        $resp = Invoke-WebRequest -Uri $Url -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+        return [pscustomobject]@{ Healthy = ($resp.StatusCode -eq 200); Content = $resp.Content }
+    } catch {
+        return [pscustomobject]@{ Healthy = $false; Content = "" }
+    }
+}
+
+function Test-DockerVolume {
+    param([string]$Name)
+    $volumeName = (& docker volume ls --quiet --filter "name=^$Name$" | Select-Object -First 1)
+    return ($volumeName -eq $Name)
+}
+
+function Test-LegacyAvaData {
+    try {
+        $legacy = & wsl sh -lc "if [ -d /home/manoj/ava-data ] && [ -n \"`$(find /home/manoj/ava-data -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)\" ]; then echo present; else echo absent; fi"
+        return (($legacy | Select-Object -Last 1).Trim() -eq "present")
+    } catch {
+        return $false
+    }
+}
+
+function Ensure-AvaDataVolume {
+    $volumeName = "ava_data"
+    if (Test-DockerVolume -Name $volumeName) {
+        Write-Host "  Docker volume ready: $volumeName"
+        return
+    }
+
+    if (Test-LegacyAvaData) {
+        throw ("Docker volume '" + $volumeName + "' is missing, but legacy data exists at /home/manoj/ava-data. " +
+               "Run .\scripts\migrate-ava-data-to-volume.ps1 -Execute first to preserve state.")
+    }
+
+    Write-Host "  Creating empty Docker volume: $volumeName"
+    Invoke-Native docker "volume" "create" $volumeName
 }
 
 # ── Step 1: Docker health ─────────────────────────────────────────────────────
@@ -90,7 +178,8 @@ if (Test-Path $syncScript) {
 
 Write-Host "[3/5] Starting AVA containers..."
 Set-Location $repoRoot
-& docker compose up -d 2>&1 | ForEach-Object { Write-Host "  $_" }
+Ensure-AvaDataVolume
+Invoke-Native docker "compose" "up" "-d"
 
 # ── Step 4: wait for /health ─────────────────────────────────────────────────
 
@@ -100,15 +189,12 @@ $waited    = 0
 $healthy   = $false
 
 while ($waited -lt $HealthTimeout) {
-    try {
-        $resp = Invoke-WebRequest -Uri $healthUrl -TimeoutSec 5 -UseBasicParsing `
-            -SkipCertificateCheck -ErrorAction Stop
-        if ($resp.StatusCode -eq 200) {
-            Write-Host ("  AVA healthy: " + $resp.Content)
-            $healthy = $true
-            break
-        }
-    } catch { }
+    $health = Test-AvaHealth -Url $healthUrl
+    if ($health.Healthy) {
+        Write-Host ("  AVA healthy: " + $health.Content)
+        $healthy = $true
+        break
+    }
     Start-Sleep -Seconds 5
     $waited += 5
     Write-Host "  ...${waited}s"
@@ -123,7 +209,9 @@ if (-not $healthy) {
 
 Write-Host "[5/5] Starting AVA host runner..."
 $runnerScript = Join-Path $PSScriptRoot "start_host_runner.ps1"
-if (Test-Path $runnerScript) {
+if (-not $healthy) {
+    Write-Warning "Skipping host runner start because AVA is not healthy yet."
+} elseif (Test-Path $runnerScript) {
     $runnerArg = '-NoProfile -ExecutionPolicy Bypass -File "' + $runnerScript + '"'
     Start-Process powershell.exe -ArgumentList $runnerArg -WindowStyle Minimized
     Write-Host "  Host runner started (minimised window)"

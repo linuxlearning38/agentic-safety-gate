@@ -36,7 +36,7 @@ $runnerSettings = New-ScheduledTaskSettingsSet `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 5) `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -StartWhenAvailable $true
+    -StartWhenAvailable
 
 Register-ScheduledTask `
     -TaskName "AVA Host Runner" `
@@ -55,7 +55,7 @@ $cleanAction  = New-ScheduledTaskAction -Execute $psExe -Argument $cleanArg
 $cleanTrigger  = New-ScheduledTaskTrigger -Daily -At "03:00"
 $cleanSettings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
-    -StartWhenAvailable $true
+    -StartWhenAvailable
 
 Register-ScheduledTask `
     -TaskName "AVA Cleanup Stale Seeds" `
