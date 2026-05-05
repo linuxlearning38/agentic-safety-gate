@@ -7,8 +7,11 @@ from datetime import datetime, timezone
 import hashlib
 import secrets
 import sqlite3
-import string
 from pathlib import Path
+
+
+_PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+_PASSWORD_ALLOWED_CHARS = set(_PASSWORD_ALPHABET + "-")
 
 
 def _utc_now() -> str:
@@ -20,14 +23,18 @@ def _hash_secret(secret: str, salt: str) -> str:
 
 
 def _generate_password(length: int = 20) -> str:
-    alphabet = string.ascii_letters + string.digits + "!@#%+-_=."
+    if length < 14:
+        raise ValueError("temporary password length must be at least 14 characters")
+
+    raw_length = length - 2
     while True:
-        password = "".join(secrets.choice(alphabet) for _ in range(length))
+        raw = "".join(secrets.choice(_PASSWORD_ALPHABET) for _ in range(raw_length))
+        password = f"{raw[:6]}-{raw[6:12]}-{raw[12:]}"
         if (
             any(char.islower() for char in password)
             and any(char.isupper() for char in password)
             and any(char.isdigit() for char in password)
-            and any(char in "!@#%+-_=." for char in password)
+            and set(password) <= _PASSWORD_ALLOWED_CHARS
         ):
             return password
 

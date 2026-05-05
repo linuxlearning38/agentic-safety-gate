@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from control import approval  # noqa: E402
 from provisioning.conversation import ProvisioningFlowEngine, SessionManager, SessionPhase  # noqa: E402
-from provisioning.credentials import CredentialManager  # noqa: E402
+from provisioning.credentials import CredentialManager, _generate_password  # noqa: E402
 from provisioning.policy import evaluate_provisioning_policy  # noqa: E402
 
 
@@ -90,11 +90,24 @@ def main() -> int:
         )
 
         display_record = credentials.get_display_record(credential.credential_id)
+        safe_password_chars = set("ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789-")
         failures.extend(
             [
                 check("credential metadata can be reloaded", display_record is not None),
                 check("credential password is not recoverable after issue", display_record.temporary_password is None),
                 check("credential hash verifies original password", credentials.verify_password(credential.credential_id, credential.temporary_password)),
+                check("credential password is PuTTY-friendly", set(credential.temporary_password) <= safe_password_chars),
+                check("credential password uses readable separators", credential.temporary_password.count("-") == 2),
+            ]
+        )
+
+        generated_password = _generate_password()
+        failures.extend(
+            [
+                check("generated password avoids ambiguous characters", not any(char in "O0Il1" for char in generated_password)),
+                check("generated password has uppercase", any(char.isupper() for char in generated_password)),
+                check("generated password has lowercase", any(char.islower() for char in generated_password)),
+                check("generated password has digit", any(char.isdigit() for char in generated_password)),
             ]
         )
 
