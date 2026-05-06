@@ -1,7 +1,7 @@
 # AVA v2 Phase 9 — Chat-to-VM Provisioning: Operations Guide
 
 Branch: `v2-development`
-Status: Functional — Phase 9.5 operational hardening complete (2026-05-04)
+Status: Functional — Phase 9.5 operational hardening and May 5-6 product polish complete
 
 ## Operator Quickstart
 
@@ -36,6 +36,56 @@ That is the only command needed.  It:
 docker ps                               # all containers healthy
 curl -k https://localhost:5443/health   # {"status":"ok",...}
 ```
+
+---
+
+## Current Product Behavior (Validated 2026-05-06)
+
+AVA now supports the full user-facing chat-to-VM loop for a VirtualBox Ubuntu
+web server:
+
+1. User asks for a web server.
+2. AVA asks for missing VM specs (`cpu`, `ram_gb`, `disk_gb`) and accepts an
+   optional hostname.
+3. AVA prepares a plan and requires approval.
+4. Before accepting approval, AVA checks that the Windows host runner heartbeat
+   is healthy. If not, AVA refuses to issue credentials or queue the VM.
+5. After approval, AVA issues the temporary password once, queues the runner
+   job, and the Windows runner creates the VM through `VBoxManage`.
+6. Runner bootstraps nginx, applies `baseline_linux`, verifies guest and host
+   HTTP 200, and writes result evidence to Redis.
+7. AVA status, evidence, PuTTY, and verification prompts read the runner result
+   and report the real VM name, SSH host/port, username, web URL, hardening
+   summary, and verification evidence.
+
+Validated live result:
+
+| Field | Value |
+|------|-------|
+| VM instance | `ava-web-23f164db` |
+| Runner job | `23f164db-8fa5-4245-a686-f2beecf29dca` |
+| SSH / PuTTY | `127.0.0.1:2222` |
+| Username | `avaadmin` |
+| Web URL | `http://127.0.0.1:8080/` |
+| Runner status | `completed` |
+| HTTP evidence | guest curl success and host HTTP 200 |
+| Hardening | `baseline_linux` applied by runner |
+
+Validated chat prompts:
+
+- `show me the provisioning status`
+- `how do I connect with PuTTY?`
+- `verify the web server`
+- `what did you do and what evidence do you have?`
+- misspelled status prompt: `show me the provisionning status`
+- late follow-up prompt after completion: `I logged in and changed the password`
+- late hardening prompt after completion: `yes harden it`
+
+The last two prompts are intentionally absorbed by completed provisioning
+sessions. AVA should not fall back to the old generic scope response. If the VM
+is already complete, AVA records/acknowledges the follow-up and explains that
+the runner already completed the VM, applied hardening, bootstrapped nginx, and
+verified HTTP 200.
 
 ---
 
@@ -209,6 +259,124 @@ restart and multi-step AVA recovery.
 
 ---
 
+## Implementation And Validation Log (2026-05-03 to 2026-05-06)
+
+This section records the Phase 9 implementation work after the initial runner
+bridge design. It is intentionally factual: failures are listed alongside the
+fixes because they shaped the final product behavior.
+
+### 2026-05-03 — First Live Chat-to-VM Success
+
+What worked:
+
+- AVA chat accepted a web-server request, collected specs, gated approval, and
+  queued a host-runner job.
+- The Windows-native runner picked up the Redis job, cloned the Ubuntu template,
+  injected cloud-init access, verified SSH, installed nginx, applied
+  `baseline_linux`, and verified HTTP 200.
+- The VM was reachable through NAT forwarding using PuTTY/SSH on localhost and
+  a host HTTP URL.
+
+What failed or felt wrong:
+
+- Chat state and runner state were out of sync. The runner had completed
+  bootstrap/hardening/verification, but chat still asked the user to confirm
+  first login and hardening.
+- Cleanup of cloud-init seed media was fragile because VirtualBox held locks on
+  attached `seed.iso` files.
+
+Fixes that followed:
+
+- Seed cleanup was made non-destructive: cleanup races must not destroy a
+  verified VM.
+- Runner evidence became the source of truth for status/evidence/verify prompts.
+
+### 2026-05-04 — Operational Hardening
+
+What failed:
+
+- `ava-agent` repeatedly crash-looped with ChromaDB permission errors after
+  restarts.
+- Manual startup required several steps: Docker, WSL/Ollama IP, AVA containers,
+  and the host runner.
+- Runner startup through Windows automation was not reliable enough for a
+  product workflow.
+
+Fixes:
+
+- Moved AVA runtime data to the Docker named volume `ava_data`.
+- Added the Docker entrypoint guard for `/data` directory creation and
+  permissions.
+- Added `start-ava.ps1` as the one-command startup orchestrator.
+- Added WSL Ollama IP sync into `.env`.
+- Added startup-folder runner installation and daily stale seed cleanup support.
+- Added runner heartbeat preflight so AVA refuses approval when the host runner
+  is not healthy.
+
+Product outcome:
+
+- After reboot, the intended user workflow is to run `.\scripts\start-ava.ps1`
+  or rely on the login startup hook installed by `install-runner-task.ps1`.
+- AVA should not issue a temporary password if the runner is offline.
+
+### 2026-05-05 — Connection Reporting And Repeatability Polish
+
+What failed:
+
+- Multiple VMs caused NAT port collisions.
+- PuTTY connection details were not always visible at the right time.
+- Temporary passwords contained characters that were easy to misread or hard to
+  type into PuTTY.
+- Some completed-runner responses still sounded like the VM was pending.
+
+Fixes:
+
+- VirtualBox NAT port allocation now avoids collisions.
+- AVA reports PuTTY-friendly connection details after the runner writes the
+  result: VM name, `127.0.0.1`, SSH port, username, and web URL.
+- Temporary passwords were changed to be PuTTY-friendly while still one-time.
+- Completed runner jobs now drive the status/evidence/verification response even
+  if the transient Redis status key expires.
+
+Product outcome:
+
+- Users can ask `how do I connect with PuTTY?` after completion and receive the
+  correct Host Name, Port, Connection Type, username, and web URL.
+- AVA does not reprint temporary passwords after the approval response.
+
+### 2026-05-06 — Final Chat UX And Evidence Polish
+
+What failed:
+
+- The web UI could collapse into a narrow column when long verification evidence
+  was rendered.
+- Misspelled status prompts such as `provisionning status` could route through
+  the wrong path.
+- After completion, `I logged in and changed the password` and `yes harden it`
+  could fall through to the old generic v1 scope response.
+- `.ava-runner/` and `.claude/` appeared as untracked local files even though
+  they are runtime/local artifacts.
+
+Fixes:
+
+- The AVA shell layout was forced to full viewport width with stable sidebar and
+  main-pane sizing.
+- Status intent matching now handles common provisioning/status wording variants
+  and the `provisionning` typo.
+- Completed provisioning sessions now absorb late first-login and hardening
+  follow-ups and respond with "already done" style product truth.
+- `.ava-runner/` and `.claude/` are ignored in Git because they may contain
+  runner logs, seed ISO artifacts, temporary key material, or local CLI settings.
+
+Product outcome:
+
+- Long verification evidence no longer breaks the page layout.
+- Completed VM sessions feel consistent: status, evidence, verify, PuTTY, late
+  login confirmation, and late hardening confirmation all report the same
+  runner-backed truth.
+
+---
+
 ## Remaining Known Issues
 
 ### Runner orphan on mid-job crash
@@ -235,6 +403,22 @@ Expected until `start-ava.ps1` is run (which calls `sync-ollama-host.ps1`).
 Not a bug — Ollama itself is healthy; AVA just has the wrong IP in memory until
 the containers are restarted with the synced `.env`.
 
+### Startup automation depends on Windows environment policy
+
+`install-runner-task.ps1` installs a current-user startup hook and attempts to
+create a daily cleanup task where Windows permits it. On machines with stricter
+execution policy or Task Scheduler restrictions, the fallback is still explicit
+and product-safe: run `.\scripts\start-ava.ps1` after login. AVA will refuse VM
+approval if the runner heartbeat is missing, so this fails safely instead of
+silently creating a dead queued job.
+
+### Browser login/session is still local-dev style
+
+AVA runs as a local HTTPS service at `https://localhost:5443`. Docker Desktop
+must be available locally, and the browser session depends on the local AVA
+login state. This is acceptable for v2.0.0 local product validation. A packaged
+installer or tray app is a future productization step.
+
 ---
 
 ## New File Inventory (Phase 9.5)
@@ -254,15 +438,22 @@ Modified files: `Dockerfile`, `docker-compose.yml`, `web_agent_v2.1_guardrail.py
 
 ---
 
-## Exit Criteria (Phase 9 — met 2026-05-02)
+## Exit Criteria (Phase 9 — live product validation)
 
 - Approving a provisioning request from chat triggers VM creation on Windows
-  within 30 seconds
+  when the host runner heartbeat is healthy
+- AVA refuses approval safely when the host runner is not healthy
 - AVA chat session attaches the real `instance_id` after VM creation
-- AVA provides SSH connection details (host, port, username)
+- AVA provides SSH/PuTTY connection details: host, port, username, VM name
 - nginx is bootstrapped on the created VM
-- HTTP 200 verified from host
-- `tests/v2_chat_to_vm_e2e_test.py` pass
-- Runner survives one `VBoxManage` failure via Phase 7 rollback
+- `baseline_linux` hardening is applied by the runner by default
+- HTTP 200 is verified from both guest and host perspectives
+- Status/evidence/verify/PuTTY prompts report real runner evidence
+- Late first-login and hardening follow-ups after completion do not fall through
+  to the generic scope response
+- UI remains usable when long verification evidence is displayed
 
-Phase 9.5 adds: no manual steps required after reboot.
+Phase 9.5 adds: startup and recovery are product-safe. The preferred path is
+`.\scripts\start-ava.ps1` or the login startup hook installed by
+`.\scripts\install-runner-task.ps1`; if the runner is not alive, AVA blocks
+approval rather than issuing credentials for a job that cannot execute.
