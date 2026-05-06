@@ -10,6 +10,12 @@ from typing import Any
 
 from control import approval
 from provisioning.conversation import ProvisioningFlowEngine, SessionManager, SessionPhase
+from provisioning.day2 import (
+    classify_day2_operation,
+    format_approval_required_response,
+    format_approved_pending_response,
+    format_read_only_response,
+)
 from provisioning.runner import ProvisioningJobQueue, ProvisioningJobResult, RedisProvisioningJobQueue
 
 
@@ -57,6 +63,14 @@ class ProvisioningChatService:
             return ProvisioningServingResult(handled=False)
 
         runner = self._runner_snapshot(active)
+
+        day2_approval = self._maybe_handle_day2_approval(normalized, active, runner)
+        if day2_approval:
+            return day2_approval
+
+        day2 = self._maybe_handle_day2_operation(normalized, active, runner)
+        if day2:
+            return day2
 
         if _is_status_query(normalized):
             return self._result(_format_status_response(active, runner), active)
@@ -280,6 +294,95 @@ class ProvisioningChatService:
         if result and result.instance_id and not session.instance_id:
             self.sessions.save(session.with_updates(instance_id=result.instance_id))
         return {"job_id": job_id, "status": status, "result": result}
+
+    def _maybe_handle_day2_operation(
+        self,
+        normalized: str,
+        session,
+        runner: dict[str, Any],
+    ) -> ProvisioningServingResult | None:
+        operation = classify_day2_operation(normalized)
+        if not operation:
+            return None
+        result = runner.get("result")
+        if not result or not result.instance_id:
+            if operation.operation in {"status", "verify"}:
+                return None
+            return self._result(
+                "I recognize this as a Phase 9 Day-2 operation, but there is no completed "
+                "AVA-created VM attached to this chat session yet.\n\n"
+                "Create and verify a VM first, then ask again.",
+                session,
+            )
+        if not operation.requires_approval:
+            return self._result(format_read_only_response(operation, session=session, result=result), session)
+
+        approval_id = approval.add_request(
+            f"day2:{operation.operation}:{result.instance_name or result.instance_id}",
+            normalized,
+            risk=operation.risk,
+            mode="day2_operation",
+            approval_key=f"day2:{operation.operation}:{result.instance_name or result.instance_id}",
+            metadata={
+                "type": "day2_operation",
+                "operation": operation.operation,
+                "target": operation.target,
+                "session_id": session.session_id,
+                "runner_job_id": runner.get("job_id"),
+                "instance_id": result.instance_id,
+                "instance_name": result.instance_name,
+                "ssh_host": result.ssh_host,
+                "ssh_port": result.ssh_port,
+                "http_port": result.http_port,
+            },
+        )
+        return self._result(
+            format_approval_required_response(operation, session=session, result=result, approval_id=approval_id),
+            session,
+            approval_id=approval_id,
+        )
+
+    def _maybe_handle_day2_approval(
+        self,
+        normalized: str,
+        session,
+        runner: dict[str, Any],
+    ) -> ProvisioningServingResult | None:
+        approval_id = _extract_chat_approval_id(normalized)
+        if not approval_id:
+            return None
+        entry = approval.get_by_id(approval_id)
+        metadata = dict((entry or {}).get("metadata") or {})
+        if metadata.get("type") != "day2_operation":
+            return None
+        if entry.get("status") != "pending":
+            return self._result(
+                f"Day-2 approval `{approval_id}` is not pending; current status is `{entry.get('status')}`.",
+                session,
+                approval_id=approval_id,
+            )
+        result = runner.get("result")
+        if not result or not result.instance_id:
+            return self._result(
+                "This Day-2 approval belongs to an AVA VM, but the completed runner result is not "
+                "attached to the active chat session right now. No action was executed.",
+                session,
+                approval_id=approval_id,
+            )
+        operation = classify_day2_operation(str(entry.get("query") or entry.get("command") or ""))
+        if not operation:
+            return self._result(
+                f"Day-2 approval `{approval_id}` could not be matched to a supported operation. "
+                "No action was executed.",
+                session,
+                approval_id=approval_id,
+            )
+        approval.update_status(approval_id, "approved")
+        return self._result(
+            format_approved_pending_response(operation, session=session, result=result),
+            session,
+            approval_id=approval_id,
+        )
 
     def _result(self, message: str, session, *, approval_id: str | None = None) -> ProvisioningServingResult:
         metadata = {
