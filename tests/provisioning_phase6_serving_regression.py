@@ -509,6 +509,17 @@ def main() -> int:
                 check("recent completed verify still works", recent_completed_verify.handled and "http://127.0.0.1:8080/" in recent_completed_verify.response.lower()),
             ]
         )
+        accidental_second_server = service.handle("user-1", "I want a web server", route_intent="provisioning")
+        explicit_second_server = service.handle("user-1", "create another web server", route_intent="provisioning")
+        failures.extend(
+            [
+                check("existing managed VM blocks accidental second server", accidental_second_server.handled),
+                check("existing managed VM guard names current VM", "ava-web-01" in accidental_second_server.response),
+                check("existing managed VM guard avoids duplicate creation", "will not create a second one by accident" in accidental_second_server.response.lower()),
+                check("explicit second server request is allowed", explicit_second_server.handled),
+                check("explicit second server asks for specs", "cpu" in explicit_second_server.response.lower() and "ram" in explicit_second_server.response.lower()),
+            ]
+        )
 
         unrelated = service.handle("user-2", "What is Kubernetes?", route_intent=route_query("What is Kubernetes?").intent)
         failures.append(check("unrelated knowledge prompt is not hijacked", unrelated.handled is False))

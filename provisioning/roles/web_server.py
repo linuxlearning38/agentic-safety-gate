@@ -26,24 +26,29 @@ WEB_SERVER_ROLE = RoleDefinition(
         BootstrapCommand(
             name="network_ready",
             command=(
-                "for i in $(seq 1 36); do "
+                "for i in $(seq 1 72); do "
                 "getent hosts archive.ubuntu.com >/dev/null 2>&1 && "
                 "getent hosts security.ubuntu.com >/dev/null 2>&1 && exit 0; "
+                "if [ $((i % 6)) -eq 0 ]; then "
+                "sudo resolvectl flush-caches >/dev/null 2>&1 || true; "
+                "sudo systemctl restart systemd-resolved >/dev/null 2>&1 || true; "
+                "fi; "
                 "sleep 5; "
                 "done; "
                 "echo 'DNS resolution not ready for Ubuntu package mirrors' >&2; "
                 "resolvectl status 2>/dev/null || cat /etc/resolv.conf; "
                 "exit 1"
             ),
-            timeout_seconds=210,
+            timeout_seconds=420,
             failure_class="package_manager_failed",
         ),
         BootstrapCommand(
             name="package_update",
             command=(
-                "for i in 1 2 3; do "
+                "for i in 1 2 3 4 5 6; do "
                 "sudo apt-get update && exit 0; "
-                "sleep 10; "
+                "sudo resolvectl flush-caches >/dev/null 2>&1 || true; "
+                "sleep 15; "
                 "done; "
                 "sudo apt-get update"
             ),
@@ -53,10 +58,10 @@ WEB_SERVER_ROLE = RoleDefinition(
         BootstrapCommand(
             name="install_web_packages",
             command=(
-                "for i in 1 2 3; do "
+                "for i in 1 2 3 4 5; do "
                 "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing nginx ufw && exit 0; "
                 "sudo apt-get update || true; "
-                "sleep 10; "
+                "sleep 15; "
                 "done; "
                 "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing nginx ufw"
             ),

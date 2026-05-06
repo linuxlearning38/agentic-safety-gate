@@ -60,6 +60,11 @@ class ProvisioningChatService:
             return self._result(response.message, response.session)
 
         if route_intent == "provisioning":
+            if active:
+                return self._result(_format_active_provisioning_guard(active, self._runner_snapshot(active)), active)
+            existing = self._existing_managed_vm_session(user_id)
+            if existing and not _is_explicit_additional_provisioning(normalized):
+                return self._result(_format_existing_vm_guard(existing, self._runner_snapshot(existing)), existing)
             response = self.flow.start(user_id, query)
             if response.requires_approval and response.desired_state_ready:
                 response = self.flow.request_approval(response.session.session_id)
@@ -250,6 +255,15 @@ class ProvisioningChatService:
         recent_sessions = getattr(self.sessions, "list_recent", lambda *_args, **_kwargs: [])(user_id, limit=5)
         for session in recent_sessions:
             if session.instance_id or (session.collected_answers or {}).get("runner_job_id") or session.approval_id:
+                return session
+        return None
+
+    def _existing_managed_vm_session(self, user_id: str):
+        recent_sessions = getattr(self.sessions, "list_recent", lambda *_args, **_kwargs: [])(user_id, limit=10)
+        for session in recent_sessions:
+            runner = self._runner_snapshot(session)
+            result = runner.get("result")
+            if result and result.instance_id and not result.error:
                 return session
         return None
 
@@ -575,6 +589,57 @@ def _is_provisioning_followup_query(query: str) -> bool:
     if _is_first_login_confirmation(query) or _extract_post_login_answers(query):
         return True
     return classify_day2_operation(query) is not None
+
+
+def _is_explicit_additional_provisioning(query: str) -> bool:
+    additional_markers = (
+        "another web server",
+        "additional web server",
+        "second web server",
+        "new web server",
+        "one more web server",
+        "create another",
+        "create new",
+        "provision another",
+        "provision new",
+    )
+    return any(marker in query for marker in additional_markers)
+
+
+def _format_active_provisioning_guard(session, runner: dict[str, Any]) -> str:
+    return (
+        "A provisioning request is already active, so I will not start another one on top of it.\n\n"
+        f"- Current session: `{session.session_id}`\n"
+        f"- Phase: `{_effective_phase(session, runner)}`\n"
+        f"- Runner job ID: `{runner.get('job_id') or 'not queued yet'}`\n"
+        f"- Runner status: `{runner.get('status') or 'not available yet'}`\n\n"
+        "Ask `show me the provisioning status` to continue tracking it, or say `cancel provisioning` "
+        "if you want to stop this request before starting a different one."
+    )
+
+
+def _format_existing_vm_guard(session, runner: dict[str, Any]) -> str:
+    result = runner.get("result")
+    vm_name = (
+        (result.instance_name if result else None)
+        or session.instance_id
+        or (result.instance_id if result else None)
+        or "the existing AVA-managed VM"
+    )
+    ssh = ""
+    web = ""
+    if result and result.ssh_host and result.ssh_port:
+        ssh = f"\n- SSH / PuTTY: `{result.ssh_host}:{result.ssh_port}`"
+    if result and result.http_port:
+        web = f"\n- Web URL: `http://127.0.0.1:{result.http_port}/`"
+    return (
+        "You already have an AVA-managed web server, so I will not create a second one by accident.\n\n"
+        f"- Existing VM: `{vm_name}`"
+        f"{ssh}"
+        f"{web}\n\n"
+        "Ask `show status of my web server`, `verify the web server`, or `show nginx logs` for this server.\n"
+        "If you intentionally want a second server, say `create another web server` and include the specs."
+    )
 
 
 def _format_runner_unavailable_response() -> str:
