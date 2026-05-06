@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import re
+import time
 from typing import Any
 
 from control import approval
@@ -15,6 +16,8 @@ from provisioning.day2 import (
     format_approved_queued_response,
     format_approval_required_response,
     format_approved_pending_response,
+    format_live_verify_queued_response,
+    format_live_verify_response,
     format_read_only_response,
 )
 from provisioning.runner import ProvisioningJobQueue, ProvisioningJobResult, RedisProvisioningJobQueue
@@ -350,6 +353,10 @@ class ProvisioningChatService:
                 session,
             )
         if not operation.requires_approval:
+            if operation.operation == "verify":
+                live_verify = self._queue_live_verify(operation, session, runner, result)
+                if live_verify:
+                    return live_verify
             return self._result(format_read_only_response(operation, session=session, result=result), session)
 
         approval_id = approval.add_request(
@@ -461,6 +468,59 @@ class ProvisioningChatService:
             session,
             approval_id=approval_id,
         )
+
+    def _queue_live_verify(
+        self,
+        operation,
+        session,
+        runner: dict[str, Any],
+        result: ProvisioningJobResult,
+    ) -> ProvisioningServingResult | None:
+        if not getattr(self.job_queue, "is_runner_healthy", lambda: False)():
+            return self._result(
+                "I can show the last stored verification, but live verification needs the Windows host runner online.\n\n"
+                + format_read_only_response(operation, session=session, result=result),
+                session,
+            )
+        enqueue_operation = getattr(self.job_queue, "enqueue_day2_operation", None)
+        if enqueue_operation is None:
+            return None
+        day2_job = enqueue_operation(
+            session_id=session.session_id,
+            operation=operation.operation,
+            target=operation.target,
+            instance_id=result.instance_id,
+            instance_name=result.instance_name,
+            ssh_host=result.ssh_host,
+            ssh_port=result.ssh_port,
+            http_port=result.http_port,
+            metadata={"read_only": True, "runner_job_id": runner.get("job_id")},
+        )
+        existing_operations = list((session.collected_answers or {}).get("day2_operation_ids") or [])
+        existing_operations.append(day2_job.operation_id)
+        session = self.sessions.record_answers(
+            session.session_id,
+            {
+                "last_day2_operation_id": day2_job.operation_id,
+                "day2_operation_ids": existing_operations[-10:],
+            },
+        )
+        operation_result = self._wait_for_day2_result(day2_job.operation_id, timeout_seconds=18)
+        if operation_result:
+            return self._result(format_live_verify_response(operation_result, result=result), session)
+        return self._result(format_live_verify_queued_response(day2_job.operation_id, result=result), session)
+
+    def _wait_for_day2_result(self, operation_id: str, *, timeout_seconds: float) -> Any | None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            result = self.job_queue.get_day2_result(operation_id)
+            if result is not None:
+                return result
+            status = self.job_queue.get_day2_status(operation_id)
+            if status in {"failed", "cancelled"}:
+                return self.job_queue.get_day2_result(operation_id)
+            time.sleep(0.5)
+        return None
 
     def _result(self, message: str, session, *, approval_id: str | None = None) -> ProvisioningServingResult:
         metadata = {

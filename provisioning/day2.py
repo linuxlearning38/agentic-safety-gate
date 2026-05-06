@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import re
 from typing import Any
 
-from provisioning.runner import ProvisioningJobResult
+from provisioning.runner import Day2OperationResult, ProvisioningJobResult
 
 
 READ_ONLY_OPERATIONS = {"status", "verify", "nginx_logs"}
@@ -71,6 +71,42 @@ def format_read_only_response(operation: Day2Operation, *, session: Any, result:
     if operation.operation == "nginx_logs":
         return _format_nginx_logs(session=session, result=result)
     raise ValueError(f"Unsupported read-only server-management operation: {operation.operation}")
+
+
+def format_live_verify_response(operation_result: Day2OperationResult, *, result: ProvisioningJobResult) -> str:
+    """Format fresh host-runner verification evidence for chat."""
+
+    evidence = dict(operation_result.evidence or {})
+    checks = list(evidence.get("checks") or [])
+    check_lines: list[str] = []
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        status = "passed" if check.get("passed") else "failed"
+        check_lines.append(f"- {check.get('name', 'check')}: `{status}` ({check.get('evidence', '')})")
+    if not check_lines:
+        check_lines = ["- live verification completed, but no detailed check list was stored"]
+
+    http_port = result.http_port or evidence.get("http_port")
+    return (
+        "Live web-server verification from the host runner:\n\n"
+        f"- VM: `{operation_result.instance_name or operation_result.instance_id}`\n"
+        f"- SSH / PuTTY: `{result.ssh_host or evidence.get('ssh_host', 'unknown')}:{result.ssh_port or evidence.get('ssh_port', 'unknown')}`\n"
+        f"- HTTP: `http://127.0.0.1:{http_port}/`\n"
+        f"- Status: `{operation_result.status}`\n"
+        f"- Verified: `{operation_result.completion_timestamp}`\n\n"
+        + "\n".join(check_lines)
+    )
+
+
+def format_live_verify_queued_response(operation_id: str, *, result: ProvisioningJobResult) -> str:
+    return (
+        "Live verification has been queued for the Windows host runner.\n\n"
+        f"- VM: `{result.instance_name or result.instance_id}`\n"
+        f"- Operation ID: `{operation_id}`\n"
+        "- Status: `queued`\n\n"
+        "Ask `verify the web server` again in a few seconds to see the fresh evidence."
+    )
 
 
 def format_approval_required_response(
