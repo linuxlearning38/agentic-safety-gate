@@ -6529,6 +6529,47 @@ HTML_TEMPLATE = r'''
             word-break: break-word;
         }
 
+        /* Keep the product shell anchored to the full viewport. Long
+           provisioning evidence must scroll/wrap inside the chat, not shrink
+           the main pane into a narrow column. */
+        html,
+        body {
+            width: 100%;
+            min-width: 100%;
+            overflow: hidden;
+        }
+
+        .app-container {
+            width: 100vw;
+            max-width: 100vw;
+            min-width: 100vw;
+            box-sizing: border-box;
+        }
+
+        .sidebar {
+            flex: 0 0 284px;
+        }
+
+        .main-content {
+            flex: 1 1 auto;
+            width: calc(100vw - 332px);
+            max-width: none;
+            min-width: 480px;
+        }
+
+        .workspace-bar,
+        .chat-area,
+        .input-container {
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        .message,
+        .loading-message,
+        .input-wrapper {
+            max-width: min(980px, 100%);
+        }
+
         .input-container {
             padding: 18px 24px 22px;
             background: linear-gradient(180deg, transparent, var(--main-bg) 18%);
@@ -6783,10 +6824,17 @@ HTML_TEMPLATE = r'''
             .app-container {
                 padding: 10px;
                 gap: 10px;
+                min-width: 100vw;
             }
 
             .sidebar {
                 width: 232px;
+                flex-basis: 232px;
+            }
+
+            .main-content {
+                width: calc(100vw - 262px);
+                min-width: 0;
             }
 
             .example-prompts {
@@ -6817,6 +6865,7 @@ HTML_TEMPLATE = r'''
         @media (max-width: 760px) {
             .app-container {
                 padding: 0;
+                min-width: 100vw;
             }
 
             .sidebar {
@@ -6845,6 +6894,8 @@ HTML_TEMPLATE = r'''
                 border-radius: 0;
                 border-left: none;
                 border-right: none;
+                width: 100vw;
+                min-width: 0;
             }
 
             .mobile-topbar {
