@@ -343,6 +343,8 @@ def main() -> int:
         day2_approved = service.handle("user-1", f"approve {day2_approval_id}", route_intent=None)
         day2_operation_id = day2_approved.response.split("Operation ID: `", 1)[1].split("`", 1)[0]
         day2_snapshot = service.handle("user-1", "take a snapshot before changes", route_intent=None)
+        day2_job_count_before_snapshot_status = len(job_queue.day2_jobs)
+        day2_snapshot_status = service.handle("user-1", "snapshot status", route_intent=None)
         day2_rollback = service.handle("user-1", "rollback to last snapshot", route_intent=None)
         job_queue.statuses.pop("job-0001", None)
         expired_status = service.handle("user-1", "show me the provisionning status", route_intent=None)
@@ -376,6 +378,9 @@ def main() -> int:
                 check("day-2 approval includes operation id", day2_operation_id in job_queue.day2_jobs),
                 check("day-2 approval hides internal phase name", "day-2" not in day2_approved.response.lower() and "phase 9" not in day2_approved.response.lower()),
                 check("day-2 snapshot requires approval", "operation: `snapshot`" in day2_snapshot.response.lower()),
+                check("snapshot status is handled as read-only status", day2_snapshot_status.handled),
+                check("snapshot status does not create new approval", "approval required" not in day2_snapshot_status.response.lower()),
+                check("snapshot status does not queue another operation", len(job_queue.day2_jobs) == day2_job_count_before_snapshot_status),
                 check("day-2 rollback is high risk", "risk: `high`" in day2_rollback.response.lower()),
                 check("misspelled status query stays in provisioning session", expired_status.handled),
                 check("expired runner status derives completed from result", "runner status: `completed`" in expired_status.response.lower()),

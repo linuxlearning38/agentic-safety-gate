@@ -647,9 +647,16 @@ def _is_status_query(query: str) -> bool:
         or "provision status" in query
         or "vm status" in query
         or "server status" in query
+        or "snapshot status" in query
+        or "operation status" in query
+        or "latest operation" in query
+        or "latest snapshot" in query
         or "status of provisioning" in query
         or query in {"status", "show status", "show me status"}
-        or ("status" in query and any(marker in query for marker in ("provision", "provisionning", "vm", "server", "web server")))
+        or (
+            "status" in query
+            and any(marker in query for marker in ("provision", "provisionning", "vm", "server", "web server", "snapshot", "operation"))
+        )
     )
 
 
