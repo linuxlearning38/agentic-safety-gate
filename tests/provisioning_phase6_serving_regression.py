@@ -520,6 +520,44 @@ def main() -> int:
                 check("explicit second server asks for specs", "cpu" in explicit_second_server.response.lower() and "ram" in explicit_second_server.response.lower()),
             ]
         )
+        failed_service = ProvisioningChatService(temp_dir / "failed_retry_sessions.sqlite3", job_queue=job_queue)
+        failed_service.handle("user-failed", "I want a web server", route_intent="provisioning")
+        failed_specs = failed_service.handle("user-failed", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
+        failed_approval_id = failed_specs.metadata["provisioning"]["approval_id"]
+        failed_service.handle("user-failed", f"approve {failed_approval_id}", route_intent=None)
+        failed_session = failed_service.sessions.list_active("user-failed")[0]
+        failed_job_id = failed_session.collected_answers["runner_job_id"]
+        job_queue.write_status(failed_job_id, "failed")
+        job_queue.write_result(
+            ProvisioningJobResult(
+                job_id=failed_job_id,
+                instance_id="ava-web-failed",
+                instance_name=None,
+                ssh_host=None,
+                ssh_port=None,
+                http_port=None,
+                verification_evidence={"rollback": {"status": "destroyed"}},
+                completion_timestamp="2026-05-02T00:30:00+00:00",
+                error={
+                    "failed_step": "host_runner",
+                    "failure_class": "runner_failed",
+                    "message": "DNS resolution not ready for Ubuntu package mirrors",
+                    "rollback": {"status": "destroyed"},
+                },
+            )
+        )
+        failed_status = failed_service.handle("user-failed", "show status", route_intent=None)
+        failed_retry = failed_service.handle("user-failed", "I want a web server", route_intent="provisioning")
+        failures.extend(
+            [
+                check("failed runner status is reported as failed", "phase: `failed`" in failed_status.response.lower()),
+                check("failed runner status shows failure details", "failure details" in failed_status.response.lower()),
+                check("failed runner status does not claim web hardening success", "nginx web_server role verified" not in failed_status.response.lower()),
+                check("failed provisioning does not block retry", failed_retry.handled),
+                check("failed provisioning retry starts a new request", "cpu" in failed_retry.response.lower() and "ram" in failed_retry.response.lower()),
+                check("failed provisioning retry avoids active guard", "already active" not in failed_retry.response.lower()),
+            ]
+        )
 
         unrelated = service.handle("user-2", "What is Kubernetes?", route_intent=route_query("What is Kubernetes?").intent)
         failures.append(check("unrelated knowledge prompt is not hijacked", unrelated.handled is False))

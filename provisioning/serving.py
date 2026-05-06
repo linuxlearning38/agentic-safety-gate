@@ -61,7 +61,11 @@ class ProvisioningChatService:
 
         if route_intent == "provisioning":
             if active:
-                return self._result(_format_active_provisioning_guard(active, self._runner_snapshot(active)), active)
+                active_runner = self._runner_snapshot(active)
+                if _runner_failed(active_runner):
+                    active = None
+                else:
+                    return self._result(_format_active_provisioning_guard(active, active_runner), active)
             existing = self._existing_managed_vm_session(user_id)
             if existing and not _is_explicit_additional_provisioning(normalized):
                 return self._result(_format_existing_vm_guard(existing, self._runner_snapshot(existing)), existing)
@@ -336,6 +340,8 @@ class ProvisioningChatService:
             status = "completed"
         elif result and result.error:
             status = "failed"
+            if session.phase != SessionPhase.FAILED:
+                session = self.sessions.save(session.with_updates(phase=SessionPhase.FAILED))
         if result and result.instance_id and not session.instance_id:
             self.sessions.save(session.with_updates(instance_id=result.instance_id))
         return {
@@ -569,6 +575,13 @@ def _runner_completed(runner: dict[str, Any] | None) -> bool:
         return False
     result = runner.get("result")
     return runner.get("status") == "completed" and bool(result and result.instance_id)
+
+
+def _runner_failed(runner: dict[str, Any] | None) -> bool:
+    if not runner:
+        return False
+    result = runner.get("result")
+    return runner.get("status") == "failed" or bool(result and result.error)
 
 
 def _runner_is_healthy(job_queue: ProvisioningJobQueue) -> bool:
@@ -870,13 +883,19 @@ def _format_hardening_summary(session, result: ProvisioningJobResult | None) -> 
     desired = session.desired_state or {}
     profile = answers.get("hardening_profile") or desired.get("hardening_profile") or "baseline_linux"
     status = "applied by runner" if result and result.instance_id and profile != "none" else "requested/default"
+    if result and result.error:
+        status = "not applied; provisioning failed before completion"
     if profile == "none":
         status = "explicitly skipped"
     return [
         "Hardening summary:",
         f"- Server hardening profile: `{profile}` ({status})",
         "- Linux baseline: `default-on unless explicitly skipped`",
-        "- Web role hardening: `nginx web_server role verified with HTTP 200`" if result and result.instance_id else "- Web role hardening: `pending runner completion`",
+        "- Web role hardening: `not verified because provisioning failed`"
+        if result and result.error
+        else "- Web role hardening: `nginx web_server role verified with HTTP 200`"
+        if result and result.instance_id
+        else "- Web role hardening: `pending runner completion`",
         "- Apache hardening: `not applied in v2.0.0 because the active role is nginx/web_server`",
     ]
 
@@ -936,7 +955,23 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
         "",
         _format_desired_state(session.desired_state or {}),
     ]
-    if result and result.instance_id:
+    if result and result.error:
+        error = result.error or {}
+        rollback = error.get("rollback") if isinstance(error, dict) else None
+        lines.extend(
+            [
+                "",
+                "Failure details:",
+                f"- Failed step: `{error.get('failed_step') or 'host_runner'}`",
+                f"- Failure class: `{error.get('failure_class') or 'runner_failed'}`",
+                f"- Error: `{error.get('message') or 'unknown error'}`",
+                f"- Partial VM cleanup: `{(rollback or {}).get('status') or 'not reported'}`",
+                "",
+                "No PuTTY or web URL is available because this VM did not finish provisioning. "
+                "You can start a fresh request now.",
+            ]
+        )
+    elif result and result.instance_id:
         lines.extend(["", *_connection_lines(session, result), "", *_format_hardening_summary(session, result)])
         operation_lines = _format_latest_server_operation_lines(runner)
         if operation_lines:
@@ -1048,7 +1083,21 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
         "",
         _format_desired_state(session.desired_state or {}),
     ]
-    if result and result.instance_id:
+    if result and result.error:
+        error = result.error or {}
+        rollback = error.get("rollback") if isinstance(error, dict) else None
+        evidence.extend(
+            [
+                "",
+                "Runner failure evidence:",
+                f"- Failed step: `{error.get('failed_step') or 'host_runner'}`",
+                f"- Failure class: `{error.get('failure_class') or 'runner_failed'}`",
+                f"- Error: `{error.get('message') or 'unknown error'}`",
+                f"- Partial VM cleanup: `{(rollback or {}).get('status') or 'not reported'}`",
+                f"- Completion timestamp: `{result.completion_timestamp}`",
+            ]
+        )
+    elif result and result.instance_id:
         evidence.extend(
             [
                 "",
