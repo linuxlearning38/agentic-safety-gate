@@ -342,6 +342,25 @@ class ProvisioningChatService:
             status = "failed"
             if session.phase != SessionPhase.FAILED:
                 session = self.sessions.save(session.with_updates(phase=SessionPhase.FAILED))
+        elif status is None and _runner_job_state_expired(session):
+            status = "failed"
+            result = ProvisioningJobResult(
+                job_id=job_id,
+                instance_id=session.instance_id,
+                instance_name=session.instance_id,
+                verification_evidence={},
+                completion_timestamp=_utc_now(),
+                error={
+                    "failed_step": "host_runner",
+                    "failure_class": "runner_state_expired",
+                    "message": (
+                        "Runner job state expired before AVA observed a terminal result. "
+                        "The previous provisioning attempt is stale; start a fresh request."
+                    ),
+                },
+            )
+            if session.phase != SessionPhase.FAILED:
+                session = self.sessions.save(session.with_updates(phase=SessionPhase.FAILED))
         if result and result.instance_id and not session.instance_id:
             self.sessions.save(session.with_updates(instance_id=result.instance_id))
         return {
@@ -582,6 +601,24 @@ def _runner_failed(runner: dict[str, Any] | None) -> bool:
         return False
     result = runner.get("result")
     return runner.get("status") == "failed" or bool(result and result.error)
+
+
+def _runner_job_state_expired(session) -> bool:
+    if session.phase in {SessionPhase.COMPLETED, SessionPhase.FAILED, SessionPhase.CANCELLED}:
+        return False
+    if session.instance_id:
+        return False
+    updated_at = getattr(session, "updated_at", None)
+    if not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(str(updated_at))
+    except ValueError:
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds()
+    return age_seconds > 30 * 60
 
 
 def _runner_is_healthy(job_queue: ProvisioningJobQueue) -> bool:
