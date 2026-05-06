@@ -94,6 +94,9 @@ Keep `AGENTS.md` as the short operational truth, not the full history.
 
 - `docs/AVA_V2_PHASE9_RUNNER_BRIDGE_DESIGN.md` - Phase 9 design contract: host-side runner
   bridge that closes the chat-to-VM gap discovered in live validation on 2026-05-02.
+- `docs/AVA_V2_PHASE9_DAY2_OPERATIONS.md` - Phase 9 v2.1 Day-2 Operations contract:
+  manage AVA-created VMs after provisioning with status, logs, restart, snapshot,
+  rollback, stop/start, and evidence-backed responses.
 
 Rule of thumb:
 

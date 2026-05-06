@@ -718,10 +718,14 @@ Redis keys and message format:
 8. Phase 7 — failure modes and rollback
 9. Phase 8 — module-level end-to-end release gate (passed; reopened — chat path incomplete)
 10. Phase 9 — host-side runner bridge (required user-facing release gate)
+11. Phase 9 Day-2 Operations — v2.1 server management layer after provisioning
 
 Phase 8 remains valuable as the module-level release gate.
 Phase 9 is now required as the user-facing release gate.
 `v2.0.0` cannot be tagged until Phase 9 exit criteria are met.
+Phase 9 Day-2 Operations is the v2.1 continuation: AVA manages the VM it created
+with status, logs, restart, snapshot, rollback, stop/start, and evidence-backed
+responses. See `docs/AVA_V2_PHASE9_DAY2_OPERATIONS.md`.
 
 ---
 
