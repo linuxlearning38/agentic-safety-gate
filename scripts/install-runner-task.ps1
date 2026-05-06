@@ -1,15 +1,16 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Registers Windows Scheduled Tasks for the AVA host runner and seed cleanup.
+    Registers Windows startup hooks for the AVA host runner and seed cleanup.
 
 .DESCRIPTION
-    Run this script ONCE as the user who will operate AVA (no admin required
-    for per-user tasks).  It creates two tasks:
+    Run this script ONCE as the user who will operate AVA. It avoids admin-only
+    scheduler behavior by installing the host runner through the current user's
+    Startup folder.
 
-      "AVA Host Runner"          starts start_host_runner.ps1 at user login
-                                 and restarts automatically if it exits.
-      "AVA Cleanup Stale Seeds"  runs cleanup-stale-seeds.ps1 daily at 03:00.
+      "AVA Host Runner.cmd"      starts start_host_runner.ps1 at user login.
+      "AVA Cleanup Stale Seeds"  runs cleanup-stale-seeds.ps1 daily at 03:00
+                                 when Windows permits task registration.
 
     After registration, use .\scripts\start-ava.ps1 as your daily startup
     command -- it starts the runner in the background automatically.
@@ -24,48 +25,72 @@ $ErrorActionPreference = "Stop"
 $repoRoot      = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $runnerScript  = Join-Path $repoRoot "scripts\start_host_runner.ps1"
 $cleanupScript = Join-Path $repoRoot "scripts\cleanup-stale-seeds.ps1"
-$psExe         = "powershell.exe"
-$psFlags       = "-NoProfile -ExecutionPolicy Bypass"
+$wrapperDir    = Join-Path $env:LOCALAPPDATA "AVA"
+$runnerWrapper = Join-Path $wrapperDir "start-host-runner.cmd"
+$cleanupWrapper = Join-Path $wrapperDir "cleanup-stale-seeds.cmd"
+$startupDir = [Environment]::GetFolderPath("Startup")
+$startupRunner = Join-Path $startupDir "AVA Host Runner.cmd"
 
-# ── AVA Host Runner task ──────────────────────────────────────────────────────
+New-Item -ItemType Directory -Path $wrapperDir -Force | Out-Null
 
-$runnerArg    = $psFlags + ' -File "' + $runnerScript + '" -MaxJobs 0'
-$runnerAction = New-ScheduledTaskAction -Execute $psExe -Argument $runnerArg
-$runnerTrigger  = New-ScheduledTaskTrigger -AtLogOn
-$runnerSettings = New-ScheduledTaskSettingsSet `
-    -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 5) `
-    -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -StartWhenAvailable
+@"
+@echo off
+cd /d "$repoRoot"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$runnerScript" -MaxJobs 0
+"@ | Set-Content -Path $runnerWrapper -Encoding ASCII
 
-Register-ScheduledTask `
-    -TaskName "AVA Host Runner" `
-    -Action   $runnerAction `
-    -Trigger  $runnerTrigger `
-    -Settings $runnerSettings `
-    -RunLevel Limited `
-    -Force | Out-Null
+@"
+@echo off
+cd /d "$repoRoot"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$cleanupScript"
+"@ | Set-Content -Path $cleanupWrapper -Encoding ASCII
 
-Write-Host "Registered: 'AVA Host Runner' (starts at login, restarts on exit)"
+function Register-AvaTask {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    $output = & schtasks.exe @Arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to register '$TaskName': $output"
+    }
+}
+
+# ── AVA Host Runner login startup ─────────────────────────────────────────────
+
+@"
+@echo off
+start "AVA Host Runner" /min "$runnerWrapper"
+"@ | Set-Content -Path $startupRunner -Encoding ASCII
+
+Write-Host "Registered: 'AVA Host Runner' (starts at user login via Startup folder)"
 
 # ── AVA Cleanup Stale Seeds task ─────────────────────────────────────────────
 
-$cleanArg     = $psFlags + ' -File "' + $cleanupScript + '"'
-$cleanAction  = New-ScheduledTaskAction -Execute $psExe -Argument $cleanArg
-$cleanTrigger  = New-ScheduledTaskTrigger -Daily -At "03:00"
-$cleanSettings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
-    -StartWhenAvailable
-
-Register-ScheduledTask `
-    -TaskName "AVA Cleanup Stale Seeds" `
-    -Action   $cleanAction `
-    -Trigger  $cleanTrigger `
-    -Settings $cleanSettings `
-    -RunLevel Limited `
-    -Force | Out-Null
-
-Write-Host "Registered: 'AVA Cleanup Stale Seeds' (daily at 03:00)"
+try {
+    Register-AvaTask `
+        -TaskName "AVA Cleanup Stale Seeds" `
+        -Arguments @(
+            "/Create",
+            "/TN", "AVA Cleanup Stale Seeds",
+            "/SC", "DAILY",
+            "/ST", "03:00",
+            "/TR", $cleanupWrapper,
+            "/F"
+        )
+    Write-Host "Registered: 'AVA Cleanup Stale Seeds' (daily at 03:00)"
+} catch {
+    Write-Warning "Could not register daily cleanup task. Startup still works; run cleanup manually if needed."
+    Write-Warning $_
+}
+Write-Host ""
+Write-Host "Generated wrappers:"
+Write-Host "  $runnerWrapper"
+Write-Host "  $cleanupWrapper"
+Write-Host "  $startupRunner"
 Write-Host ""
 Write-Host "One-time setup complete.  From now on, use:"
 Write-Host "  .\scripts\start-ava.ps1   -- brings up Docker + AVA + runner"
