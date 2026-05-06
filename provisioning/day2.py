@@ -116,6 +116,25 @@ def format_approved_pending_response(operation: Day2Operation, *, session: Any, 
     )
 
 
+def format_approved_queued_response(
+    operation: Day2Operation,
+    *,
+    session: Any,
+    result: ProvisioningJobResult,
+    operation_id: str,
+) -> str:
+    return (
+        "Approval recorded. AVA has queued this operation for the Windows host runner.\n\n"
+        f"- Operation: `{operation.operation}`\n"
+        f"- Target: `{operation.target}`\n"
+        f"- VM: `{result.instance_name or result.instance_id}`\n"
+        f"- Operation ID: `{operation_id}`\n"
+        "- Execution status: `queued`\n\n"
+        "Ask `show status of my web server` or `what did you do and what evidence do you have?` "
+        "after the runner finishes to see the latest evidence."
+    )
+
+
 def _is_status(query: str) -> bool:
     return (
         "show status" in query

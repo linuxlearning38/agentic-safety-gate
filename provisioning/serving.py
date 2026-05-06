@@ -12,6 +12,7 @@ from control import approval
 from provisioning.conversation import ProvisioningFlowEngine, SessionManager, SessionPhase
 from provisioning.day2 import (
     classify_day2_operation,
+    format_approved_queued_response,
     format_approval_required_response,
     format_approved_pending_response,
     format_read_only_response,
@@ -294,8 +295,22 @@ class ProvisioningChatService:
 
     def _runner_snapshot(self, session) -> dict[str, Any]:
         job_id = (session.collected_answers or {}).get("runner_job_id")
+        answers = session.collected_answers or {}
+        day2_operation_id = answers.get("last_day2_operation_id")
+        day2_status = None
+        day2_result = None
+        if day2_operation_id and hasattr(self.job_queue, "get_day2_status"):
+            day2_status = self.job_queue.get_day2_status(day2_operation_id)
+            day2_result = self.job_queue.get_day2_result(day2_operation_id)
         if not job_id:
-            return {"job_id": None, "status": None, "result": None}
+            return {
+                "job_id": None,
+                "status": None,
+                "result": None,
+                "day2_operation_id": day2_operation_id,
+                "day2_status": day2_status,
+                "day2_result": day2_result,
+            }
         status = self.job_queue.get_status(job_id)
         result = self.job_queue.get_result(job_id)
         if result and result.instance_id:
@@ -304,7 +319,14 @@ class ProvisioningChatService:
             status = "failed"
         if result and result.instance_id and not session.instance_id:
             self.sessions.save(session.with_updates(instance_id=result.instance_id))
-        return {"job_id": job_id, "status": status, "result": result}
+        return {
+            "job_id": job_id,
+            "status": status,
+            "result": result,
+            "day2_operation_id": day2_operation_id,
+            "day2_status": day2_status,
+            "day2_result": day2_result,
+        }
 
     def _maybe_handle_day2_operation(
         self,
@@ -314,6 +336,8 @@ class ProvisioningChatService:
     ) -> ProvisioningServingResult | None:
         operation = classify_day2_operation(normalized)
         if not operation:
+            return None
+        if operation.operation == "status":
             return None
         result = runner.get("result")
         if not result or not result.instance_id:
@@ -389,6 +413,49 @@ class ProvisioningChatService:
                 approval_id=approval_id,
             )
         approval.update_status(approval_id, "approved")
+        enqueue_operation = getattr(self.job_queue, "enqueue_day2_operation", None)
+        if enqueue_operation is not None:
+            try:
+                day2_job = enqueue_operation(
+                    session_id=session.session_id,
+                    operation=operation.operation,
+                    target=operation.target,
+                    instance_id=result.instance_id,
+                    instance_name=result.instance_name,
+                    ssh_host=result.ssh_host,
+                    ssh_port=result.ssh_port,
+                    http_port=result.http_port,
+                    metadata={"approval_id": approval_id, "runner_job_id": runner.get("job_id")},
+                )
+                existing_operations = list((session.collected_answers or {}).get("day2_operation_ids") or [])
+                existing_operations.append(day2_job.operation_id)
+                session = self.sessions.record_answers(
+                    session.session_id,
+                    {
+                        "last_day2_operation_id": day2_job.operation_id,
+                        "day2_operation_ids": existing_operations[-10:],
+                    },
+                )
+                return self._result(
+                    format_approved_queued_response(
+                        operation,
+                        session=session,
+                        result=result,
+                        operation_id=day2_job.operation_id,
+                    ),
+                    session,
+                    approval_id=approval_id,
+                )
+            except Exception as exc:
+                return self._result(
+                    "Approval recorded, but AVA could not queue the server-management operation yet.\n\n"
+                    f"- Operation: `{operation.operation}`\n"
+                    f"- VM: `{result.instance_name or result.instance_id}`\n"
+                    f"- Queue error: `{exc}`\n\n"
+                    "No VM or service change was executed.",
+                    session,
+                    approval_id=approval_id,
+                )
         return self._result(
             format_approved_pending_response(operation, session=session, result=result),
             session,
@@ -733,6 +800,9 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
     ]
     if result and result.instance_id:
         lines.extend(["", *_connection_lines(session, result), "", *_format_hardening_summary(session, result)])
+        operation_lines = _format_latest_server_operation_lines(runner)
+        if operation_lines:
+            lines.extend(["", *operation_lines])
     elif runner.get("job_id"):
         lines.extend(
             [
@@ -857,6 +927,9 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
                 *_format_hardening_summary(session, result),
             ]
         )
+        operation_lines = _format_latest_server_operation_lines(runner)
+        if operation_lines:
+            evidence.extend(["", *operation_lines])
     elif not session.instance_id:
         evidence.extend(
             [
@@ -867,6 +940,35 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
             ]
         )
     return "\n".join(evidence)
+
+
+def _format_latest_server_operation_lines(runner: dict[str, Any] | None) -> list[str]:
+    runner = runner or {}
+    operation_id = runner.get("day2_operation_id")
+    if not operation_id:
+        return []
+    operation_result = runner.get("day2_result")
+    operation_status = runner.get("day2_status") or "queued"
+    if operation_result:
+        evidence = dict(getattr(operation_result, "evidence", {}) or {})
+        lines = [
+            "Latest server-management operation:",
+            f"- Operation ID: `{operation_id}`",
+            f"- Operation: `{getattr(operation_result, 'operation', 'unknown')}`",
+            f"- Status: `{getattr(operation_result, 'status', operation_status)}`",
+            f"- Completed: `{getattr(operation_result, 'completion_timestamp', 'unknown')}`",
+        ]
+        if evidence.get("snapshot_name"):
+            lines.append(f"- Snapshot: `{evidence.get('snapshot_name')}`")
+        if getattr(operation_result, "error", None):
+            error = getattr(operation_result, "error") or {}
+            lines.append(f"- Error: `{error.get('message') or error.get('failure_class') or 'operation_failed'}`")
+        return lines
+    return [
+        "Latest server-management operation:",
+        f"- Operation ID: `{operation_id}`",
+        f"- Status: `{operation_status}`",
+    ]
 
 
 def _format_flow_response(response) -> str:

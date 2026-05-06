@@ -22,7 +22,7 @@ from provisioning.rollback import ProvisioningRollbackManager
 from provisioning.roles.web_server import WebServerRole
 from provisioning.verify import VerificationEngine
 
-from .job_queue import ProvisioningJob, RedisProvisioningJobQueue
+from .job_queue import Day2OperationJob, Day2OperationResult, ProvisioningJob, RedisProvisioningJobQueue
 from .result_writer import ProvisioningResultWriter
 
 
@@ -219,6 +219,12 @@ class HostRunner:
             if self.config.max_jobs is not None and processed >= self.config.max_jobs:
                 self.logger.info("Max jobs reached; exiting")
                 return
+            operation = self.queue.claim_next_day2_operation(timeout_seconds=1)
+            if operation is not None:
+                self._write_day2_processing_heartbeat(operation)
+                processed += 1
+                self.execute_day2_operation(operation)
+                continue
             job = self.queue.claim_next_job(timeout_seconds=self.config.poll_timeout_seconds)
             if job is None:
                 continue
@@ -228,6 +234,11 @@ class HostRunner:
 
     def run_once(self) -> bool:
         self._write_idle_heartbeat()
+        operation = self.queue.claim_next_day2_operation(timeout_seconds=1)
+        if operation is not None:
+            self._write_day2_processing_heartbeat(operation)
+            self.execute_day2_operation(operation)
+            return True
         job = self.queue.claim_next_job(timeout_seconds=self.config.poll_timeout_seconds)
         if job is None:
             return False
@@ -252,6 +263,88 @@ class HostRunner:
                 "pid": os.getpid(),
                 "job_id": job.job_id,
                 "session_id": job.session_id,
+            },
+        )
+
+    def _write_day2_processing_heartbeat(self, operation: Day2OperationJob) -> None:
+        self.queue.write_runner_heartbeat(
+            "server_management",
+            {
+                "pid": os.getpid(),
+                "operation_id": operation.operation_id,
+                "operation": operation.operation,
+                "instance_id": operation.instance_id,
+            },
+        )
+
+    def execute_day2_operation(self, operation: Day2OperationJob) -> None:
+        self.logger.info(
+            "Picked up server-management operation %s: %s on %s",
+            operation.operation_id,
+            operation.operation,
+            operation.instance_id,
+        )
+        try:
+            self.queue.write_day2_status(operation.operation_id, "running")
+            if operation.operation == "snapshot":
+                result = self._execute_snapshot(operation)
+            else:
+                raise RuntimeError(
+                    f"Operation '{operation.operation}' is approved but not executable yet. "
+                    "Snapshot execution is enabled first; guest SSH actions require durable runner identity."
+                )
+            self.queue.write_day2_status(operation.operation_id, "completed")
+            self.queue.write_day2_result(result)
+            self.logger.info("Completed server-management operation %s", operation.operation_id)
+        except Exception as exc:
+            self.logger.exception(
+                "Server-management operation %s failed: %s",
+                operation.operation_id,
+                exc,
+            )
+            self.queue.write_day2_status(operation.operation_id, "failed")
+            self.queue.write_day2_result(
+                Day2OperationResult(
+                    operation_id=operation.operation_id,
+                    operation=operation.operation,
+                    status="failed",
+                    instance_id=operation.instance_id,
+                    instance_name=operation.instance_name,
+                    evidence={"runner": "host_runner", "failed_at": _utc_now()},
+                    error={"message": str(exc), "failure_class": "day2_operation_failed"},
+                )
+            )
+
+    def _execute_snapshot(self, operation: Day2OperationJob) -> Day2OperationResult:
+        self._validate_vboxmanage()
+        state = self.adapter.get_instance_state(operation.instance_id)
+        if not state.exists:
+            raise RuntimeError(f"VirtualBox VM '{operation.instance_id}' does not exist")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        snapshot_name = f"ava-snapshot-{operation.operation_id[:8]}-{timestamp}"
+        args = [
+            "snapshot",
+            operation.instance_id,
+            "take",
+            snapshot_name,
+            "--description",
+            f"AVA snapshot for approved operation {operation.operation_id}",
+        ]
+        if state.power_state == "running":
+            args.append("--live")
+        self.adapter._run_vboxmanage(*args, timeout=300)
+        return Day2OperationResult(
+            operation_id=operation.operation_id,
+            operation=operation.operation,
+            status="completed",
+            instance_id=operation.instance_id,
+            instance_name=operation.instance_name,
+            evidence={
+                "action": "snapshot_taken",
+                "snapshot_name": snapshot_name,
+                "power_state": state.power_state,
+                "provider": "virtualbox",
+                "runner": "host_runner",
             },
         )
 
@@ -441,6 +534,10 @@ class HostRunner:
         ):
             if not Path(path).exists():
                 raise RuntimeError(f"{label} not found at {path}")
+
+    def _validate_vboxmanage(self) -> None:
+        if not Path(self.config.vboxmanage).exists():
+            raise RuntimeError(f"VBoxManage not found at {self.config.vboxmanage}")
 
     def _detach_seed_iso(self, instance_id: str, seed_iso: Path) -> None:
         self.adapter._run_vboxmanage(

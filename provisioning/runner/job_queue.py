@@ -17,6 +17,9 @@ STATUS_KEY_PREFIX = "ava:provisioning:jobs:status:"
 RESULT_KEY_PREFIX = "ava:provisioning:jobs:result:"
 RUNNER_HEARTBEAT_KEY = "ava:provisioning:runner:heartbeat"
 RUNNER_HEARTBEAT_TTL_SECONDS = 90
+DAY2_OPERATION_QUEUE_KEY = "ava:provisioning:day2:operations:approved"
+DAY2_STATUS_KEY_PREFIX = "ava:provisioning:day2:operations:status:"
+DAY2_RESULT_KEY_PREFIX = "ava:provisioning:day2:operations:result:"
 ALLOWED_STATUSES = {
     "queued",
     "picked_up",
@@ -28,6 +31,7 @@ ALLOWED_STATUSES = {
     "failed",
     "cancelled",
 }
+ALLOWED_DAY2_STATUSES = {"queued", "picked_up", "running", "completed", "failed", "cancelled"}
 
 
 def _utc_now() -> str:
@@ -120,6 +124,72 @@ class ProvisioningJobResult:
         )
 
 
+@dataclass(slots=True)
+class Day2OperationJob:
+    """Approved post-provisioning operation consumed by the Windows host runner."""
+
+    operation_id: str
+    session_id: str
+    operation: str
+    target: str
+    instance_id: str
+    instance_name: str | None
+    ssh_host: str | None
+    ssh_port: int | None
+    http_port: int | None
+    requested_at: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Day2OperationJob":
+        return cls(
+            operation_id=str(data["operation_id"]),
+            session_id=str(data["session_id"]),
+            operation=str(data["operation"]),
+            target=str(data["target"]),
+            instance_id=str(data["instance_id"]),
+            instance_name=data.get("instance_name"),
+            ssh_host=data.get("ssh_host"),
+            ssh_port=int(data["ssh_port"]) if data.get("ssh_port") is not None else None,
+            http_port=int(data["http_port"]) if data.get("http_port") is not None else None,
+            requested_at=str(data.get("requested_at") or _utc_now()),
+            metadata=dict(data.get("metadata") or {}),
+        )
+
+
+@dataclass(slots=True)
+class Day2OperationResult:
+    """Host-runner result for a post-provisioning operation."""
+
+    operation_id: str
+    operation: str
+    status: str
+    instance_id: str
+    instance_name: str | None
+    evidence: dict[str, Any] = field(default_factory=dict)
+    completion_timestamp: str = field(default_factory=_utc_now)
+    error: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Day2OperationResult":
+        return cls(
+            operation_id=str(data["operation_id"]),
+            operation=str(data["operation"]),
+            status=str(data["status"]),
+            instance_id=str(data["instance_id"]),
+            instance_name=data.get("instance_name"),
+            evidence=dict(data.get("evidence") or {}),
+            completion_timestamp=str(data.get("completion_timestamp") or _utc_now()),
+            error=data.get("error"),
+        )
+
+
 class ProvisioningJobQueue(Protocol):
     """Small protocol used by serving and runner code."""
 
@@ -153,6 +223,36 @@ class ProvisioningJobQueue(Protocol):
         ...
 
     def is_runner_healthy(self) -> bool:
+        ...
+
+    def enqueue_day2_operation(
+        self,
+        *,
+        session_id: str,
+        operation: str,
+        target: str,
+        instance_id: str,
+        instance_name: str | None,
+        ssh_host: str | None,
+        ssh_port: int | None,
+        http_port: int | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Day2OperationJob:
+        ...
+
+    def claim_next_day2_operation(self, *, timeout_seconds: int = 1) -> Day2OperationJob | None:
+        ...
+
+    def get_day2_status(self, operation_id: str) -> str | None:
+        ...
+
+    def write_day2_status(self, operation_id: str, status: str) -> None:
+        ...
+
+    def get_day2_result(self, operation_id: str) -> Day2OperationResult | None:
+        ...
+
+    def write_day2_result(self, result: Day2OperationResult) -> None:
         ...
 
 
@@ -204,6 +304,49 @@ class RedisProvisioningJobQueue:
         self.write_status(job.job_id, "picked_up")
         return job
 
+    def enqueue_day2_operation(
+        self,
+        *,
+        session_id: str,
+        operation: str,
+        target: str,
+        instance_id: str,
+        instance_name: str | None,
+        ssh_host: str | None,
+        ssh_port: int | None,
+        http_port: int | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> Day2OperationJob:
+        job = Day2OperationJob(
+            operation_id=str(uuid4()),
+            session_id=session_id,
+            operation=operation,
+            target=target,
+            instance_id=instance_id,
+            instance_name=instance_name,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            http_port=http_port,
+            requested_at=_utc_now(),
+            metadata=dict(metadata or {}),
+        )
+        self.client.rpush(DAY2_OPERATION_QUEUE_KEY, _json_dumps(job.to_dict()))
+        self.client.expire(DAY2_OPERATION_QUEUE_KEY, self.ttl_seconds)
+        self.write_day2_status(job.operation_id, "queued")
+        return job
+
+    def claim_next_day2_operation(self, *, timeout_seconds: int = 1) -> Day2OperationJob | None:
+        item = self.client.blpop(DAY2_OPERATION_QUEUE_KEY, timeout=timeout_seconds)
+        if not item:
+            return None
+        _queue_name, raw = item
+        job = Day2OperationJob.from_dict(_json_loads(raw))
+        current_status = self.get_day2_status(job.operation_id)
+        if current_status == "cancelled":
+            return None
+        self.write_day2_status(job.operation_id, "picked_up")
+        return job
+
     def get_status(self, job_id: str) -> str | None:
         value = self.client.get(_status_key(job_id))
         if isinstance(value, bytes):
@@ -223,6 +366,26 @@ class RedisProvisioningJobQueue:
 
     def write_result(self, result: ProvisioningJobResult) -> None:
         self.client.set(_result_key(result.job_id), _json_dumps(result.to_dict()), ex=max(self.ttl_seconds, 86400))
+
+    def get_day2_status(self, operation_id: str) -> str | None:
+        value = self.client.get(_day2_status_key(operation_id))
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        return value
+
+    def write_day2_status(self, operation_id: str, status: str) -> None:
+        if status not in ALLOWED_DAY2_STATUSES:
+            raise ValueError(f"Unsupported server-management operation status: {status}")
+        self.client.set(_day2_status_key(operation_id), status, ex=max(self.ttl_seconds, 86400))
+
+    def get_day2_result(self, operation_id: str) -> Day2OperationResult | None:
+        raw = self.client.get(_day2_result_key(operation_id))
+        if raw is None:
+            return None
+        return Day2OperationResult.from_dict(_json_loads(raw))
+
+    def write_day2_result(self, result: Day2OperationResult) -> None:
+        self.client.set(_day2_result_key(result.operation_id), _json_dumps(result.to_dict()), ex=max(self.ttl_seconds, 86400))
 
     def write_runner_heartbeat(self, status: str = "idle", metadata: dict[str, Any] | None = None) -> None:
         self.client.set(
@@ -247,6 +410,14 @@ def _status_key(job_id: str) -> str:
 
 def _result_key(job_id: str) -> str:
     return f"{RESULT_KEY_PREFIX}{job_id}"
+
+
+def _day2_status_key(operation_id: str) -> str:
+    return f"{DAY2_STATUS_KEY_PREFIX}{operation_id}"
+
+
+def _day2_result_key(operation_id: str) -> str:
+    return f"{DAY2_RESULT_KEY_PREFIX}{operation_id}"
 
 
 def _build_redis_client(redis_url: str):
