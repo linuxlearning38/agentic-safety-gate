@@ -54,4 +54,6 @@ docs/
 
 # Runtime data (should never be tracked)
 .ava-data/
+.ava-runner/
+.claude/
 approval_queue.json
