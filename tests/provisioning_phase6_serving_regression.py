@@ -313,14 +313,14 @@ def main() -> int:
                 check("day-2 status reports active vm", "ava-web-01" in day2_status.response),
                 check("day-2 logs are handled", day2_logs.handled),
                 check("day-2 status hides internal phase name", "day-2" not in day2_status.response.lower() and "phase 9" not in day2_status.response.lower()),
-                check("day-2 logs does not pretend live ssh ran", "pending runner handler" in day2_logs.response.lower()),
+                check("day-2 logs does not pretend live ssh ran", "not enabled yet" in day2_logs.response.lower()),
                 check("day-2 logs hides internal phase name", "day-2" not in day2_logs.response.lower() and "phase 9" not in day2_logs.response.lower()),
                 check("day-2 restart requires approval", "approval required" in day2_restart.response.lower()),
                 check("day-2 restart hides internal phase name", "day-2" not in day2_restart.response.lower() and "phase 9" not in day2_restart.response.lower()),
                 check("day-2 approval entry is tagged", (day2_approval_entry or {}).get("metadata", {}).get("type") == "day2_operation"),
                 check("day-2 approval records risk", (day2_approval_entry or {}).get("risk") == "medium"),
                 check("day-2 approval is handled", day2_approved.handled),
-                check("day-2 approval does not claim execution", "pending runner handler" in day2_approved.response.lower()),
+                check("day-2 approval does not claim execution", "queued for runner support" in day2_approved.response.lower()),
                 check("day-2 approval hides internal phase name", "day-2" not in day2_approved.response.lower() and "phase 9" not in day2_approved.response.lower()),
                 check("day-2 snapshot requires approval", "operation: `snapshot`" in day2_snapshot.response.lower()),
                 check("day-2 rollback is high risk", "risk: `high`" in day2_rollback.response.lower()),
@@ -374,6 +374,21 @@ def main() -> int:
                 check("late login reports runner already completed", "already completed" in late_login.response.lower()),
                 check("late hardening does not claim next execution step", "next execution step" not in late_hardening.response.lower()),
                 check("late hardening reports runner-applied baseline", "already applied" in late_hardening.response.lower()),
+            ]
+        )
+
+        service.sessions.update_phase(approved_session.session_id, SessionPhase.COMPLETED)
+        recent_completed_login = service.handle("user-1", "I logged in and changed the password", route_intent=None)
+        recent_completed_hardening = service.handle("user-1", "yes harden it", route_intent=None)
+        recent_completed_verify = service.handle("user-1", "verify the web server", route_intent=None)
+        failures.extend(
+            [
+                check("recent completed login follow-up is handled", recent_completed_login.handled),
+                check("recent completed login follow-up does not fall through", "v1.0.3 is scoped" not in recent_completed_login.response.lower()),
+                check("recent completed login points to existing VM", "ava-web-01" in recent_completed_login.response),
+                check("recent completed hardening follow-up is handled", recent_completed_hardening.handled),
+                check("recent completed hardening does not fall through", "v1.0.3 is scoped" not in recent_completed_hardening.response.lower()),
+                check("recent completed verify still works", recent_completed_verify.handled and "http://127.0.0.1:8080/" in recent_completed_verify.response.lower()),
             ]
         )
 

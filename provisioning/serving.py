@@ -60,7 +60,9 @@ class ProvisioningChatService:
             return self._result(_format_flow_response(response), response.session, approval_id=response.approval_id)
 
         if not active:
-            return ProvisioningServingResult(handled=False)
+            active = self._recent_session_for_followup(user_id, normalized)
+            if not active:
+                return ProvisioningServingResult(handled=False)
 
         runner = self._runner_snapshot(active)
 
@@ -236,6 +238,15 @@ class ProvisioningChatService:
         sessions = self.sessions.list_active(user_id)
         return sessions[0] if sessions else None
 
+    def _recent_session_for_followup(self, user_id: str, normalized: str):
+        if not _is_provisioning_followup_query(normalized):
+            return None
+        recent_sessions = getattr(self.sessions, "list_recent", lambda *_args, **_kwargs: [])(user_id, limit=5)
+        for session in recent_sessions:
+            if session.instance_id or (session.collected_answers or {}).get("runner_job_id") or session.approval_id:
+                return session
+        return None
+
     def _maybe_queue_approval(self, response):
         if response.requires_approval and response.desired_state_ready:
             response = self.flow.request_approval(response.session.session_id)
@@ -309,8 +320,8 @@ class ProvisioningChatService:
             if operation.operation in {"status", "verify"}:
                 return None
             return self._result(
-                "I recognize this as a Phase 9 Day-2 operation, but there is no completed "
-                "AVA-created VM attached to this chat session yet.\n\n"
+                "I can manage an AVA-created VM after it has completed provisioning, but this chat "
+                "session does not have a completed VM attached yet.\n\n"
                 "Create and verify a VM first, then ask again.",
                 session,
             )
@@ -357,14 +368,14 @@ class ProvisioningChatService:
             return None
         if entry.get("status") != "pending":
             return self._result(
-                f"Day-2 approval `{approval_id}` is not pending; current status is `{entry.get('status')}`.",
+                f"Approval `{approval_id}` is not pending; current status is `{entry.get('status')}`.",
                 session,
                 approval_id=approval_id,
             )
         result = runner.get("result")
         if not result or not result.instance_id:
             return self._result(
-                "This Day-2 approval belongs to an AVA VM, but the completed runner result is not "
+                "This approval belongs to an AVA-managed VM, but the completed runner result is not "
                 "attached to the active chat session right now. No action was executed.",
                 session,
                 approval_id=approval_id,
@@ -372,7 +383,7 @@ class ProvisioningChatService:
         operation = classify_day2_operation(str(entry.get("query") or entry.get("command") or ""))
         if not operation:
             return self._result(
-                f"Day-2 approval `{approval_id}` could not be matched to a supported operation. "
+                f"Approval `{approval_id}` could not be matched to a supported VM operation. "
                 "No action was executed.",
                 session,
                 approval_id=approval_id,
@@ -421,6 +432,16 @@ def _runner_is_healthy(job_queue: ProvisioningJobQueue) -> bool:
         return bool(health_check())
     except Exception:
         return False
+
+
+def _is_provisioning_followup_query(query: str) -> bool:
+    if _extract_chat_approval_id(query):
+        return True
+    if _is_status_query(query) or _is_connection_query(query) or _is_evidence_query(query) or _is_web_verification_query(query):
+        return True
+    if _is_first_login_confirmation(query) or _extract_post_login_answers(query):
+        return True
+    return classify_day2_operation(query) is not None
 
 
 def _format_runner_unavailable_response() -> str:

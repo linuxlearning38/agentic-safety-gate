@@ -1,6 +1,6 @@
-"""Day-2 operation routing for AVA-managed VMs.
+"""Server-management operation routing for AVA-managed VMs.
 
-This module is intentionally chat-safe: it classifies and formats Day-2
+This module is intentionally chat-safe: it classifies and formats server-management
 operations, but it does not execute mutating actions directly. Mutating actions
 must go through approval first, then a host-runner implementation.
 """
@@ -22,7 +22,7 @@ HIGH_RISK_OPERATIONS = {"rollback_snapshot"}
 
 @dataclass(slots=True)
 class Day2Operation:
-    """Classified Day-2 operation request."""
+    """Classified server-management operation request."""
 
     operation: str
     target: str
@@ -36,7 +36,7 @@ def _utc_now() -> str:
 
 
 def classify_day2_operation(query: str) -> Day2Operation | None:
-    """Classify a user query as a Day-2 operation if it targets an AVA VM."""
+    """Classify a user query as a server-management operation if it targets an AVA VM."""
 
     normalized = re.sub(r"\s+", " ", (query or "").lower()).strip(" ?!.")
     if not normalized:
@@ -62,7 +62,7 @@ def classify_day2_operation(query: str) -> Day2Operation | None:
 
 
 def format_read_only_response(operation: Day2Operation, *, session: Any, result: ProvisioningJobResult) -> str:
-    """Format a safe Day-2 read-only response from stored runner evidence."""
+    """Format a safe read-only response from stored runner evidence."""
 
     if operation.operation == "status":
         return _format_status(session=session, result=result)
@@ -70,7 +70,7 @@ def format_read_only_response(operation: Day2Operation, *, session: Any, result:
         return _format_verify(session=session, result=result)
     if operation.operation == "nginx_logs":
         return _format_nginx_logs(session=session, result=result)
-    raise ValueError(f"Unsupported read-only Day-2 operation: {operation.operation}")
+    raise ValueError(f"Unsupported read-only server-management operation: {operation.operation}")
 
 
 def format_approval_required_response(
@@ -80,7 +80,7 @@ def format_approval_required_response(
     result: ProvisioningJobResult,
     approval_id: str,
 ) -> str:
-    """Format the user-facing approval prompt for a Day-2 mutating operation."""
+    """Format the user-facing approval prompt for a mutating server-management operation."""
 
     warning = ""
     if operation.risk == "high":
@@ -102,16 +102,17 @@ def format_approval_required_response(
 
 
 def format_approved_pending_response(operation: Day2Operation, *, session: Any, result: ProvisioningJobResult) -> str:
-    """Format approved Day-2 operations before runner execution exists."""
+    """Format approved server-management operations before runner execution exists."""
 
     return (
         "Approval recorded.\n\n"
         f"- Operation: `{operation.operation}`\n"
         f"- Target: `{operation.target}`\n"
         f"- VM: `{result.instance_name or result.instance_id}`\n"
-        "- Execution status: `pending runner handler`\n\n"
-        "No VM or service change has been executed by this approval yet. The next implementation slice "
-        "will connect approved server-management operations to the Windows host runner."
+        "- Execution status: `queued for runner support`\n\n"
+        "No VM or service change has been executed by this approval yet. AVA has recorded the approval, "
+        "and the execution path will be enabled when server-management actions are connected to the "
+        "Windows host runner."
     )
 
 
@@ -194,9 +195,9 @@ def _format_nginx_logs(*, session: Any, result: ProvisioningJobResult) -> str:
         f"- VM: `{result.instance_name or result.instance_id}`\n"
         f"- SSH / PuTTY: `{result.ssh_host}:{result.ssh_port}`\n"
         "- Current evidence: nginx was active during runner verification\n"
-        "- Live log retrieval: `pending runner handler`\n\n"
-        "No SSH log command was executed from chat yet. The next implementation slice will run "
-        "`journalctl -u nginx` and recent access/error log checks through the Windows host runner."
+        "- Live log retrieval: `not enabled yet`\n\n"
+        "No SSH log command was executed from chat yet. AVA will run `journalctl -u nginx` and recent "
+        "access/error log checks after live server-management actions are connected to the Windows host runner."
     )
 
 
