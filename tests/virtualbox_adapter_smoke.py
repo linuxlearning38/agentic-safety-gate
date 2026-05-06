@@ -233,6 +233,10 @@ def main() -> int:
                     any(cmd[1:4] == ["storageattach", "ava-seed-vm", "--storagectl"] and r"C:\tmp\seed.iso" in cmd for cmd in command_log),
                 ),
                 check(
+                    "inject_access marks seed ISO hot-pluggable",
+                    any(cmd[1:4] == ["storageattach", "ava-seed-vm", "--storagectl"] and "--hotpluggable" in cmd and "on" in cmd for cmd in command_log),
+                ),
+                check(
                     "inject_access records seed extradata",
                     any(cmd[1:4] == ["setextradata", "ava-seed-vm", "AVA:access:seed_iso_path"] for cmd in command_log),
                 ),
