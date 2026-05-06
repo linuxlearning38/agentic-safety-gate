@@ -4056,8 +4056,8 @@ def ask():
                         f"needs your approval before continuing:\n\n"
                         f"**Tool:** `{graph_result.paused_at}`\n"
                         f"**Approval ID:** `{graph_result.approval_id}`\n\n"
-                        f"Run this to approve:\n"
-                        f"```bash\npython3 -m control.security_review\n```\n\n"
+                        f"Reply in chat to approve:\n"
+                        f"`approve {graph_result.approval_id}`\n\n"
                         f"Steps completed so far:\n{graph_result.summary_for_ui()}"
                     ),
                     "sources_used": 0,
@@ -7735,7 +7735,7 @@ HTML_TEMPLATE = r'''
             if (!approvalId) return;
             addAVAMessage({
                 type: 'knowledge',
-                response: `Approval ${approvalId} is queued. In v1.0, use the local security review flow to approve and execute guarded actions.`,
+                response: `Approval ${approvalId} is queued. To approve and continue, reply in chat: approve ${approvalId}`,
                 time_taken: '',
                 sources_used: 0,
             });
