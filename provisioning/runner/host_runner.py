@@ -46,6 +46,41 @@ def _run(command: list[str], *, timeout: int = 120, check: bool = True) -> subpr
     return proc
 
 
+def _ps_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _windows_private_key_acl_command(path: Path) -> list[str]:
+    path_literal = _ps_single_quote(str(path))
+    script = "\n".join(
+        [
+            f"$path = {path_literal}",
+            "$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
+            "$acl = Get-Acl -LiteralPath $path",
+            "$acl.SetOwner($current)",
+            "$acl.SetAccessRuleProtection($true, $false)",
+            "foreach ($rule in @($acl.Access)) { [void] $acl.RemoveAccessRuleAll($rule) }",
+            "$rights = [System.Security.AccessControl.FileSystemRights]::Read",
+            "$allow = [System.Security.AccessControl.AccessControlType]::Allow",
+            "$rule = New-Object System.Security.AccessControl.FileSystemAccessRule($current, $rights, $allow)",
+            "$acl.AddAccessRule($rule)",
+            "Set-Acl -LiteralPath $path -AclObject $acl",
+        ]
+    )
+    return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+
+
+def _lock_down_private_key(path: Path) -> None:
+    """Keep OpenSSH happy by restricting runner private-key permissions."""
+    if os.name == "nt":
+        _run(_windows_private_key_acl_command(path), timeout=30, check=False)
+        return
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
 def _wait_for_tcp(host: str, port: int, timeout_seconds: int, *, heartbeat: Callable[[], None] | None = None) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -521,6 +556,7 @@ class HostRunner:
             candidates.append(self.config.work_root / runner_job_id / "ava_runner_ed25519")
         for candidate in candidates:
             if candidate.exists():
+                _lock_down_private_key(candidate)
                 return candidate
         return None
 
@@ -551,12 +587,14 @@ class HostRunner:
             seed_dir = work_dir / "seed"
             seed_iso = work_dir / "seed.iso"
             _run([self.config.ssh_keygen, "-t", "ed25519", "-N", "", "-f", str(key_path), "-C", f"ava-runner-{vm_name}"], timeout=30)
+            _lock_down_private_key(key_path)
             public_key = (key_path.with_suffix(".pub")).read_text(encoding="utf-8").strip()
             retained_key_dir = self.config.work_root / "keys"
             retained_key_dir.mkdir(parents=True, exist_ok=True)
             retained_key_path = retained_key_dir / f"{vm_name}_ava_runner_ed25519"
             shutil.copy2(key_path, retained_key_path)
             shutil.copy2(key_path.with_suffix(".pub"), retained_key_path.with_suffix(".pub"))
+            _lock_down_private_key(retained_key_path)
             _write_cloud_init_seed(seed_dir, vm_name, username, temporary_password, public_key)
             _run(
                 [

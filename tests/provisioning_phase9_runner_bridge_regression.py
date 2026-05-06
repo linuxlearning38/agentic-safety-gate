@@ -28,6 +28,7 @@ from provisioning.runner.host_runner import (  # noqa: E402
     HostRunner,
     HostRunnerConfig,
     _ISO_UNLINK_ATTEMPTS,
+    _windows_private_key_acl_command,
     _write_cloud_init_seed,
 )
 from provisioning.runner.result_writer import ProvisioningResultWriter as _ResultWriter  # noqa: E402
@@ -656,6 +657,60 @@ def test_day2_nginx_logs_uses_retained_runner_key() -> list[bool]:
     ]
 
 
+def test_windows_runner_key_acl_command_restricts_private_key() -> list[bool]:
+    key_path = Path(r"C:\ava test\keys\ava-web_ava_runner_ed25519")
+    command = _windows_private_key_acl_command(key_path)
+    script = command[-1]
+    return [
+        check("private key ACL command uses PowerShell", command[:4] == ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass"]),
+        check("private key ACL command disables inherited access", "SetAccessRuleProtection($true, $false)" in script),
+        check("private key ACL command removes broad existing rules", "RemoveAccessRuleAll" in script),
+        check("private key ACL command grants only current runner identity", "WindowsIdentity]::GetCurrent().User" in script),
+        check("private key ACL command protects paths with spaces", "'C:\\ava test\\keys\\ava-web_ava_runner_ed25519'" in script),
+    ]
+
+
+def test_day2_key_lookup_self_heals_private_key_permissions() -> list[bool]:
+    tmp = Path(tempfile.mkdtemp())
+    key_path = tmp / "keys" / "ava-web-day2_ava_runner_ed25519"
+    key_path.parent.mkdir(parents=True)
+    key_path.write_text("fake-private-key", encoding="utf-8")
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.config = HostRunnerConfig(
+        vboxmanage="VBoxManage",
+        ssh_binary="ssh",
+        ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image",
+        work_root=tmp,
+        log_path=tmp / "ava-day2-key-self-heal-test.log",
+        retain_debug=False,
+        timeout_seconds=30,
+        max_jobs=1,
+    )
+    operation = SimpleNamespace(
+        instance_id="ava-web-day2",
+        instance_name="ava-web-day2",
+        metadata={},
+    )
+
+    import provisioning.runner.host_runner as hr_mod
+
+    locked: list[Path] = []
+    original_lock_down = hr_mod._lock_down_private_key
+    try:
+        hr_mod._lock_down_private_key = lambda path: locked.append(path)
+        found = runner._find_runner_key_path(operation)
+    finally:
+        hr_mod._lock_down_private_key = original_lock_down
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    return [
+        check("retained key lookup finds private key", found == key_path),
+        check("retained key lookup locks down private key before use", locked == [key_path]),
+    ]
+
+
 def test_day2_nginx_logs_fail_without_runner_key() -> list[bool]:
     fake = FakeRedis()
     queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
@@ -806,6 +861,8 @@ def main() -> int:
     failures.extend(test_day2_snapshot_execution_uses_vboxmanage())
     failures.extend(test_day2_live_verify_uses_fresh_host_checks())
     failures.extend(test_day2_nginx_logs_uses_retained_runner_key())
+    failures.extend(test_windows_runner_key_acl_command_restricts_private_key())
+    failures.extend(test_day2_key_lookup_self_heals_private_key_permissions())
     failures.extend(test_day2_nginx_logs_fail_without_runner_key())
 
     failed_count = len([item for item in failures if not item])
