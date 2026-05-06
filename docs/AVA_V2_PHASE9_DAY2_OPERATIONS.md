@@ -1,7 +1,7 @@
 # AVA v2 Phase 9 — Day-2 Operations
 
 Branch: `v2-development`
-Status: Design locked, implementation pending
+Status: Slice 1 implemented — chat routing, read-only evidence, and approval contract
 Target version: `v2.1`
 
 ## Purpose
@@ -50,6 +50,52 @@ Initial supported commands:
 
 These operations prove AVA can manage a server lifecycle, not just create a
 server once.
+
+## Implementation Status
+
+### Slice 1 — Chat Contract And Approval Boundary
+
+Status: implemented.
+
+This first slice intentionally does not execute live Day-2 mutations yet. It
+locks the user-facing contract and safety boundary first:
+
+- `show status of my web server` is handled as a Day-2 status request.
+- `verify the web server` continues to report runner-backed HTTP evidence.
+- `show nginx logs` is recognized as Day-2, but clearly reports that live SSH
+  log retrieval is pending the Day-2 runner handler.
+- `restart nginx` is recognized as a medium-risk Day-2 action and requires
+  approval.
+- approving the Day-2 restart records approval, but does not claim execution
+  until the Day-2 runner handler exists.
+
+This preserves product truth: AVA should never say it restarted nginx, tailed
+logs, snapshotted, or rolled back a VM unless the host runner actually performed
+that action and returned evidence.
+
+### Slice 2 — Runner Execution Handlers
+
+Status: pending.
+
+Next implementation slice:
+
+- extend the host runner with a Day-2 operation queue
+- execute read-only live checks through VirtualBox/SSH
+- execute approved nginx restart through SSH
+- write structured Day-2 operation results back to Redis
+- update chat responses from "pending handler" to real evidence
+
+### Slice 3 — Snapshot And Power Controls
+
+Status: pending.
+
+After the restart/logs path is proven:
+
+- snapshot VM
+- rollback to latest AVA snapshot
+- stop VM
+- start VM
+- verify after each operation
 
 ## Why This Comes Before PostgreSQL
 
@@ -189,17 +235,18 @@ same Redis and host-runner pattern.
 
 ## Implementation Plan
 
-1. Define Day-2 operation model and result schema.
-2. Add VM inventory lookup for AVA-created instances.
-3. Add runner-side handlers for read-only status and verify operations.
-4. Add nginx log and nginx status handlers.
-5. Add approval-gated nginx restart.
-6. Add approval-gated VirtualBox snapshot creation.
-7. Add approval-gated VM start/stop.
-8. Add approval-gated rollback to latest AVA snapshot.
-9. Add chat response formatting for operation evidence.
-10. Add regression tests for routing, approval, evidence, and blocked actions.
-11. Add one live validation run against an AVA-created web server.
+1. Define Day-2 operation model and result schema. **Implemented in Slice 1.**
+2. Add chat routing for read-only and approval-required Day-2 prompts. **Implemented in Slice 1.**
+3. Add VM inventory lookup for AVA-created instances.
+4. Add runner-side handlers for read-only status and verify operations.
+5. Add nginx log and nginx status handlers.
+6. Add approval-gated nginx restart.
+7. Add approval-gated VirtualBox snapshot creation.
+8. Add approval-gated VM start/stop.
+9. Add approval-gated rollback to latest AVA snapshot.
+10. Add chat response formatting for operation evidence. **Started in Slice 1.**
+11. Add regression tests for routing, approval, evidence, and blocked actions. **Started in Slice 1.**
+12. Add one live validation run against an AVA-created web server.
 
 ## Expected User Experience
 
@@ -264,4 +311,3 @@ After Phase 9 Day-2 Operations, the next recommended product sequence is:
 3. Reverse proxy role.
 4. Multi-VM web + DB orchestration.
 5. Day-2 operations generalized across all roles.
-

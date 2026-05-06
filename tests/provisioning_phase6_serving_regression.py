@@ -284,6 +284,14 @@ def main() -> int:
         completed_verify = service.handle("user-1", "verify the web server", route_intent=None)
         completed_connection = service.handle("user-1", "how do I connect with PuTTY?", route_intent=None)
         completed_evidence = service.handle("user-1", "what did you do and what evidence do you have?", route_intent=None)
+        day2_status = service.handle("user-1", "show status of my web server", route_intent=None)
+        day2_logs = service.handle("user-1", "show nginx logs", route_intent=None)
+        day2_restart = service.handle("user-1", "restart nginx", route_intent=None)
+        day2_approval_id = day2_restart.metadata["provisioning"]["approval_id"]
+        day2_approval_entry = approval.get_by_id(day2_approval_id)
+        day2_approved = service.handle("user-1", f"approve {day2_approval_id}", route_intent=None)
+        day2_snapshot = service.handle("user-1", "take a snapshot before changes", route_intent=None)
+        day2_rollback = service.handle("user-1", "rollback to last snapshot", route_intent=None)
         job_queue.statuses.pop("job-0001", None)
         expired_status = service.handle("user-1", "show me the provisionning status", route_intent=None)
         expired_evidence = service.handle("user-1", "what evidence do you have?", route_intent=None)
@@ -301,6 +309,17 @@ def main() -> int:
                 check("evidence includes hardening summary", "hardening summary" in completed_evidence.response.lower()),
                 check("evidence reports effective completed phase", "effective phase: `completed`" in completed_evidence.response.lower()),
                 check("evidence states apache not applied", "apache hardening" in completed_evidence.response.lower()),
+                check("day-2 status is handled", day2_status.handled),
+                check("day-2 status reports active vm", "ava-web-01" in day2_status.response),
+                check("day-2 logs are handled", day2_logs.handled),
+                check("day-2 logs does not pretend live ssh ran", "pending day-2 runner handler" in day2_logs.response.lower()),
+                check("day-2 restart requires approval", "approval required" in day2_restart.response.lower()),
+                check("day-2 approval entry is tagged", (day2_approval_entry or {}).get("metadata", {}).get("type") == "day2_operation"),
+                check("day-2 approval records risk", (day2_approval_entry or {}).get("risk") == "medium"),
+                check("day-2 approval is handled", day2_approved.handled),
+                check("day-2 approval does not claim execution", "pending day-2 runner handler" in day2_approved.response.lower()),
+                check("day-2 snapshot requires approval", "operation: `snapshot`" in day2_snapshot.response.lower()),
+                check("day-2 rollback is high risk", "risk: `high`" in day2_rollback.response.lower()),
                 check("misspelled status query stays in provisioning session", expired_status.handled),
                 check("expired runner status derives completed from result", "runner status: `completed`" in expired_status.response.lower()),
                 check("expired runner status still shows effective completed phase", "phase: `completed`" in expired_status.response.lower()),
