@@ -328,6 +328,7 @@ def test_cleanup_failure_after_verification_does_not_rollback() -> list[bool]:
     # This lets us seed the files that mocked _run would otherwise create.
     work_dir = work_root / job.job_id
     work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "ava_runner_ed25519").write_text("fake-private-key", encoding="utf-8")
     (work_dir / "ava_runner_ed25519.pub").write_text("ssh-ed25519 AAAAFAKEKEY ava-runner-test", encoding="utf-8")
     seed_iso = work_dir / "seed.iso"
     seed_iso.write_bytes(b"fake-iso-secret-content")
@@ -577,6 +578,130 @@ def test_day2_live_verify_uses_fresh_host_checks() -> list[bool]:
     ]
 
 
+def test_day2_nginx_logs_uses_retained_runner_key() -> list[bool]:
+    tmp = Path(tempfile.mkdtemp())
+    fake = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
+    key_path = tmp / "keys" / "ava-web-day2_ava_runner_ed25519"
+    key_path.parent.mkdir(parents=True)
+    key_path.write_text("fake-private-key", encoding="utf-8")
+    operation = queue.enqueue_day2_operation(
+        session_id="session-day2-logs",
+        operation="nginx_logs",
+        target="nginx",
+        instance_id="ava-web-day2",
+        instance_name="ava-web-day2",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+        http_port=8080,
+        metadata={"read_only": True},
+    )
+    claimed = queue.claim_next_day2_operation(timeout_seconds=1)
+
+    class MockAdapter:
+        def get_connection_info(self, iid):
+            return SimpleNamespace(host="127.0.0.1", port=2222, metadata={"http_host_port": 8080})
+
+    class MockSSHExecutor:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def run(self, command, **kwargs):
+            stdout = (
+                "nginx.service active\n"
+                "--- AVA_ACCESS_LOG ---\n"
+                "GET / HTTP/1.1 200\n"
+                "--- AVA_ERROR_LOG ---\n"
+                "no errors\n"
+            )
+            return SimpleNamespace(exit_code=0, stdout=stdout, stderr="", failure_class=None)
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.queue = queue
+    runner.config = HostRunnerConfig(
+        vboxmanage="VBoxManage",
+        ssh_binary="ssh",
+        ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image",
+        work_root=tmp,
+        log_path=tmp / "ava-day2-logs-test.log",
+        retain_debug=False,
+        timeout_seconds=30,
+        max_jobs=1,
+    )
+    runner.adapter = MockAdapter()
+    runner.logger = logging.getLogger("ava.test.day2_logs")
+
+    import provisioning.runner.host_runner as hr_mod
+
+    original_validate = HostRunner._validate_binaries
+    original_ssh_executor = hr_mod.SSHExecutor
+    try:
+        HostRunner._validate_binaries = lambda self: None
+        hr_mod.SSHExecutor = MockSSHExecutor
+        runner.execute_day2_operation(claimed)
+    finally:
+        HostRunner._validate_binaries = original_validate
+        hr_mod.SSHExecutor = original_ssh_executor
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    loaded = queue.get_day2_result(operation.operation_id)
+    evidence = loaded.evidence if loaded else {}
+    return [
+        check("nginx logs operation status is completed", queue.get_day2_status(operation.operation_id) == "completed"),
+        check("nginx logs result is stored", loaded is not None and loaded.status == "completed"),
+        check("nginx logs include service journal", "nginx.service active" in str(evidence.get("journalctl_tail"))),
+        check("nginx logs include access tail", "GET / HTTP/1.1 200" in str(evidence.get("access_log_tail"))),
+        check("nginx logs include error tail", "no errors" in str(evidence.get("error_log_tail"))),
+    ]
+
+
+def test_day2_nginx_logs_fail_without_runner_key() -> list[bool]:
+    fake = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
+    operation = queue.enqueue_day2_operation(
+        session_id="session-day2-logs-missing-key",
+        operation="nginx_logs",
+        target="nginx",
+        instance_id="ava-web-missing-key",
+        instance_name="ava-web-missing-key",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+        http_port=8080,
+        metadata={"read_only": True},
+    )
+    claimed = queue.claim_next_day2_operation(timeout_seconds=1)
+    runner = HostRunner.__new__(HostRunner)
+    runner.queue = queue
+    runner.config = HostRunnerConfig(
+        vboxmanage="VBoxManage",
+        ssh_binary="ssh",
+        ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image",
+        work_root=Path(tempfile.gettempdir()) / "ava-day2-missing-key-test",
+        log_path=Path(tempfile.gettempdir()) / "ava-day2-missing-key-test.log",
+        retain_debug=False,
+        timeout_seconds=30,
+        max_jobs=1,
+    )
+    runner.adapter = SimpleNamespace()
+    runner.logger = logging.getLogger("ava.test.day2_missing_key")
+
+    original_validate = HostRunner._validate_binaries
+    try:
+        HostRunner._validate_binaries = lambda self: None
+        runner.execute_day2_operation(claimed)
+    finally:
+        HostRunner._validate_binaries = original_validate
+
+    loaded = queue.get_day2_result(operation.operation_id)
+    return [
+        check("missing-key nginx logs status is failed", queue.get_day2_status(operation.operation_id) == "failed"),
+        check("missing-key nginx logs result is stored", loaded is not None and loaded.status == "failed"),
+        check("missing-key nginx logs explains runner key", loaded is not None and "Runner SSH key" in str(loaded.error)),
+    ]
+
+
 def main() -> int:
     fake = FakeRedis()
     queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
@@ -680,6 +805,8 @@ def main() -> int:
     print("\n--- server-management operation queue (v2.1 snapshot execution) ---")
     failures.extend(test_day2_snapshot_execution_uses_vboxmanage())
     failures.extend(test_day2_live_verify_uses_fresh_host_checks())
+    failures.extend(test_day2_nginx_logs_uses_retained_runner_key())
+    failures.extend(test_day2_nginx_logs_fail_without_runner_key())
 
     failed_count = len([item for item in failures if not item])
     if failed_count:

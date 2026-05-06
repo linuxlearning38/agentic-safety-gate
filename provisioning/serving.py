@@ -16,6 +16,8 @@ from provisioning.day2 import (
     format_approved_queued_response,
     format_approval_required_response,
     format_approved_pending_response,
+    format_live_nginx_logs_queued_response,
+    format_live_nginx_logs_response,
     format_live_verify_queued_response,
     format_live_verify_response,
     format_read_only_response,
@@ -353,10 +355,10 @@ class ProvisioningChatService:
                 session,
             )
         if not operation.requires_approval:
-            if operation.operation == "verify":
-                live_verify = self._queue_live_verify(operation, session, runner, result)
-                if live_verify:
-                    return live_verify
+            if operation.operation in {"verify", "nginx_logs"}:
+                live_operation = self._queue_live_read_only_operation(operation, session, runner, result)
+                if live_operation:
+                    return live_operation
             return self._result(format_read_only_response(operation, session=session, result=result), session)
 
         approval_id = approval.add_request(
@@ -469,7 +471,7 @@ class ProvisioningChatService:
             approval_id=approval_id,
         )
 
-    def _queue_live_verify(
+    def _queue_live_read_only_operation(
         self,
         operation,
         session,
@@ -507,7 +509,11 @@ class ProvisioningChatService:
         )
         operation_result = self._wait_for_day2_result(day2_job.operation_id, timeout_seconds=18)
         if operation_result:
+            if operation.operation == "nginx_logs":
+                return self._result(format_live_nginx_logs_response(operation_result, result=result), session)
             return self._result(format_live_verify_response(operation_result, result=result), session)
+        if operation.operation == "nginx_logs":
+            return self._result(format_live_nginx_logs_queued_response(day2_job.operation_id, result=result), session)
         return self._result(format_live_verify_queued_response(day2_job.operation_id, result=result), session)
 
     def _wait_for_day2_result(self, operation_id: str, *, timeout_seconds: float) -> Any | None:
