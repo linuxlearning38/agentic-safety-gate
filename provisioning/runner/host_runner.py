@@ -225,7 +225,9 @@ class HostRunner:
                 processed += 1
                 self.execute_day2_operation(operation)
                 continue
-            job = self.queue.claim_next_job(timeout_seconds=self.config.poll_timeout_seconds)
+            # Keep post-provisioning operations responsive even when no new
+            # provisioning job is available.
+            job = self.queue.claim_next_job(timeout_seconds=min(self.config.poll_timeout_seconds, 5))
             if job is None:
                 continue
             self._write_processing_heartbeat(job)
@@ -239,7 +241,7 @@ class HostRunner:
             self._write_day2_processing_heartbeat(operation)
             self.execute_day2_operation(operation)
             return True
-        job = self.queue.claim_next_job(timeout_seconds=self.config.poll_timeout_seconds)
+        job = self.queue.claim_next_job(timeout_seconds=min(self.config.poll_timeout_seconds, 5))
         if job is None:
             return False
         self._write_processing_heartbeat(job)
