@@ -16,9 +16,14 @@ if (-not $WorkDir) {
 }
 
 # Kill any stale runner process so the new launch gets fresh code.
-Get-Process -Name python -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -match 'host_runner' } |
-    ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+# Get-Process does not reliably expose CommandLine on Windows, especially
+# under StrictMode, so use CIM for command-line matching.
+Get-CimInstance Win32_Process |
+    Where-Object {
+        $_.Name -match '^python(\.exe|3\.exe)?$' -and
+        $_.CommandLine -match 'provisioning\.runner\.host_runner|host_runner\.py'
+    } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 $env:AVA_PROVISIONING_REDIS_URL = $RedisUrl
 $env:AVA_VBOXMANAGE_PATH = $VBoxManagePath
