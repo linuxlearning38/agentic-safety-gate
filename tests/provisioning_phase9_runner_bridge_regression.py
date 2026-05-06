@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from provisioning.runner import (  # noqa: E402
     JOB_QUEUE_KEY,
+    RUNNER_HEARTBEAT_KEY,
     ProvisioningJobResult,
     ProvisioningResultWriter,
     RedisProvisioningJobQueue,
@@ -407,9 +408,9 @@ def test_cleanup_failure_after_verification_does_not_rollback() -> list[bool]:
     try:
         HostRunner._validate_binaries = lambda self: None
         hr_mod._run = lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr="")
-        hr_mod._wait_for_tcp = lambda host, port, timeout: True
-        hr_mod._wait_for_executor_command = lambda executor, cmd, timeout, *, redact: cloud_init_result
-        hr_mod._wait_for_http_200 = lambda url, timeout_seconds: (True, "HTTP 200")
+        hr_mod._wait_for_tcp = lambda host, port, timeout, **kw: True
+        hr_mod._wait_for_executor_command = lambda executor, cmd, timeout, *, redact, **kw: cloud_init_result
+        hr_mod._wait_for_http_200 = lambda url, timeout_seconds, **kw: (True, "HTTP 200")
         hr_mod.SSHExecutor = lambda conn: SimpleNamespace(run=lambda cmd, **kw: cloud_init_result)
         hr_mod.WebServerRole = _MockWebServerRole
         hr_mod.VerificationEngine = _MockVerificationEngine
@@ -487,6 +488,15 @@ def main() -> int:
     )
 
     writer = ProvisioningResultWriter(queue)
+    queue.write_runner_heartbeat("idle", {"pid": 1234})
+    failures.extend(
+        [
+            check("runner heartbeat is written", bool(fake.values.get(RUNNER_HEARTBEAT_KEY))),
+            check("runner heartbeat has ttl", fake.expirations.get(RUNNER_HEARTBEAT_KEY) == 90),
+            check("runner health reads heartbeat", queue.is_runner_healthy() is True),
+        ]
+    )
+
     writer.status(job.job_id, "provisioning")
     result = writer.completed(
         job_id=job.job_id,

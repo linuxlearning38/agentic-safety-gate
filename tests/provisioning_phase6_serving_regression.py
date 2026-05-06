@@ -33,6 +33,7 @@ class FakeProvisioningJobQueue:
         self.statuses: dict[str, str] = {}
         self.results: dict[str, ProvisioningJobResult] = {}
         self.counter = 0
+        self.runner_healthy = True
 
     def enqueue_approved_job(self, *, session_id, desired_state, credential_id, username, temporary_password):
         self.counter += 1
@@ -67,6 +68,9 @@ class FakeProvisioningJobQueue:
 
     def write_result(self, result):
         self.results[result.job_id] = result
+
+    def is_runner_healthy(self):
+        return self.runner_healthy
 
 
 def main() -> int:
@@ -163,6 +167,49 @@ def main() -> int:
                 check("wrong chat approval id is handled", wrong_approval.handled),
                 check("wrong chat approval id is rejected", "does not match" in wrong_approval.response.lower()),
                 check("wrong chat approval does not approve queue", approval.get_by_id(approval_id).get("status") == "pending"),
+            ]
+        )
+
+        offline_queue = FakeProvisioningJobQueue()
+        offline_queue.runner_healthy = False
+        offline_service = ProvisioningChatService(temp_dir / "offline_sessions.sqlite3", job_queue=offline_queue)
+        offline_service.handle("user-offline", "I want a web server in Ubuntu", route_intent="provisioning")
+        offline_specs = offline_service.handle("user-offline", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
+        offline_approval_id = offline_specs.metadata["provisioning"]["approval_id"]
+        offline_approval = offline_service.handle("user-offline", f"approve {offline_approval_id}", route_intent=None)
+        offline_session = offline_service.sessions.list_active("user-offline")[0]
+        failures.extend(
+            [
+                check("offline runner approval is handled", offline_approval.handled),
+                check("offline runner blocks VM queue", "runner is not reporting healthy" in offline_approval.response.lower()),
+                check(
+                    "offline runner does not print credential block",
+                    "username:" not in offline_approval.response.lower()
+                    and "temporary password:" not in offline_approval.response.lower(),
+                ),
+                check("offline runner leaves approval pending", approval.get_by_id(offline_approval_id).get("status") == "pending"),
+                check("offline runner leaves session awaiting approval", offline_session.phase == SessionPhase.AWAITING_APPROVAL, offline_session.phase.value),
+                check("offline runner queue stays empty", len(offline_queue.jobs) == 0),
+            ]
+        )
+
+        offline_continue_queue = FakeProvisioningJobQueue()
+        offline_continue_queue.runner_healthy = False
+        offline_continue_service = ProvisioningChatService(
+            temp_dir / "offline_continue_sessions.sqlite3",
+            job_queue=offline_continue_queue,
+        )
+        offline_continue_service.handle("user-offline-continue", "I want a web server in Ubuntu", route_intent="provisioning")
+        offline_continue_service.handle("user-offline-continue", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
+        offline_continue = offline_continue_service.handle("user-offline-continue", "continue provisioning", route_intent=None)
+        failures.extend(
+            [
+                check("offline runner continuation is handled", offline_continue.handled),
+                check(
+                    "offline runner continuation blocks VM queue",
+                    "runner is not reporting healthy" in offline_continue.response.lower(),
+                ),
+                check("offline runner continuation queue stays empty", len(offline_continue_queue.jobs) == 0),
             ]
         )
 

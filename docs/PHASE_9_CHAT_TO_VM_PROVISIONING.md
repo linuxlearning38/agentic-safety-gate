@@ -13,8 +13,9 @@ Status: Functional — Phase 9.5 operational hardening complete (2026-05-04)
 ```
 The storage check is non-destructive. The migration script is dry-run by
 default and does not copy anything unless run later with `-Execute` and an
-explicit `YES` confirmation. The task installer registers two Windows Scheduled
-Tasks: the host runner at login and a daily cleanup job at 03:00.
+explicit `YES` confirmation. The runner installer creates a current-user
+Startup-folder hook for the host runner and, where Windows permits it, a daily
+cleanup task at 03:00.
 
 **Daily startup (or after any reboot):**
 ```powershell
@@ -59,6 +60,28 @@ VirtualBox / VBoxManage     [Windows host]
      v
 AVA chat (/ask)             -- session shows real instance_id and evidence
 ```
+
+---
+
+## Runner Readiness Preflight
+
+AVA must not accept a provisioning approval if the Windows host-side runner is
+not alive. Otherwise the user sees a password and a queued job, but no VM is
+created.
+
+Phase 9 now treats the runner as a required dependency before approval:
+
+1. `host_runner.py` writes a Redis heartbeat to
+   `ava:provisioning:runner:heartbeat`.
+2. The heartbeat has a 90-second TTL, so stale runners expire automatically.
+3. `provisioning/serving.py` checks the heartbeat before accepting approval.
+4. If the heartbeat is missing or stale, AVA refuses to start provisioning,
+   leaves the approval pending, does not queue a VM job, and does not print a
+   temporary password.
+5. The user can start AVA with `.\scripts\start-ava.ps1`, wait for the runner
+   to report healthy, then approve the same request again.
+
+This is intentional product behavior: runner first, VM creation second.
 
 ---
 
@@ -121,11 +144,14 @@ longer reach Ollama (`ollama: false` in health check).
 every login or AVA restart.
 
 **Fix:**
-- `scripts/install-runner-task.ps1` — registers "AVA Host Runner" as a Windows
-  Scheduled Task at user login, with automatic restart (up to 3 times with a
-  5-minute delay) if the process exits.
-- `scripts/start-ava.ps1` also starts the runner in step 5, so it comes up
-  with the rest of the stack even if the Scheduled Task hasn't fired yet.
+- `scripts/install-runner-task.ps1` — creates `AVA Host Runner.cmd` in the
+  current user's Windows Startup folder. This avoids admin-only Scheduled Task
+  failures while still starting the runner automatically at login.
+- `scripts/start-ava.ps1` also starts the runner in step 5, so it comes up with
+  the rest of the stack even if the login hook has not fired yet.
+- AVA chat now checks the runner heartbeat before approval. If the runner is
+  offline, AVA tells the user that provisioning cannot start yet instead of
+  silently queuing a job.
 
 **One-time setup:** `.\scripts\install-runner-task.ps1`
 
@@ -197,8 +223,9 @@ docker exec agent_redis redis-cli DEL ava:provisioning:jobs:status:<job_id>
 
 ### Redis disconnection exits the runner
 
-If Redis becomes unreachable mid-poll, the runner exits cleanly.  It will
-restart automatically via the Scheduled Task (up to 3 times, 5-minute delay).
+If Redis becomes unreachable mid-poll, the runner exits cleanly. Restart AVA
+with `.\scripts\start-ava.ps1`; the chat approval preflight will block new VM
+requests until the runner heartbeat is healthy again.
 
 ### Ollama shown as `false` in health check after WSL restart
 
@@ -217,7 +244,7 @@ the containers are restarted with the synced `.env`.
 | `scripts/migrate-ava-data-to-volume.ps1` | Optional dry-run-first migration from WSL bind path to Docker volume |
 | `scripts/sync-ollama-host.ps1` | Detects WSL2 IP, writes `OLLAMA_HOST` to `.env` |
 | `scripts/start-ava.ps1` | One-command full startup orchestrator |
-| `scripts/install-runner-task.ps1` | Registers Windows Scheduled Tasks (one-time setup) |
+| `scripts/install-runner-task.ps1` | Installs current-user Startup hook for runner and daily cleanup task where allowed |
 | `scripts/cleanup-stale-seeds.ps1` | Removes stale `seed.iso` files older than 1 hour |
 
 Modified files: `Dockerfile`, `docker-compose.yml`, `web_agent_v2.1_guardrail.py`,

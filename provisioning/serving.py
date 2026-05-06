@@ -113,12 +113,16 @@ class ProvisioningChatService:
                         f"Approval `{approval_id}` is not pending; current status is `{status}`.",
                         active,
                     )
+                if not _runner_is_healthy(self.job_queue):
+                    return self._result(_format_runner_unavailable_response(), active)
                 approval.update_status(approval_id, "approved")
                 response = self.flow.continue_after_approval(active.session_id)
                 message = self._format_approval_and_enqueue(response)
                 return self._result(message, response.session, approval_id=response.approval_id)
             if not _is_approval_continuation(normalized):
                 return ProvisioningServingResult(handled=False)
+            if not _runner_is_healthy(self.job_queue):
+                return self._result(_format_runner_unavailable_response(), active)
             response = self.flow.continue_after_approval(active.session_id)
             message = self._format_approval_and_enqueue(response)
             return self._result(message, response.session, approval_id=response.approval_id)
@@ -268,6 +272,25 @@ def _runner_completed(runner: dict[str, Any] | None) -> bool:
         return False
     result = runner.get("result")
     return runner.get("status") == "completed" and bool(result and result.instance_id)
+
+
+def _runner_is_healthy(job_queue: ProvisioningJobQueue) -> bool:
+    health_check = getattr(job_queue, "is_runner_healthy", None)
+    if health_check is None:
+        return True
+    try:
+        return bool(health_check())
+    except Exception:
+        return False
+
+
+def _format_runner_unavailable_response() -> str:
+    return (
+        "I cannot start provisioning yet because the Windows host-side VirtualBox runner is not "
+        "reporting healthy.\n\n"
+        "No VM was created and no temporary password was issued. Start AVA with "
+        "`scripts/start-ava.ps1` or wait for the runner to come online, then approve again."
+    )
 
 
 def _effective_phase(session, runner: dict[str, Any] | None) -> str:

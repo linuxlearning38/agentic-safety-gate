@@ -15,6 +15,8 @@ from uuid import uuid4
 JOB_QUEUE_KEY = "ava:provisioning:jobs:approved"
 STATUS_KEY_PREFIX = "ava:provisioning:jobs:status:"
 RESULT_KEY_PREFIX = "ava:provisioning:jobs:result:"
+RUNNER_HEARTBEAT_KEY = "ava:provisioning:runner:heartbeat"
+RUNNER_HEARTBEAT_TTL_SECONDS = 90
 ALLOWED_STATUSES = {
     "queued",
     "picked_up",
@@ -147,6 +149,12 @@ class ProvisioningJobQueue(Protocol):
     def write_result(self, result: ProvisioningJobResult) -> None:
         ...
 
+    def write_runner_heartbeat(self, status: str = "idle", metadata: dict[str, Any] | None = None) -> None:
+        ...
+
+    def is_runner_healthy(self) -> bool:
+        ...
+
 
 class RedisProvisioningJobQueue:
     """Redis implementation of the Phase 9 approved-job queue contract."""
@@ -215,6 +223,22 @@ class RedisProvisioningJobQueue:
 
     def write_result(self, result: ProvisioningJobResult) -> None:
         self.client.set(_result_key(result.job_id), _json_dumps(result.to_dict()), ex=max(self.ttl_seconds, 86400))
+
+    def write_runner_heartbeat(self, status: str = "idle", metadata: dict[str, Any] | None = None) -> None:
+        self.client.set(
+            RUNNER_HEARTBEAT_KEY,
+            _json_dumps(
+                {
+                    "status": status,
+                    "updated_at": _utc_now(),
+                    "metadata": dict(metadata or {}),
+                }
+            ),
+            ex=RUNNER_HEARTBEAT_TTL_SECONDS,
+        )
+
+    def is_runner_healthy(self) -> bool:
+        return bool(self.client.get(RUNNER_HEARTBEAT_KEY))
 
 
 def _status_key(job_id: str) -> str:
