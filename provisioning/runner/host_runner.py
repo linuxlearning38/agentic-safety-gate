@@ -290,12 +290,14 @@ class HostRunner:
             self.queue.write_day2_status(operation.operation_id, "running")
             if operation.operation == "snapshot":
                 result = self._execute_snapshot(operation)
+            elif operation.operation == "verify":
+                result = self._execute_live_verify(operation)
             else:
                 raise RuntimeError(
                     f"Operation '{operation.operation}' is approved but not executable yet. "
-                    "Snapshot execution is enabled first; guest SSH actions require durable runner identity."
+                    "Snapshot and live web verification are enabled first; guest SSH actions require durable runner identity."
                 )
-            self.queue.write_day2_status(operation.operation_id, "completed")
+            self.queue.write_day2_status(operation.operation_id, result.status)
             self.queue.write_day2_result(result)
             self.logger.info("Completed server-management operation %s", operation.operation_id)
         except Exception as exc:
@@ -348,6 +350,86 @@ class HostRunner:
                 "provider": "virtualbox",
                 "runner": "host_runner",
             },
+        )
+
+    def _execute_live_verify(self, operation: Day2OperationJob) -> Day2OperationResult:
+        self._validate_vboxmanage()
+        checks: list[dict[str, object]] = []
+        state = self.adapter.get_instance_state(operation.instance_id)
+        checks.append(
+            {
+                "name": "vm_exists",
+                "passed": state.exists,
+                "evidence": f"provider_status={state.provider_status}",
+            }
+        )
+        if state.exists:
+            checks.append(
+                {
+                    "name": "vm_running",
+                    "passed": state.power_state == "running",
+                    "evidence": f"power_state={state.power_state}",
+                }
+            )
+
+        connection = None
+        if state.exists:
+            connection = self.adapter.get_connection_info(operation.instance_id)
+            checks.append(
+                {
+                    "name": "connection_info",
+                    "passed": bool(connection.host and connection.port),
+                    "evidence": f"{connection.host}:{connection.port}",
+                }
+            )
+            checks.append(
+                {
+                    "name": "ssh_tcp_reachable",
+                    "passed": _wait_for_tcp(connection.host, connection.port, 10),
+                    "evidence": f"{connection.host}:{connection.port}",
+                }
+            )
+
+        http_port = (
+            operation.http_port
+            or (connection.metadata.get("http_host_port") if connection is not None else None)
+        )
+        http_url = f"http://127.0.0.1:{http_port}/" if http_port else ""
+        if http_url:
+            ok, detail = _wait_for_http_200(http_url, timeout_seconds=15)
+            checks.append(
+                {
+                    "name": "host_http_200",
+                    "passed": ok,
+                    "evidence": f"{http_url} -> {detail}",
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": "host_http_200",
+                    "passed": False,
+                    "evidence": "missing http_host_port metadata",
+                }
+            )
+
+        passed = all(bool(check.get("passed")) for check in checks)
+        return Day2OperationResult(
+            operation_id=operation.operation_id,
+            operation=operation.operation,
+            status="completed" if passed else "failed",
+            instance_id=operation.instance_id,
+            instance_name=operation.instance_name,
+            evidence={
+                "action": "live_web_verify",
+                "checks": checks,
+                "http_port": http_port,
+                "ssh_host": operation.ssh_host or (connection.host if connection else None),
+                "ssh_port": operation.ssh_port or (connection.port if connection else None),
+                "provider": "virtualbox",
+                "runner": "host_runner",
+            },
+            error=None if passed else {"message": "one or more live verification checks failed"},
         )
 
     def execute_job(self, job: ProvisioningJob) -> None:

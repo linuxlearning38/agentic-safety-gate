@@ -510,6 +510,73 @@ def test_day2_snapshot_execution_uses_vboxmanage() -> list[bool]:
     ]
 
 
+def test_day2_live_verify_uses_fresh_host_checks() -> list[bool]:
+    fake = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
+    operation = queue.enqueue_day2_operation(
+        session_id="session-day2-verify",
+        operation="verify",
+        target="web_server",
+        instance_id="ava-web-day2",
+        instance_name="ava-web-day2",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+        http_port=8080,
+        metadata={"read_only": True},
+    )
+    claimed = queue.claim_next_day2_operation(timeout_seconds=1)
+
+    class MockAdapter:
+        def get_instance_state(self, iid):
+            return SimpleNamespace(exists=True, power_state="running", provider_status="running")
+
+        def get_connection_info(self, iid):
+            return SimpleNamespace(host="127.0.0.1", port=2222, metadata={"http_host_port": 8080})
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.queue = queue
+    runner.config = HostRunnerConfig(
+        vboxmanage="VBoxManage",
+        ssh_binary="ssh",
+        ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image",
+        work_root=Path(tempfile.gettempdir()) / "ava-day2-verify-test",
+        log_path=Path(tempfile.gettempdir()) / "ava-day2-verify-test.log",
+        retain_debug=False,
+        timeout_seconds=30,
+        max_jobs=1,
+    )
+    runner.adapter = MockAdapter()
+    runner.logger = logging.getLogger("ava.test.day2_verify")
+
+    import provisioning.runner.host_runner as hr_mod
+
+    original_validate = HostRunner._validate_vboxmanage
+    original_wait_tcp = hr_mod._wait_for_tcp
+    original_wait_http = hr_mod._wait_for_http_200
+    try:
+        HostRunner._validate_vboxmanage = lambda self: None
+        hr_mod._wait_for_tcp = lambda host, port, timeout_seconds, **kw: True
+        hr_mod._wait_for_http_200 = lambda url, timeout_seconds, **kw: (True, "HTTP 200")
+        runner.execute_day2_operation(claimed)
+    finally:
+        HostRunner._validate_vboxmanage = original_validate
+        hr_mod._wait_for_tcp = original_wait_tcp
+        hr_mod._wait_for_http_200 = original_wait_http
+
+    loaded = queue.get_day2_result(operation.operation_id)
+    checks = (loaded.evidence or {}).get("checks") if loaded else []
+    check_names = {item.get("name") for item in checks if isinstance(item, dict)}
+
+    return [
+        check("live verify operation status is completed", queue.get_day2_status(operation.operation_id) == "completed"),
+        check("live verify result is stored", loaded is not None and loaded.status == "completed"),
+        check("live verify checks VM existence", "vm_exists" in check_names),
+        check("live verify checks SSH TCP reachability", "ssh_tcp_reachable" in check_names),
+        check("live verify checks host HTTP 200", "host_http_200" in check_names),
+    ]
+
+
 def main() -> int:
     fake = FakeRedis()
     queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
@@ -612,6 +679,7 @@ def main() -> int:
 
     print("\n--- server-management operation queue (v2.1 snapshot execution) ---")
     failures.extend(test_day2_snapshot_execution_uses_vboxmanage())
+    failures.extend(test_day2_live_verify_uses_fresh_host_checks())
 
     failed_count = len([item for item in failures if not item])
     if failed_count:

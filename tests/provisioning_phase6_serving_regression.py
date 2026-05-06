@@ -106,6 +106,27 @@ class FakeProvisioningJobQueue:
         )
         self.day2_jobs[operation_id] = job
         self.day2_statuses[operation_id] = "queued"
+        if operation == "verify":
+            self.day2_statuses[operation_id] = "completed"
+            self.day2_results[operation_id] = Day2OperationResult(
+                operation_id=operation_id,
+                operation="verify",
+                status="completed",
+                instance_id=instance_id,
+                instance_name=instance_name,
+                evidence={
+                    "action": "live_web_verify",
+                    "checks": [
+                        {"name": "vm_exists", "passed": True, "evidence": "provider_status=running"},
+                        {"name": "vm_running", "passed": True, "evidence": "power_state=running"},
+                        {"name": "host_http_200", "passed": True, "evidence": f"http://127.0.0.1:{http_port}/ -> HTTP 200"},
+                    ],
+                    "http_port": http_port,
+                    "ssh_host": ssh_host,
+                    "ssh_port": ssh_port,
+                },
+                completion_timestamp="2026-05-02T00:15:30+00:00",
+            )
         return job
 
     def claim_next_day2_operation(self, *, timeout_seconds=1):
@@ -357,6 +378,7 @@ def main() -> int:
                 check("completed status reports effective phase", "phase: `completed`" in completed_status.response.lower()),
                 check("completed status keeps conversation checkpoint visible", "conversation checkpoint:" in completed_status.response.lower()),
                 check("completed verify shows http evidence", "http://127.0.0.1:8080/" in completed_verify.response.lower()),
+                check("completed verify uses live runner evidence", "live web-server verification" in completed_verify.response.lower()),
                 check("connection query shows putty host", "putty host name" in completed_connection.response.lower()),
                 check("connection query shows username", "username: `avaadmin`" in completed_connection.response.lower()),
                 check("connection query does not reprint actual password", issued_secret not in completed_connection.response),
