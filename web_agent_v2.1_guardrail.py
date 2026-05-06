@@ -17,7 +17,7 @@ import time
 import logging
 import threading
 from datetime import datetime
-from control.secure_executor import execute_command_secure, execute_tool_safe
+from control.secure_executor import execute_approved_command, execute_command_secure, execute_tool_safe
 from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
 from control.react_loop import react_loop
@@ -636,7 +636,59 @@ def _blocked_action_result(query: str, reason: str, threat: str, blast_radius: s
     }
 
 
+def _resolve_chat_approval_execution(query: str) -> dict | None:
+    match = re.match(r"^\s*approve\s+([a-z0-9-]{4,64})\s*$", query, re.IGNORECASE)
+    if not match:
+        return None
+
+    approval_id = match.group(1)
+    from control.approval import get_by_id, update_status
+
+    entry = get_by_id(approval_id)
+    if not entry:
+        result = {
+            "status": "failed",
+            "risk": "unknown",
+            "approval_id": approval_id,
+            "command_repr": f"approve {approval_id}",
+            "reason": "Approval ID not found.",
+            "error": "Approval ID not found.",
+        }
+        return {"kind": "command", "result": result, "response": _command_response_text(result)}
+
+    status = entry.get("status")
+    if status == "executed":
+        result = {
+            "status": "failed",
+            "risk": entry.get("risk") or "unknown",
+            "approval_id": approval_id,
+            "command_repr": entry.get("command") or f"approve {approval_id}",
+            "reason": "This approval was already executed.",
+            "error": "This approval was already executed.",
+        }
+        return {"kind": "command", "result": result, "response": _command_response_text(result)}
+    if status == "pending":
+        update_status(approval_id, "approved")
+    elif status != "approved":
+        result = {
+            "status": "failed",
+            "risk": entry.get("risk") or "unknown",
+            "approval_id": approval_id,
+            "command_repr": entry.get("command") or f"approve {approval_id}",
+            "reason": f"Approval is not executable because its status is {status}.",
+            "error": f"Approval is not executable because its status is {status}.",
+        }
+        return {"kind": "command", "result": result, "response": _command_response_text(result)}
+
+    result = execute_approved_command(approval_id)
+    return {"kind": "command", "result": result, "response": _command_response_text(result)}
+
+
 def _resolve_direct_action_query(query: str) -> dict | None:
+    approval_execution = _resolve_chat_approval_execution(query)
+    if approval_execution:
+        return approval_execution
+
     # Destructive check MUST come before extract_explicit_command_request.
     # 'echo' and 'kill' are both in _RAW_COMMAND_STARTERS — without this order,
     # they get routed to execute_command_secure which returns approval_required
@@ -4906,6 +4958,7 @@ HTML_TEMPLATE = r'''
         .app-container {
             display: flex;
             height: 100vh;
+            min-width: 0;
         }
         
         /* Sidebar */
@@ -5164,6 +5217,7 @@ HTML_TEMPLATE = r'''
             display: flex;
             flex-direction: column;
             background: var(--main-bg);
+            min-width: 0;
         }
         
         .top-bar {
@@ -5195,6 +5249,7 @@ HTML_TEMPLATE = r'''
             display: flex;
             flex-direction: column;
             gap: 24px;
+            min-width: 0;
         }
         
         .welcome-screen {
@@ -5259,6 +5314,7 @@ HTML_TEMPLATE = r'''
             max-width: 900px;
             margin: 0 auto;
             width: 100%;
+            min-width: 0;
             animation: fadeIn 0.3s ease;
         }
         
@@ -5283,6 +5339,7 @@ HTML_TEMPLATE = r'''
         .message-content {
             flex: 1;
             padding-top: 4px;
+            min-width: 0;
         }
         
         .message-header {
@@ -5306,6 +5363,9 @@ HTML_TEMPLATE = r'''
             line-height: 1.7;
             font-size: 15px;
             color: #d0d0d0;
+            max-width: 100%;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
         
         .message.user .message-text {
@@ -5853,6 +5913,7 @@ HTML_TEMPLATE = r'''
             background: var(--main-bg);
             box-shadow: var(--shadow-shell);
             backdrop-filter: blur(10px);
+            min-width: 0;
         }
 
         .workspace-bar {
@@ -5955,6 +6016,7 @@ HTML_TEMPLATE = r'''
         .chat-area {
             padding: 28px 28px 18px;
             gap: 30px;
+            min-width: 0;
         }
 
         .welcome-screen {
@@ -6196,6 +6258,8 @@ HTML_TEMPLATE = r'''
         .message,
         .loading-message {
             max-width: 980px;
+            width: 100%;
+            min-width: 0;
         }
 
         .message-avatar {
@@ -6211,7 +6275,10 @@ HTML_TEMPLATE = r'''
         }
 
         .message-content {
+            flex: 1 1 auto;
             max-width: 820px;
+            min-width: 0;
+            width: 100%;
             padding-top: 2px;
         }
 
@@ -6231,6 +6298,9 @@ HTML_TEMPLATE = r'''
             color: var(--text-main);
             line-height: 1.82;
             font-size: 15px;
+            max-width: 100%;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
 
         .message.user .message-text {
@@ -6241,6 +6311,14 @@ HTML_TEMPLATE = r'''
             border: 1px solid var(--border-soft);
             color: var(--text-main);
             font-weight: 400;
+        }
+
+        .message-text code,
+        .status-card code,
+        .findings-panel code {
+            white-space: normal;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
 
         .message-actions {
@@ -6265,6 +6343,9 @@ HTML_TEMPLATE = r'''
             border-radius: 18px;
             border: 1px solid var(--border-soft);
             background: var(--bg-panel-2);
+            max-width: 100%;
+            min-width: 0;
+            overflow-wrap: anywhere;
         }
 
         .status-card-title {
@@ -6328,6 +6409,8 @@ HTML_TEMPLATE = r'''
             border: 1px solid var(--border-soft);
             border-radius: 16px;
             overflow: hidden;
+            max-width: 100%;
+            min-width: 0;
         }
 
         .terminal-label {
@@ -6349,6 +6432,8 @@ HTML_TEMPLATE = r'''
             border-radius: 14px;
             background: var(--card-bg);
             overflow: hidden;
+            max-width: 100%;
+            min-width: 0;
         }
 
         .findings-label {
@@ -6372,6 +6457,8 @@ HTML_TEMPLATE = r'''
             color: var(--text-main);
             font-size: 13px;
             line-height: 1.55;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
 
         .findings-item-title {
@@ -6428,10 +6515,18 @@ HTML_TEMPLATE = r'''
             background: transparent;
             border: none;
             border-radius: 0;
+            max-width: 100%;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
 
         .terminal-output code {
             color: #aef1c8;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
 
         .input-container {

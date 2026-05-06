@@ -91,6 +91,7 @@ FUNCTIONS = {
     "_is_single_destructive_request",
     "_blocked_action_result",
     "_command_response_text",
+    "_resolve_chat_approval_execution",
     "_resolve_direct_action_query",
     "_has_shell_control_syntax",
 }

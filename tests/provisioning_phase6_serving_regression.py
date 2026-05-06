@@ -284,6 +284,9 @@ def main() -> int:
         completed_verify = service.handle("user-1", "verify the web server", route_intent=None)
         completed_connection = service.handle("user-1", "how do I connect with PuTTY?", route_intent=None)
         completed_evidence = service.handle("user-1", "what did you do and what evidence do you have?", route_intent=None)
+        job_queue.statuses.pop("job-0001", None)
+        expired_status = service.handle("user-1", "show me the provisionning status", route_intent=None)
+        expired_evidence = service.handle("user-1", "what evidence do you have?", route_intent=None)
         issued_secret = job_queue.jobs["job-0001"].credentials_seed_data["temporary_password"]
         failures.extend(
             [
@@ -298,6 +301,11 @@ def main() -> int:
                 check("evidence includes hardening summary", "hardening summary" in completed_evidence.response.lower()),
                 check("evidence reports effective completed phase", "effective phase: `completed`" in completed_evidence.response.lower()),
                 check("evidence states apache not applied", "apache hardening" in completed_evidence.response.lower()),
+                check("misspelled status query stays in provisioning session", expired_status.handled),
+                check("expired runner status derives completed from result", "runner status: `completed`" in expired_status.response.lower()),
+                check("expired runner status still shows effective completed phase", "phase: `completed`" in expired_status.response.lower()),
+                check("expired runner status still shows putty details", "ssh port: `2222`" in expired_status.response.lower()),
+                check("expired runner evidence derives completed from result", "runner status: `completed`" in expired_evidence.response.lower()),
             ]
         )
 

@@ -241,6 +241,10 @@ class ProvisioningChatService:
             return {"job_id": None, "status": None, "result": None}
         status = self.job_queue.get_status(job_id)
         result = self.job_queue.get_result(job_id)
+        if result and result.instance_id:
+            status = "completed"
+        elif result and result.error:
+            status = "failed"
         if result and result.instance_id and not session.instance_id:
             self.sessions.save(session.with_updates(instance_id=result.instance_id))
         return {"job_id": job_id, "status": status, "result": result}
@@ -405,8 +409,13 @@ def _extract_hostname(query: str) -> str | None:
 def _is_status_query(query: str) -> bool:
     return (
         "provisioning status" in query
+        or "provisionning status" in query
+        or "provision status" in query
+        or "vm status" in query
+        or "server status" in query
         or "status of provisioning" in query
-        or query in {"status", "show status"}
+        or query in {"status", "show status", "show me status"}
+        or ("status" in query and any(marker in query for marker in ("provision", "provisionning", "vm", "server", "web server")))
     )
 
 
