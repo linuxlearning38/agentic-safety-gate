@@ -1,7 +1,7 @@
 # AVA v2 Phase 9 — Day-2 Operations
 
 Branch: `v2-development`
-Status: Slice 1 implemented — chat routing, read-only evidence, and approval contract
+Status: Slice 2 started — chat routing, approval contract, operation queue, and snapshot execution
 Target version: `v2.1`
 
 ## Purpose
@@ -75,23 +75,34 @@ that action and returned evidence.
 
 ### Slice 2 — Runner Execution Handlers
 
+Status: started.
+
+Implemented in this slice:
+
+- extended the host runner with a separate server-management operation queue
+- approving a supported server-management operation writes a queued operation to Redis
+- the Windows host runner polls the server-management queue before provisioning jobs
+- approved `snapshot` operations execute through `VBoxManage snapshot <vm> take <name>`
+- snapshot results are written back to Redis with structured evidence
+- chat status/evidence can show the latest server-management operation result
+
+Still pending in this slice:
+
+- live nginx log retrieval through SSH
+- approved nginx restart through SSH
+- live read-only service checks through SSH
+
+Important design note: guest SSH actions need durable runner identity. Earlier
+provisioning used a per-job runner key that may be deleted after cleanup. AVA
+must not pretend to restart nginx or read logs until a durable, protected runner
+SSH identity is added for future provisioned VMs.
+
+### Slice 3 — Rollback And Power Controls
+
 Status: pending.
 
-Next implementation slice:
+After snapshot execution is proven live:
 
-- extend the host runner with a Day-2 operation queue
-- execute read-only live checks through VirtualBox/SSH
-- execute approved nginx restart through SSH
-- write structured Day-2 operation results back to Redis
-- update chat responses from "pending handler" to real evidence
-
-### Slice 3 — Snapshot And Power Controls
-
-Status: pending.
-
-After the restart/logs path is proven:
-
-- snapshot VM
 - rollback to latest AVA snapshot
 - stop VM
 - start VM
@@ -223,12 +234,12 @@ the Docker container.
 Proposed queue extension:
 
 - existing provisioning queue remains for create-VM jobs
-- add a day-2 operation queue:
-  `ava:day2:operations:requested`
+- add a server-management operation queue:
+  `ava:provisioning:day2:operations:approved`
 - result key prefix:
-  `ava:day2:operations:result:<operation_id>`
+  `ava:provisioning:day2:operations:result:<operation_id>`
 - status key prefix:
-  `ava:day2:operations:status:<operation_id>`
+  `ava:provisioning:day2:operations:status:<operation_id>`
 
 This keeps provisioning jobs and management jobs separate while still using the
 same Redis and host-runner pattern.
@@ -241,11 +252,11 @@ same Redis and host-runner pattern.
 4. Add runner-side handlers for read-only status and verify operations.
 5. Add nginx log and nginx status handlers.
 6. Add approval-gated nginx restart.
-7. Add approval-gated VirtualBox snapshot creation.
+7. Add approval-gated VirtualBox snapshot creation. **Implemented in Slice 2.**
 8. Add approval-gated VM start/stop.
 9. Add approval-gated rollback to latest AVA snapshot.
-10. Add chat response formatting for operation evidence. **Started in Slice 1.**
-11. Add regression tests for routing, approval, evidence, and blocked actions. **Started in Slice 1.**
+10. Add chat response formatting for operation evidence. **Started in Slice 1; extended in Slice 2.**
+11. Add regression tests for routing, approval, evidence, and blocked actions. **Started in Slice 1; extended in Slice 2.**
 12. Add one live validation run against an AVA-created web server.
 
 ## Expected User Experience

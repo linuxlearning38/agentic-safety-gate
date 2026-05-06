@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 from control import approval  # noqa: E402
 from control.input_router import route_query  # noqa: E402
 from provisioning.conversation import SessionPhase  # noqa: E402
-from provisioning.runner import ProvisioningJob, ProvisioningJobResult  # noqa: E402
+from provisioning.runner import Day2OperationJob, Day2OperationResult, ProvisioningJob, ProvisioningJobResult  # noqa: E402
 from provisioning.serving import ProvisioningChatService  # noqa: E402
 
 
@@ -32,7 +32,11 @@ class FakeProvisioningJobQueue:
         self.jobs: dict[str, ProvisioningJob] = {}
         self.statuses: dict[str, str] = {}
         self.results: dict[str, ProvisioningJobResult] = {}
+        self.day2_jobs: dict[str, Day2OperationJob] = {}
+        self.day2_statuses: dict[str, str] = {}
+        self.day2_results: dict[str, Day2OperationResult] = {}
         self.counter = 0
+        self.day2_counter = 0
         self.runner_healthy = True
 
     def enqueue_approved_job(self, *, session_id, desired_state, credential_id, username, temporary_password):
@@ -71,6 +75,53 @@ class FakeProvisioningJobQueue:
 
     def is_runner_healthy(self):
         return self.runner_healthy
+
+    def enqueue_day2_operation(
+        self,
+        *,
+        session_id,
+        operation,
+        target,
+        instance_id,
+        instance_name,
+        ssh_host,
+        ssh_port,
+        http_port,
+        metadata=None,
+    ):
+        self.day2_counter += 1
+        operation_id = f"day2-{self.day2_counter:04d}"
+        job = Day2OperationJob(
+            operation_id=operation_id,
+            session_id=session_id,
+            operation=operation,
+            target=target,
+            instance_id=instance_id,
+            instance_name=instance_name,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            http_port=http_port,
+            requested_at="2026-05-02T00:15:00+00:00",
+            metadata=dict(metadata or {}),
+        )
+        self.day2_jobs[operation_id] = job
+        self.day2_statuses[operation_id] = "queued"
+        return job
+
+    def claim_next_day2_operation(self, *, timeout_seconds=1):
+        return None
+
+    def get_day2_status(self, operation_id):
+        return self.day2_statuses.get(operation_id)
+
+    def write_day2_status(self, operation_id, status):
+        self.day2_statuses[operation_id] = status
+
+    def get_day2_result(self, operation_id):
+        return self.day2_results.get(operation_id)
+
+    def write_day2_result(self, result):
+        self.day2_results[result.operation_id] = result
 
 
 def main() -> int:
@@ -290,6 +341,7 @@ def main() -> int:
         day2_approval_id = day2_restart.metadata["provisioning"]["approval_id"]
         day2_approval_entry = approval.get_by_id(day2_approval_id)
         day2_approved = service.handle("user-1", f"approve {day2_approval_id}", route_intent=None)
+        day2_operation_id = day2_approved.response.split("Operation ID: `", 1)[1].split("`", 1)[0]
         day2_snapshot = service.handle("user-1", "take a snapshot before changes", route_intent=None)
         day2_rollback = service.handle("user-1", "rollback to last snapshot", route_intent=None)
         job_queue.statuses.pop("job-0001", None)
@@ -320,7 +372,8 @@ def main() -> int:
                 check("day-2 approval entry is tagged", (day2_approval_entry or {}).get("metadata", {}).get("type") == "day2_operation"),
                 check("day-2 approval records risk", (day2_approval_entry or {}).get("risk") == "medium"),
                 check("day-2 approval is handled", day2_approved.handled),
-                check("day-2 approval does not claim execution", "queued for runner support" in day2_approved.response.lower()),
+                check("day-2 approval queues runner operation", "execution status: `queued`" in day2_approved.response.lower()),
+                check("day-2 approval includes operation id", day2_operation_id in job_queue.day2_jobs),
                 check("day-2 approval hides internal phase name", "day-2" not in day2_approved.response.lower() and "phase 9" not in day2_approved.response.lower()),
                 check("day-2 snapshot requires approval", "operation: `snapshot`" in day2_snapshot.response.lower()),
                 check("day-2 rollback is high risk", "risk: `high`" in day2_rollback.response.lower()),
@@ -329,6 +382,26 @@ def main() -> int:
                 check("expired runner status still shows effective completed phase", "phase: `completed`" in expired_status.response.lower()),
                 check("expired runner status still shows putty details", "ssh port: `2222`" in expired_status.response.lower()),
                 check("expired runner evidence derives completed from result", "runner status: `completed`" in expired_evidence.response.lower()),
+            ]
+        )
+        job_queue.write_day2_status(day2_operation_id, "completed")
+        job_queue.write_day2_result(
+            Day2OperationResult(
+                operation_id=day2_operation_id,
+                operation="restart_nginx",
+                status="completed",
+                instance_id="ava-web-01",
+                instance_name="ava-web-01",
+                evidence={"action": "service_restarted"},
+                completion_timestamp="2026-05-02T00:16:00+00:00",
+                error=None,
+            )
+        )
+        day2_completed_status = service.handle("user-1", "show status of my web server", route_intent=None)
+        failures.extend(
+            [
+                check("day-2 completed operation appears in status", "latest server-management operation" in day2_completed_status.response.lower()),
+                check("day-2 completed operation shows completed", "status: `completed`" in day2_completed_status.response.lower()),
             ]
         )
         service.sessions.update_phase(approved_session.session_id, SessionPhase.BOOTSTRAPPING)

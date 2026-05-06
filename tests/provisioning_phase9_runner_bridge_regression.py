@@ -16,8 +16,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from provisioning.runner import (  # noqa: E402
+    DAY2_OPERATION_QUEUE_KEY,
     JOB_QUEUE_KEY,
     RUNNER_HEARTBEAT_KEY,
+    Day2OperationResult,
     ProvisioningJobResult,
     ProvisioningResultWriter,
     RedisProvisioningJobQueue,
@@ -445,6 +447,69 @@ def test_cleanup_failure_after_verification_does_not_rollback() -> list[bool]:
     ]
 
 
+def test_day2_snapshot_execution_uses_vboxmanage() -> list[bool]:
+    fake = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
+    operation = queue.enqueue_day2_operation(
+        session_id="session-day2-snapshot",
+        operation="snapshot",
+        target="virtualbox_vm",
+        instance_id="ava-web-day2",
+        instance_name="ava-web-day2",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+        http_port=8080,
+        metadata={"approval_id": "abc12345"},
+    )
+    claimed = queue.claim_next_day2_operation(timeout_seconds=1)
+
+    vbox_calls: list[tuple[str, ...]] = []
+
+    class MockAdapter:
+        def get_instance_state(self, iid):
+            return SimpleNamespace(exists=True, power_state="running")
+
+        def _run_vboxmanage(self, *args, timeout=120, check=True):
+            vbox_calls.append(args)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.queue = queue
+    runner.config = HostRunnerConfig(
+        vboxmanage="VBoxManage",
+        ssh_binary="ssh",
+        ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image",
+        work_root=Path(tempfile.gettempdir()) / "ava-day2-test",
+        log_path=Path(tempfile.gettempdir()) / "ava-day2-test.log",
+        retain_debug=False,
+        timeout_seconds=30,
+        max_jobs=1,
+    )
+    runner.adapter = MockAdapter()
+    runner.logger = logging.getLogger("ava.test.day2_snapshot")
+
+    original_validate = HostRunner._validate_vboxmanage
+    try:
+        HostRunner._validate_vboxmanage = lambda self: None
+        runner.execute_day2_operation(claimed)
+    finally:
+        HostRunner._validate_vboxmanage = original_validate
+
+    loaded = queue.get_day2_result(operation.operation_id)
+    snapshot_call = next((call for call in vbox_calls if call[:3] == ("snapshot", "ava-web-day2", "take")), ())
+
+    return [
+        check("day-2 operation is enqueued", len(fake.lists.get(DAY2_OPERATION_QUEUE_KEY, [])) == 0),
+        check("day-2 claim marks picked_up before execution", claimed is not None),
+        check("snapshot uses VBoxManage snapshot take", bool(snapshot_call)),
+        check("running VM snapshot uses live flag", "--live" in snapshot_call),
+        check("day-2 operation status is completed", queue.get_day2_status(operation.operation_id) == "completed"),
+        check("day-2 result is stored", loaded is not None and loaded.status == "completed"),
+        check("day-2 result includes snapshot evidence", loaded is not None and bool(loaded.evidence.get("snapshot_name"))),
+    ]
+
+
 def main() -> int:
     fake = FakeRedis()
     queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
@@ -544,6 +609,9 @@ def main() -> int:
 
     print("\n--- cleanup race must not destroy verified VM (Phase 9 critical fix) ---")
     failures.extend(test_cleanup_failure_after_verification_does_not_rollback())
+
+    print("\n--- server-management operation queue (v2.1 snapshot execution) ---")
+    failures.extend(test_day2_snapshot_execution_uses_vboxmanage())
 
     failed_count = len([item for item in failures if not item])
     if failed_count:
