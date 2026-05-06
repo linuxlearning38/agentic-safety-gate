@@ -33,7 +33,7 @@ Optional legacy-data migration dry run:
 This does not copy or delete anything unless rerun with `-Execute` and explicit
 confirmation.
 
-**4. Install startup hooks (so the runner starts automatically at login):**
+**4. Install startup hooks (so AVA and the runner start automatically at login):**
 ```powershell
 .\scripts\install-runner-task.ps1
 ```

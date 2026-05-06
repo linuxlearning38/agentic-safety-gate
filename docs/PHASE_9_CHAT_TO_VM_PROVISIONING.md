@@ -14,8 +14,9 @@ Status: Functional — Phase 9.5 operational hardening complete (2026-05-04)
 The storage check is non-destructive. The migration script is dry-run by
 default and does not copy anything unless run later with `-Execute` and an
 explicit `YES` confirmation. The runner installer creates a current-user
-Startup-folder hook for the host runner and, where Windows permits it, a daily
-cleanup task at 03:00.
+Startup-folder hook that runs `start-ava.ps1` at login; that startup script
+waits for Docker, starts AVA, and then starts the host runner. Where Windows
+permits it, the installer also creates a daily cleanup task at 03:00.
 
 **Daily startup (or after any reboot):**
 ```powershell
@@ -145,8 +146,9 @@ every login or AVA restart.
 
 **Fix:**
 - `scripts/install-runner-task.ps1` — creates `AVA Host Runner.cmd` in the
-  current user's Windows Startup folder. This avoids admin-only Scheduled Task
-  failures while still starting the runner automatically at login.
+  current user's Windows Startup folder. The hook starts `start-ava.ps1`, not
+  the runner directly, so Docker/Redis/AVA are brought up before the runner
+  tries to connect.
 - `scripts/start-ava.ps1` also starts the runner in step 5, so it comes up with
   the rest of the stack even if the login hook has not fired yet.
 - AVA chat now checks the runner heartbeat before approval. If the runner is
@@ -244,7 +246,7 @@ the containers are restarted with the synced `.env`.
 | `scripts/migrate-ava-data-to-volume.ps1` | Optional dry-run-first migration from WSL bind path to Docker volume |
 | `scripts/sync-ollama-host.ps1` | Detects WSL2 IP, writes `OLLAMA_HOST` to `.env` |
 | `scripts/start-ava.ps1` | One-command full startup orchestrator |
-| `scripts/install-runner-task.ps1` | Installs current-user Startup hook for runner and daily cleanup task where allowed |
+| `scripts/install-runner-task.ps1` | Installs current-user Startup hook for `start-ava.ps1` and daily cleanup task where allowed |
 | `scripts/cleanup-stale-seeds.ps1` | Removes stale `seed.iso` files older than 1 hour |
 
 Modified files: `Dockerfile`, `docker-compose.yml`, `web_agent_v2.1_guardrail.py`,

@@ -1,14 +1,16 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Registers Windows startup hooks for the AVA host runner and seed cleanup.
+    Registers Windows startup hooks for AVA startup and seed cleanup.
 
 .DESCRIPTION
     Run this script ONCE as the user who will operate AVA. It avoids admin-only
     scheduler behavior by installing the host runner through the current user's
     Startup folder.
 
-      "AVA Host Runner.cmd"      starts start_host_runner.ps1 at user login.
+      "AVA Host Runner.cmd"      starts start-ava.ps1 at user login.
+                                 start-ava.ps1 waits for Docker, starts AVA,
+                                 then starts the host runner.
       "AVA Cleanup Stale Seeds"  runs cleanup-stale-seeds.ps1 daily at 03:00
                                  when Windows permits task registration.
 
@@ -23,15 +25,23 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $repoRoot      = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+$startAvaScript = Join-Path $repoRoot "scripts\start-ava.ps1"
 $runnerScript  = Join-Path $repoRoot "scripts\start_host_runner.ps1"
 $cleanupScript = Join-Path $repoRoot "scripts\cleanup-stale-seeds.ps1"
 $wrapperDir    = Join-Path $env:LOCALAPPDATA "AVA"
+$startAvaWrapper = Join-Path $wrapperDir "start-ava.cmd"
 $runnerWrapper = Join-Path $wrapperDir "start-host-runner.cmd"
 $cleanupWrapper = Join-Path $wrapperDir "cleanup-stale-seeds.cmd"
 $startupDir = [Environment]::GetFolderPath("Startup")
 $startupRunner = Join-Path $startupDir "AVA Host Runner.cmd"
 
 New-Item -ItemType Directory -Path $wrapperDir -Force | Out-Null
+
+@"
+@echo off
+cd /d "$repoRoot"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$startAvaScript"
+"@ | Set-Content -Path $startAvaWrapper -Encoding ASCII
 
 @"
 @echo off
@@ -59,14 +69,14 @@ function Register-AvaTask {
     }
 }
 
-# ── AVA Host Runner login startup ─────────────────────────────────────────────
+# ── AVA login startup ────────────────────────────────────────────────────────
 
 @"
 @echo off
-start "AVA Host Runner" /min "$runnerWrapper"
+start "AVA Startup" /min "$startAvaWrapper"
 "@ | Set-Content -Path $startupRunner -Encoding ASCII
 
-Write-Host "Registered: 'AVA Host Runner' (starts at user login via Startup folder)"
+Write-Host "Registered: 'AVA Host Runner' (starts AVA + runner at user login via Startup folder)"
 
 # ── AVA Cleanup Stale Seeds task ─────────────────────────────────────────────
 
@@ -88,6 +98,7 @@ try {
 }
 Write-Host ""
 Write-Host "Generated wrappers:"
+Write-Host "  $startAvaWrapper"
 Write-Host "  $runnerWrapper"
 Write-Host "  $cleanupWrapper"
 Write-Host "  $startupRunner"
