@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import sys
 import tempfile
 
@@ -556,6 +557,33 @@ def main() -> int:
                 check("failed provisioning does not block retry", failed_retry.handled),
                 check("failed provisioning retry starts a new request", "cpu" in failed_retry.response.lower() and "ram" in failed_retry.response.lower()),
                 check("failed provisioning retry avoids active guard", "already active" not in failed_retry.response.lower()),
+            ]
+        )
+        stale_db = temp_dir / "stale_retry_sessions.sqlite3"
+        stale_queue = FakeProvisioningJobQueue()
+        stale_service = ProvisioningChatService(stale_db, job_queue=stale_queue)
+        stale_service.handle("user-stale", "I want a web server", route_intent="provisioning")
+        stale_specs = stale_service.handle("user-stale", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
+        stale_approval_id = stale_specs.metadata["provisioning"]["approval_id"]
+        stale_service.handle("user-stale", f"approve {stale_approval_id}", route_intent=None)
+        stale_session = stale_service.sessions.list_active("user-stale")[0]
+        stale_job_id = stale_session.collected_answers["runner_job_id"]
+        stale_queue.statuses.pop(stale_job_id, None)
+        stale_queue.results.pop(stale_job_id, None)
+        with sqlite3.connect(stale_db) as conn:
+            conn.execute(
+                "UPDATE provisioning_sessions SET updated_at = ? WHERE session_id = ?",
+                ("2026-05-02T00:00:00+00:00", stale_session.session_id),
+            )
+        stale_status = stale_service.handle("user-stale", "show status", route_intent=None)
+        stale_retry = stale_service.handle("user-stale", "I want a web server", route_intent="provisioning")
+        failures.extend(
+            [
+                check("expired redis job state is reported as failed", "phase: `failed`" in stale_status.response.lower()),
+                check("expired redis job state explains stale runner truth", "runner job state expired" in stale_status.response.lower()),
+                check("expired redis job no longer blocks retry", stale_retry.handled),
+                check("expired redis retry starts a clean request", "cpu" in stale_retry.response.lower() and "ram" in stale_retry.response.lower()),
+                check("expired redis retry avoids active guard", "already active" not in stale_retry.response.lower()),
             ]
         )
 
