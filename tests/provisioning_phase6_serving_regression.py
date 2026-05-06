@@ -308,6 +308,20 @@ def main() -> int:
                 check("expired runner evidence derives completed from result", "runner status: `completed`" in expired_evidence.response.lower()),
             ]
         )
+        service.sessions.update_phase(approved_session.session_id, SessionPhase.BOOTSTRAPPING)
+        completed_late_login = service.handle("user-1", "I logged in and changed the password", route_intent=None)
+        completed_late_hardening = service.handle("user-1", "yes harden it", route_intent=None)
+        failures.extend(
+            [
+                check("completed bootstrapping login follow-up is handled", completed_late_login.handled),
+                check("completed bootstrapping login does not fall through to scope response", "v1.0.3 is scoped" not in completed_late_login.response.lower()),
+                check("completed bootstrapping login says no extra step is waiting", "no extra provisioning step" in completed_late_login.response.lower()),
+                check("completed bootstrapping hardening follow-up is handled", completed_late_hardening.handled),
+                check("completed bootstrapping hardening does not fall through to scope response", "v1.0.3 is scoped" not in completed_late_hardening.response.lower()),
+                check("completed bootstrapping hardening says already done", "already done" in completed_late_hardening.response.lower()),
+                check("completed bootstrapping hardening includes baseline summary", "baseline_linux" in completed_late_hardening.response.lower()),
+            ]
+        )
 
         late_start = service.handle("user-late", "I want a web server in Ubuntu", route_intent="provisioning")
         late_specs = service.handle("user-late", "2 CPU, 4 GB RAM, 30 GB disk, hostname ava-web-late", route_intent=None)

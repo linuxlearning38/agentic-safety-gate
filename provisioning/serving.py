@@ -70,6 +70,38 @@ class ProvisioningChatService:
         if _is_web_verification_query(normalized):
             return self._result(_format_verification_response(active, runner), active)
 
+        if _runner_completed(runner) and _is_first_login_confirmation(normalized):
+            session = active
+            if active.phase == SessionPhase.AWAITING_FIRST_LOGIN:
+                session = self.flow.confirm_first_login(active.session_id).session
+            return self._result(
+                "First-login confirmation recorded. The host runner had already completed this VM, "
+                "so there is no extra provisioning step waiting on this confirmation.\n\n"
+                + _format_connection_response(session, runner),
+                session,
+            )
+
+        completed_hardening_answers = _extract_post_login_answers(normalized)
+        if _runner_completed(runner) and completed_hardening_answers and _looks_like_hardening_followup(normalized, active):
+            session = self.sessions.record_answers(active.session_id, completed_hardening_answers)
+            profile = completed_hardening_answers.get("hardening_profile", "baseline_linux")
+            if profile == "none":
+                message = (
+                    "Hardening opt-out noted in the chat session, but the host runner had already "
+                    "completed this VM. In this completed run, no new provisioning or rollback step is started."
+                )
+            else:
+                message = (
+                    "Already done. The host runner already applied `baseline_linux`, bootstrapped nginx, "
+                    "and verified the web server with HTTP 200."
+                )
+            return self._result(
+                message
+                + "\n\n"
+                + "\n".join(_format_hardening_summary(session, runner.get("result"))),
+                session,
+            )
+
         phase = active.phase
         if phase == SessionPhase.AWAITING_VM_TYPE:
             answers = _extract_role_answer(normalized)
@@ -389,6 +421,17 @@ def _extract_post_login_answers(query: str) -> dict[str, Any]:
     if "yes" in query or "harden" in query or "baseline" in query:
         return {"hardening_profile": "baseline_linux", "post_login_actions": ["baseline_linux"]}
     return {}
+
+
+def _looks_like_hardening_followup(query: str, session) -> bool:
+    if any(marker in query for marker in ("harden", "baseline", "skip hardening", "no hardening", "opt out")):
+        return True
+    return query in {"yes", "yes please", "yes harden it"} and session.phase in {
+        SessionPhase.AWAITING_POST_LOGIN_CHOICES,
+        SessionPhase.BOOTSTRAPPING,
+        SessionPhase.VERIFYING,
+        SessionPhase.COMPLETED,
+    }
 
 
 def _extract_hostname(query: str) -> str | None:
