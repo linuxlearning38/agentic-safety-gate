@@ -13,7 +13,7 @@ import socket
 import subprocess
 import tempfile
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.request import urlopen
 
 from provisioning.adapters.virtualbox import VirtualBoxAdapter
@@ -46,9 +46,11 @@ def _run(command: list[str], *, timeout: int = 120, check: bool = True) -> subpr
     return proc
 
 
-def _wait_for_tcp(host: str, port: int, timeout_seconds: int) -> bool:
+def _wait_for_tcp(host: str, port: int, timeout_seconds: int, *, heartbeat: Callable[[], None] | None = None) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
+        if heartbeat:
+            heartbeat()
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(3)
             try:
@@ -59,10 +61,17 @@ def _wait_for_tcp(host: str, port: int, timeout_seconds: int) -> bool:
     return False
 
 
-def _wait_for_http_200(url: str, timeout_seconds: int) -> tuple[bool, str]:
+def _wait_for_http_200(
+    url: str,
+    timeout_seconds: int,
+    *,
+    heartbeat: Callable[[], None] | None = None,
+) -> tuple[bool, str]:
     deadline = time.monotonic() + timeout_seconds
     last_error = ""
     while time.monotonic() < deadline:
+        if heartbeat:
+            heartbeat()
         try:
             with urlopen(url, timeout=5) as response:
                 status = getattr(response, "status", None) or response.getcode()
@@ -75,10 +84,19 @@ def _wait_for_http_200(url: str, timeout_seconds: int) -> tuple[bool, str]:
     return False, last_error
 
 
-def _wait_for_executor_command(executor: SSHExecutor, command: str, timeout_seconds: int, *, redact: tuple[str, ...]):
+def _wait_for_executor_command(
+    executor: SSHExecutor,
+    command: str,
+    timeout_seconds: int,
+    *,
+    redact: tuple[str, ...],
+    heartbeat: Callable[[], None] | None = None,
+):
     deadline = time.monotonic() + timeout_seconds
     last_result = None
     while time.monotonic() < deadline:
+        if heartbeat:
+            heartbeat()
         last_result = executor.run(command, timeout_seconds=30, redact_patterns=redact)
         if last_result.exit_code == 0:
             return last_result
@@ -197,27 +215,52 @@ class HostRunner:
         processed = 0
         self.logger.info("AVA host runner started")
         while True:
+            self._write_idle_heartbeat()
             if self.config.max_jobs is not None and processed >= self.config.max_jobs:
                 self.logger.info("Max jobs reached; exiting")
                 return
             job = self.queue.claim_next_job(timeout_seconds=self.config.poll_timeout_seconds)
             if job is None:
                 continue
+            self._write_processing_heartbeat(job)
             processed += 1
             self.execute_job(job)
 
     def run_once(self) -> bool:
+        self._write_idle_heartbeat()
         job = self.queue.claim_next_job(timeout_seconds=self.config.poll_timeout_seconds)
         if job is None:
             return False
+        self._write_processing_heartbeat(job)
         self.execute_job(job)
         return True
+
+    def _write_idle_heartbeat(self) -> None:
+        self.queue.write_runner_heartbeat(
+            "idle",
+            {
+                "pid": os.getpid(),
+                "template_name": self.config.template_name,
+                "work_root": str(self.config.work_root),
+            },
+        )
+
+    def _write_processing_heartbeat(self, job: ProvisioningJob) -> None:
+        self.queue.write_runner_heartbeat(
+            "processing",
+            {
+                "pid": os.getpid(),
+                "job_id": job.job_id,
+                "session_id": job.session_id,
+            },
+        )
 
     def execute_job(self, job: ProvisioningJob) -> None:
         instance_id: str | None = None
         work_dir = self.config.work_root / job.job_id
         secret_patterns = (str(job.credentials_seed_data.get("temporary_password") or ""),)
         self.logger.info("Picked up job %s for session %s", job.job_id, job.session_id)
+        heartbeat = lambda: self._write_processing_heartbeat(job)
         try:
             self._validate_binaries()
             work_dir.mkdir(parents=True, exist_ok=True)
@@ -272,7 +315,7 @@ class HostRunner:
 
             connection = self.adapter.get_connection_info(instance_id)
             self.adapter.start_instance(instance_id)
-            if not _wait_for_tcp(connection.host, connection.port, self.config.timeout_seconds):
+            if not _wait_for_tcp(connection.host, connection.port, self.config.timeout_seconds, heartbeat=heartbeat):
                 raise RuntimeError(f"SSH TCP did not become reachable at {connection.host}:{connection.port}")
 
             # ava-runner holds the key; avaadmin has chage -d 0 (expired by design)
@@ -292,6 +335,7 @@ class HostRunner:
                 "cloud-init status --wait >/tmp/ava-cloud-init-status.txt 2>&1; test -f /var/tmp/ava-cloud-init-ready; cat /var/tmp/ava-cloud-init-ready",
                 self.config.timeout_seconds,
                 redact=secret_patterns,
+                heartbeat=heartbeat,
             )
             if not cloud_init or cloud_init.exit_code != 0 or f"AVA_CLOUD_INIT_READY {vm_name}" not in cloud_init.stdout:
                 if cloud_init:
@@ -323,7 +367,11 @@ class HostRunner:
             http_port = connection.metadata.get("http_host_port")
             if not http_port:
                 raise RuntimeError("HTTP host port was not configured")
-            ok, detail = _wait_for_http_200(f"http://127.0.0.1:{http_port}/", timeout_seconds=120)
+            ok, detail = _wait_for_http_200(
+                f"http://127.0.0.1:{http_port}/",
+                timeout_seconds=120,
+                heartbeat=heartbeat,
+            )
             if not ok:
                 raise RuntimeError(f"HTTP verification failed: {detail}")
 

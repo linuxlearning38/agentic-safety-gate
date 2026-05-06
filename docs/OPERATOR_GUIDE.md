@@ -17,7 +17,7 @@ cd C:\path\to\devops-agent
 Copy-Item .env.example .env   # if it exists; otherwise .env is already present
 ```
 
-**3. Register Scheduled Tasks (so the runner starts automatically at login):**
+**3. Check AVA storage:**
 ```powershell
 .\scripts\check-ava-storage.ps1
 ```
@@ -33,7 +33,7 @@ Optional legacy-data migration dry run:
 This does not copy or delete anything unless rerun with `-Execute` and explicit
 confirmation.
 
-**4. Register Scheduled Tasks (so the runner starts automatically at login):**
+**4. Install startup hooks (so the runner starts automatically at login):**
 ```powershell
 .\scripts\install-runner-task.ps1
 ```
@@ -60,6 +60,7 @@ This handles everything:
 - Brings up all containers
 - Waits for the health check to pass
 - Starts the VM provisioning runner in the background
+- Lets AVA verify the runner heartbeat before accepting VM approvals
 
 ---
 
@@ -69,7 +70,7 @@ This handles everything:
 docker compose down
 ```
 
-This stops all containers but preserves data in `/home/manoj/ava-data`.
+This stops all containers but preserves data in the Docker volume `ava_data`.
 
 ---
 
@@ -122,13 +123,19 @@ Most common causes:
 The WSL2 IP changed.  Run `.\scripts\start-ava.ps1` to sync and restart.
 
 ### VM provisioning jobs do not run
-The host runner is not started.  Check:
+The host runner is probably not started. AVA checks the runner heartbeat before
+approval; if the runner is missing, AVA should refuse to issue credentials or
+queue a VM job.
+
+Check the Windows host runner process:
 ```powershell
-Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'host_runner' }
+Get-CimInstance Win32_Process |
+  Where-Object { $_.CommandLine -match 'provisioning.runner.host_runner|host_runner.py' } |
+  Select-Object ProcessId,CommandLine
 ```
-If nothing appears, start it:
+If nothing appears, start the full AVA stack:
 ```powershell
-.\scripts\start_host_runner.ps1
+.\scripts\start-ava.ps1
 ```
 
 ### seed.iso files piling up in `.ava-runner/`
