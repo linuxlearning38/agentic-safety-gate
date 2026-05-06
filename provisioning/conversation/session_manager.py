@@ -206,6 +206,14 @@ class SessionManager:
             ).fetchall()
         return [self._from_row(row) for row in rows]
 
+    def list_recent(self, user_id: str, *, limit: int = 5) -> list[ProvisioningSession]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM provisioning_sessions WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
+                (user_id, int(limit)),
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
+
     def _from_row(self, row: sqlite3.Row) -> ProvisioningSession:
         return ProvisioningSession(
             session_id=row["session_id"],

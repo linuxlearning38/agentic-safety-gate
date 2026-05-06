@@ -3461,8 +3461,8 @@ def _resolve_general_unknown_response(query, prior_messages=None, route=None):
     if route.intent == "general_qwen":
         return {
             "response": (
-                "AVA v1.0.3 is scoped to DevOps and infrastructure operations. "
-                "I can help with Kubernetes, Docker, Linux, CI/CD, observability, and guarded operational actions. "
+                "AVA is focused on DevOps and infrastructure operations. "
+                "I can help with Kubernetes, Docker, Linux, CI/CD, observability, server provisioning, and guarded operational actions. "
                 "If your question is infra-related, include system context (for example: cluster, host, service, or runtime)."
             ),
             "confidence": "high",
@@ -6276,7 +6276,7 @@ HTML_TEMPLATE = r'''
 
         .message-content {
             flex: 1 1 auto;
-            max-width: 820px;
+            max-width: min(820px, calc(100vw - 420px));
             min-width: 0;
             width: 100%;
             padding-top: 2px;
@@ -6319,6 +6319,7 @@ HTML_TEMPLATE = r'''
             white-space: normal;
             overflow-wrap: anywhere;
             word-break: break-word;
+            max-width: 100%;
         }
 
         .message-actions {
@@ -6552,9 +6553,9 @@ HTML_TEMPLATE = r'''
 
         .main-content {
             flex: 1 1 auto;
-            width: calc(100vw - 332px);
+            width: auto;
             max-width: none;
-            min-width: 480px;
+            min-width: 0;
         }
 
         .workspace-bar,
@@ -6568,6 +6569,7 @@ HTML_TEMPLATE = r'''
         .loading-message,
         .input-wrapper {
             max-width: min(980px, 100%);
+            min-width: 0;
         }
 
         .input-container {
@@ -7046,7 +7048,7 @@ HTML_TEMPLATE = r'''
                 </div>
                 <div class="workspace-pills">
                     <span class="workspace-pill primary">AVA Runtime</span>
-                    <span class="workspace-pill">Qwen 2.5 14B</span>
+                    <span class="workspace-pill">Local Reasoning</span>
                     <span class="workspace-pill">Approval Guard</span>
                     <span class="workspace-pill" id="workspaceSecurityPill">Security: Healthy</span>
                     <button type="button" class="theme-inline-toggle" id="themeInlineToggle" onclick="toggleThemeMode()" aria-label="Switch to light mode">☀ Light</button>
@@ -7152,13 +7154,13 @@ HTML_TEMPLATE = r'''
                         </button>
                         <div class="composer-meta">
                             <span class="composer-pill">Local</span>
-                            <span class="composer-pill">Qwen 2.5 14B</span>
+                            <span class="composer-pill">Local Reasoning</span>
                             <span class="composer-pill">Approval-aware</span>
                         </div>
                     </div>
                     <div class="disclaimer">
                         AVA is a DevOps AI agent that can make mistakes. Verify important information.
-                        <span style="color: #667eea; margin-left: 8px;">• Powered by Qwen 2.5 14B</span>
+                        <span style="color: #667eea; margin-left: 8px;">• Powered by AVA local runtime</span>
                     </div>
                 </div>
             </div>
@@ -7211,8 +7213,8 @@ HTML_TEMPLATE = r'''
                     </label>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-label">Model</div>
-                    <div style="color: var(--text-main);">Qwen 2.5 14B (Local)</div>
+                    <div class="stat-label">Reasoning</div>
+                    <div style="color: var(--text-main);">AVA local runtime</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Security</div>

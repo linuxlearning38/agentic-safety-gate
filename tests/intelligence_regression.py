@@ -1511,8 +1511,8 @@ def main():
     check("controlled configmap definition response is grounded", "configmap" in configmap_resolved["response"].lower() and "configuration data" in configmap_resolved["response"].lower())
     general_resolved = ns["_resolve_general_unknown_response"]("What is machine learning?")
     check(
-        "controlled general response enforces v1 scope boundary",
-        "scoped to devops" in general_resolved["response"].lower() and general_resolved["sources_used"] == 0,
+        "controlled general response enforces AVA scope boundary",
+        "focused on devops" in general_resolved["response"].lower() and general_resolved["sources_used"] == 0,
     )
     unrelated_context = [
         "A cooking article about tomatoes and olive oil.",
