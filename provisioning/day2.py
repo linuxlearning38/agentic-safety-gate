@@ -89,7 +89,7 @@ def format_approval_required_response(
             "AVA will require approval before this can proceed."
         )
     return (
-        "Approval required for Phase 9 Day-2 operation.\n\n"
+        f"Approval required to {_human_action(operation)}.\n\n"
         f"- Operation: `{operation.operation}`\n"
         f"- Target: `{operation.target}`\n"
         f"- VM: `{result.instance_name or result.instance_id}`\n"
@@ -97,7 +97,7 @@ def format_approval_required_response(
         f"- Approval ID: `{approval_id}`"
         f"{warning}\n\n"
         f"To approve, reply: `approve {approval_id}`.\n\n"
-        "No Day-2 change has been made yet."
+        "No change has been made yet."
     )
 
 
@@ -105,13 +105,13 @@ def format_approved_pending_response(operation: Day2Operation, *, session: Any, 
     """Format approved Day-2 operations before runner execution exists."""
 
     return (
-        "Day-2 approval recorded.\n\n"
+        "Approval recorded.\n\n"
         f"- Operation: `{operation.operation}`\n"
         f"- Target: `{operation.target}`\n"
         f"- VM: `{result.instance_name or result.instance_id}`\n"
-        "- Execution status: `pending Day-2 runner handler`\n\n"
+        "- Execution status: `pending runner handler`\n\n"
         "No VM or service change has been executed by this approval yet. The next implementation slice "
-        "will connect approved Day-2 operations to the Windows host runner."
+        "will connect approved server-management operations to the Windows host runner."
     )
 
 
@@ -155,7 +155,7 @@ def _is_start_vm(query: str) -> bool:
 
 def _format_status(*, session: Any, result: ProvisioningJobResult) -> str:
     return (
-        "Day-2 status for the active AVA-managed web server:\n\n"
+        "Web server status:\n\n"
         f"- VM: `{result.instance_name or result.instance_id}`\n"
         f"- Instance ID: `{result.instance_id}`\n"
         f"- SSH / PuTTY: `{result.ssh_host}:{result.ssh_port}`\n"
@@ -164,7 +164,7 @@ def _format_status(*, session: Any, result: ProvisioningJobResult) -> str:
         f"- Last verified: `{result.completion_timestamp}`\n"
         f"- Evidence timestamp: `{_utc_now()}`\n\n"
         "Current source of truth: stored runner result from the completed provisioning session. "
-        "Live Day-2 power/service checks will be added through the host runner in the next slice."
+        "Live power and service checks will be added through the host runner in the next slice."
     )
 
 
@@ -179,23 +179,33 @@ def _format_verify(*, session: Any, result: ProvisioningJobResult) -> str:
     if not check_lines:
         check_lines = ["- runner verification evidence exists, but no detailed check list was stored"]
     return (
-        "Day-2 web-server verification from stored runner evidence:\n\n"
+        "Web-server verification from stored runner evidence:\n\n"
         f"- VM: `{result.instance_name or result.instance_id}`\n"
         f"- HTTP: `http://127.0.0.1:{result.http_port}/`\n"
         f"- Completed: `{result.completion_timestamp}`\n\n"
         + "\n".join(check_lines)
-        + "\n\nLive re-verification through the host runner is the next Day-2 implementation slice."
+        + "\n\nLive re-verification through the host runner is the next implementation slice."
     )
 
 
 def _format_nginx_logs(*, session: Any, result: ProvisioningJobResult) -> str:
     return (
-        "Day-2 nginx log request recognized for the active AVA-managed web server.\n\n"
+        "Nginx log request recognized for the active AVA-managed web server.\n\n"
         f"- VM: `{result.instance_name or result.instance_id}`\n"
         f"- SSH / PuTTY: `{result.ssh_host}:{result.ssh_port}`\n"
         "- Current evidence: nginx was active during runner verification\n"
-        "- Live log retrieval: `pending Day-2 runner handler`\n\n"
+        "- Live log retrieval: `pending runner handler`\n\n"
         "No SSH log command was executed from chat yet. The next implementation slice will run "
         "`journalctl -u nginx` and recent access/error log checks through the Windows host runner."
     )
 
+
+def _human_action(operation: Day2Operation) -> str:
+    labels = {
+        "restart_nginx": "restart nginx",
+        "snapshot": "take a VM snapshot",
+        "rollback_snapshot": "roll back the VM to the latest AVA snapshot",
+        "stop_vm": "stop the VM",
+        "start_vm": "start the VM",
+    }
+    return labels.get(operation.operation, operation.description)
