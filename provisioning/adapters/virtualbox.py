@@ -429,6 +429,8 @@ class VirtualBoxAdapter(ProviderAdapter):
             "dvddrive",
             "--medium",
             seed_iso_path,
+            "--hotpluggable",
+            "on",
             "--tempeject",
             "on",
         )
