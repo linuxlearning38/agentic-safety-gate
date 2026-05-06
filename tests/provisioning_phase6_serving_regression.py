@@ -127,6 +127,24 @@ class FakeProvisioningJobQueue:
                 },
                 completion_timestamp="2026-05-02T00:15:30+00:00",
             )
+        if operation == "nginx_logs":
+            self.day2_statuses[operation_id] = "completed"
+            self.day2_results[operation_id] = Day2OperationResult(
+                operation_id=operation_id,
+                operation="nginx_logs",
+                status="completed",
+                instance_id=instance_id,
+                instance_name=instance_name,
+                evidence={
+                    "action": "nginx_logs",
+                    "journalctl_tail": "nginx.service active",
+                    "access_log_tail": "GET / HTTP/1.1 200",
+                    "error_log_tail": "",
+                    "ssh_host": ssh_host,
+                    "ssh_port": ssh_port,
+                },
+                completion_timestamp="2026-05-02T00:15:45+00:00",
+            )
         return job
 
     def claim_next_day2_operation(self, *, timeout_seconds=1):
@@ -389,7 +407,7 @@ def main() -> int:
                 check("day-2 status reports active vm", "ava-web-01" in day2_status.response),
                 check("day-2 logs are handled", day2_logs.handled),
                 check("day-2 status hides internal phase name", "day-2" not in day2_status.response.lower() and "phase 9" not in day2_status.response.lower()),
-                check("day-2 logs does not pretend live ssh ran", "not enabled yet" in day2_logs.response.lower()),
+                check("day-2 logs uses live runner evidence", "live nginx logs" in day2_logs.response.lower()),
                 check("day-2 logs hides internal phase name", "day-2" not in day2_logs.response.lower() and "phase 9" not in day2_logs.response.lower()),
                 check("day-2 restart requires approval", "approval required" in day2_restart.response.lower()),
                 check("day-2 restart hides internal phase name", "day-2" not in day2_restart.response.lower() and "phase 9" not in day2_restart.response.lower()),

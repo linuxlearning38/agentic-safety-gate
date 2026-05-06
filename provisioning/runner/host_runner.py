@@ -154,6 +154,12 @@ local-hostname: {vm_name}
     (seed_dir / "meta-data").write_text(meta_data, encoding="utf-8")
 
 
+def _split_nginx_log_output(stdout: str) -> tuple[str, str, str]:
+    service_log, _, rest = (stdout or "").partition("--- AVA_ACCESS_LOG ---")
+    access_log, _, error_log = rest.partition("--- AVA_ERROR_LOG ---")
+    return service_log.strip(), access_log.strip(), error_log.strip()
+
+
 @dataclass(slots=True)
 class HostRunnerConfig:
     """Runtime config for the manually started v2.0.0 host runner."""
@@ -292,10 +298,12 @@ class HostRunner:
                 result = self._execute_snapshot(operation)
             elif operation.operation == "verify":
                 result = self._execute_live_verify(operation)
+            elif operation.operation == "nginx_logs":
+                result = self._execute_nginx_logs(operation)
             else:
                 raise RuntimeError(
                     f"Operation '{operation.operation}' is approved but not executable yet. "
-                    "Snapshot and live web verification are enabled first; guest SSH actions require durable runner identity."
+                    "Snapshot, live web verification, and nginx log retrieval are enabled first."
                 )
             self.queue.write_day2_status(operation.operation_id, result.status)
             self.queue.write_day2_result(result)
@@ -432,6 +440,90 @@ class HostRunner:
             error=None if passed else {"message": "one or more live verification checks failed"},
         )
 
+    def _execute_nginx_logs(self, operation: Day2OperationJob) -> Day2OperationResult:
+        self._validate_binaries()
+        key_path = self._find_runner_key_path(operation)
+        if not key_path:
+            return Day2OperationResult(
+                operation_id=operation.operation_id,
+                operation=operation.operation,
+                status="failed",
+                instance_id=operation.instance_id,
+                instance_name=operation.instance_name,
+                evidence={
+                    "action": "nginx_logs",
+                    "runner_key_available": False,
+                    "runner": "host_runner",
+                },
+                error={
+                    "message": (
+                        "Runner SSH key is not available for this VM. Live guest log retrieval "
+                        "requires a retained AVA runner key from provisioning."
+                    ),
+                    "failure_class": "ssh_auth_failed",
+                },
+            )
+
+        connection = self.adapter.get_connection_info(operation.instance_id)
+        executor = SSHExecutor(
+            SSHConnection(
+                host=connection.host,
+                port=connection.port,
+                username="ava-runner",
+                private_key_path=str(key_path),
+                known_hosts_path=str(self.config.work_root / "known_hosts_day2"),
+                ssh_binary=self.config.ssh_binary,
+            )
+        )
+        command = (
+            "set -o pipefail; "
+            "sudo journalctl -u nginx --no-pager -n 40 2>&1; "
+            "printf '\\n--- AVA_ACCESS_LOG ---\\n'; "
+            "sudo tail -n 30 /var/log/nginx/access.log 2>&1 || true; "
+            "printf '\\n--- AVA_ERROR_LOG ---\\n'; "
+            "sudo tail -n 30 /var/log/nginx/error.log 2>&1 || true"
+        )
+        log_result = executor.run(command, timeout_seconds=45)
+        stdout = log_result.stdout or ""
+        service_log, access_log, error_log = _split_nginx_log_output(stdout)
+        status = "completed" if log_result.exit_code == 0 else "failed"
+        return Day2OperationResult(
+            operation_id=operation.operation_id,
+            operation=operation.operation,
+            status=status,
+            instance_id=operation.instance_id,
+            instance_name=operation.instance_name,
+            evidence={
+                "action": "nginx_logs",
+                "journalctl_tail": service_log,
+                "access_log_tail": access_log,
+                "error_log_tail": error_log or log_result.stderr,
+                "ssh_host": operation.ssh_host or connection.host,
+                "ssh_port": operation.ssh_port or connection.port,
+                "runner": "host_runner",
+            },
+            error=None if status == "completed" else {
+                "message": (log_result.stderr or "nginx log command failed").strip()[:500],
+                "failure_class": log_result.failure_class or "unknown",
+            },
+        )
+
+    def _find_runner_key_path(self, operation: Day2OperationJob) -> Path | None:
+        candidates: list[Path] = []
+        metadata_key = str((operation.metadata or {}).get("runner_key_path") or "").strip()
+        if metadata_key:
+            candidates.append(Path(metadata_key))
+        if operation.instance_name:
+            candidates.append(self.config.work_root / "keys" / f"{operation.instance_name}_ava_runner_ed25519")
+        candidates.append(self.config.work_root / "keys" / f"{operation.instance_id}_ava_runner_ed25519")
+        runner_job_id = str((operation.metadata or {}).get("runner_job_id") or "").strip()
+        if runner_job_id:
+            candidates.append(self.config.work_root / runner_job_id / "ava_runner_ed25519")
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
     def execute_job(self, job: ProvisioningJob) -> None:
         instance_id: str | None = None
         work_dir = self.config.work_root / job.job_id
@@ -460,6 +552,11 @@ class HostRunner:
             seed_iso = work_dir / "seed.iso"
             _run([self.config.ssh_keygen, "-t", "ed25519", "-N", "", "-f", str(key_path), "-C", f"ava-runner-{vm_name}"], timeout=30)
             public_key = (key_path.with_suffix(".pub")).read_text(encoding="utf-8").strip()
+            retained_key_dir = self.config.work_root / "keys"
+            retained_key_dir.mkdir(parents=True, exist_ok=True)
+            retained_key_path = retained_key_dir / f"{vm_name}_ava_runner_ed25519"
+            shutil.copy2(key_path, retained_key_path)
+            shutil.copy2(key_path.with_suffix(".pub"), retained_key_path.with_suffix(".pub"))
             _write_cloud_init_seed(seed_dir, vm_name, username, temporary_password, public_key)
             _run(
                 [

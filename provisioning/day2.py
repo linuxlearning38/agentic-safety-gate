@@ -99,6 +99,41 @@ def format_live_verify_response(operation_result: Day2OperationResult, *, result
     )
 
 
+def format_live_nginx_logs_response(operation_result: Day2OperationResult, *, result: ProvisioningJobResult) -> str:
+    """Format fresh nginx log evidence collected by the host runner."""
+
+    evidence = dict(operation_result.evidence or {})
+    if operation_result.status != "completed":
+        error = operation_result.error or {}
+        return (
+            "Live nginx log retrieval could not complete.\n\n"
+            f"- VM: `{operation_result.instance_name or operation_result.instance_id}`\n"
+            f"- Status: `{operation_result.status}`\n"
+            f"- Error: `{error.get('message') or error.get('failure_class') or 'log retrieval failed'}`\n"
+            f"- Checked: `{operation_result.completion_timestamp}`"
+        )
+
+    return (
+        "Live nginx logs from the host runner:\n\n"
+        f"- VM: `{operation_result.instance_name or operation_result.instance_id}`\n"
+        f"- SSH / PuTTY: `{result.ssh_host or evidence.get('ssh_host', 'unknown')}:{result.ssh_port or evidence.get('ssh_port', 'unknown')}`\n"
+        f"- Status: `{operation_result.status}`\n"
+        f"- Collected: `{operation_result.completion_timestamp}`\n\n"
+        "Recent nginx service log:\n"
+        "```text\n"
+        f"{str(evidence.get('journalctl_tail') or '').strip()[:2500] or 'no journal output returned'}\n"
+        "```\n\n"
+        "Recent nginx access log:\n"
+        "```text\n"
+        f"{str(evidence.get('access_log_tail') or '').strip()[:1200] or 'no access log output returned'}\n"
+        "```\n\n"
+        "Recent nginx error log:\n"
+        "```text\n"
+        f"{str(evidence.get('error_log_tail') or '').strip()[:1200] or 'no error log output returned'}\n"
+        "```"
+    )
+
+
 def format_live_verify_queued_response(operation_id: str, *, result: ProvisioningJobResult) -> str:
     return (
         "Live verification has been queued for the Windows host runner.\n\n"
@@ -106,6 +141,16 @@ def format_live_verify_queued_response(operation_id: str, *, result: Provisionin
         f"- Operation ID: `{operation_id}`\n"
         "- Status: `queued`\n\n"
         "Ask `verify the web server` again in a few seconds to see the fresh evidence."
+    )
+
+
+def format_live_nginx_logs_queued_response(operation_id: str, *, result: ProvisioningJobResult) -> str:
+    return (
+        "Live nginx log retrieval has been queued for the Windows host runner.\n\n"
+        f"- VM: `{result.instance_name or result.instance_id}`\n"
+        f"- Operation ID: `{operation_id}`\n"
+        "- Status: `queued`\n\n"
+        "Ask `show nginx logs` again in a few seconds to see the fresh logs."
     )
 
 
