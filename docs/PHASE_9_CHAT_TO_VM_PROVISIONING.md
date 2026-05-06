@@ -3,6 +3,8 @@
 Branch: `v2-development`
 Status: Functional — Phase 9.5 operational hardening and May 5-6 product polish complete
 
+Next phase document: `docs/AVA_V2_PHASE9_DAY2_OPERATIONS.md`
+
 ## Operator Quickstart
 
 **One-time setup (run once per Windows user account):**
@@ -457,3 +459,27 @@ Phase 9.5 adds: startup and recovery are product-safe. The preferred path is
 `.\scripts\start-ava.ps1` or the login startup hook installed by
 `.\scripts\install-runner-task.ps1`; if the runner is not alive, AVA blocks
 approval rather than issuing credentials for a job that cannot execute.
+
+---
+
+## Next: Phase 9 Day-2 Operations (`v2.1`)
+
+Phase 9 does not stop at VM creation. The next product chapter is **Phase 9
+Day-2 Operations**, documented in
+`docs/AVA_V2_PHASE9_DAY2_OPERATIONS.md`.
+
+The goal is simple: AVA created the server, so AVA should also manage it.
+
+Initial v2.1 focus:
+
+- show VM/web-server status
+- verify the web server
+- show nginx logs
+- restart nginx with approval
+- take VirtualBox snapshots with approval
+- roll back to the latest AVA snapshot with approval
+- stop/start the VM with approval
+- return evidence after every operation
+
+This comes before PostgreSQL or multi-VM work because every future server role
+will need the same Day-2 management layer.
