@@ -29,7 +29,7 @@ def check(name: str, condition: bool, detail: str = "") -> bool:
 
 
 class FakeProvisioningJobQueue:
-    def __init__(self):
+    def __init__(self, *, live_verify_status: str = "completed"):
         self.jobs: dict[str, ProvisioningJob] = {}
         self.statuses: dict[str, str] = {}
         self.results: dict[str, ProvisioningJobResult] = {}
@@ -39,6 +39,7 @@ class FakeProvisioningJobQueue:
         self.counter = 0
         self.day2_counter = 0
         self.runner_healthy = True
+        self.live_verify_status = live_verify_status
 
     def enqueue_approved_job(self, *, session_id, desired_state, credential_id, username, temporary_password):
         self.counter += 1
@@ -108,6 +109,29 @@ class FakeProvisioningJobQueue:
         self.day2_jobs[operation_id] = job
         self.day2_statuses[operation_id] = "queued"
         if operation == "verify":
+            if self.live_verify_status == "failed":
+                self.day2_statuses[operation_id] = "failed"
+                self.day2_results[operation_id] = Day2OperationResult(
+                    operation_id=operation_id,
+                    operation="verify",
+                    status="failed",
+                    instance_id=instance_id,
+                    instance_name=instance_name,
+                    evidence={
+                        "action": "live_web_verify",
+                        "checks": [
+                            {"name": "vm_exists", "passed": False, "evidence": "provider_status=missing"},
+                            {"name": "vm_running", "passed": False, "evidence": "power_state=not_running"},
+                            {"name": "host_http_200", "passed": False, "evidence": f"http://127.0.0.1:{http_port}/ unreachable"},
+                        ],
+                        "http_port": http_port,
+                        "ssh_host": ssh_host,
+                        "ssh_port": ssh_port,
+                    },
+                    completion_timestamp="2026-05-02T00:15:30+00:00",
+                    error={"failure_class": "live_verify_failed", "message": "VM is not running or no longer exists"},
+                )
+                return job
             self.day2_statuses[operation_id] = "completed"
             self.day2_results[operation_id] = Day2OperationResult(
                 operation_id=operation_id,
@@ -521,6 +545,40 @@ def main() -> int:
                 check("explicit second server asks for specs", "cpu" in explicit_second_server.response.lower() and "ram" in explicit_second_server.response.lower()),
             ]
         )
+
+        missing_live_queue = FakeProvisioningJobQueue(live_verify_status="failed")
+        missing_live_service = ProvisioningChatService(temp_dir / "missing_live_sessions.sqlite3", job_queue=missing_live_queue)
+        missing_live_service.handle("user-missing-live", "I want a web server", route_intent="provisioning")
+        missing_live_specs = missing_live_service.handle("user-missing-live", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
+        missing_live_approval_id = missing_live_specs.metadata["provisioning"]["approval_id"]
+        missing_live_service.handle("user-missing-live", f"approve {missing_live_approval_id}", route_intent=None)
+        missing_live_queue.write_status("job-0001", "completed")
+        missing_live_queue.write_result(
+            ProvisioningJobResult(
+                job_id="job-0001",
+                instance_id="ava-web-deleted",
+                instance_name="ava-web-deleted",
+                ssh_host="127.0.0.1",
+                ssh_port=2222,
+                http_port=8080,
+                verification_evidence={"checks": [{"name": "host_http_200", "passed": True, "evidence": "old HTTP 200"}]},
+                completion_timestamp="2026-05-02T00:25:00+00:00",
+                error=None,
+            )
+        )
+        missing_live_verify = missing_live_service.handle("user-missing-live", "verify the web server", route_intent=None)
+        missing_live_status = missing_live_service.handle("user-missing-live", "show status of my web server", route_intent=None)
+        failures.extend(
+            [
+                check("missing live VM verify is handled", missing_live_verify.handled),
+                check("missing live VM verify reports live failure", "could not confirm the server" in missing_live_verify.response.lower()),
+                check("missing live VM verify does not recycle stored success", "old http 200" not in missing_live_verify.response.lower()),
+                check("missing live VM verify shows failed vm_exists", "vm_exists: `failed`" in missing_live_verify.response.lower()),
+                check("missing live VM status labels stored evidence", "stored provisioning result" in missing_live_status.response.lower()),
+                check("missing live VM status shows failed live verification", "latest live verification: `failed`" in missing_live_status.response.lower()),
+            ]
+        )
+
         failed_service = ProvisioningChatService(temp_dir / "failed_retry_sessions.sqlite3", job_queue=job_queue)
         failed_service.handle("user-failed", "I want a web server", route_intent="provisioning")
         failed_specs = failed_service.handle("user-failed", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
