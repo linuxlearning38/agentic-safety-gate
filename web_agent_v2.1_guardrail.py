@@ -1996,6 +1996,9 @@ def _resolve_follow_up_response(query):
     route = _route_query(query)
     if route.intent != "follow_up":
         return None
+    diagram_follow_up = _resolve_diagram_follow_up_response(query)
+    if diagram_follow_up:
+        return diagram_follow_up
     operational = _resolve_operational_follow_up_response(query)
     if operational:
         return operational
@@ -2007,6 +2010,51 @@ def _resolve_follow_up_response(query):
         "confidence": plan.confidence,
         "sources_used": len(recent_turns[:2]),
         "topic": plan.topic,
+    }
+
+
+_DIAGRAM_FOLLOW_UP_MARKERS = (
+    "in diagram", "show it in diagram", "show that in diagram",
+    "show it as diagram", "show that as diagram", "draw that",
+)
+
+
+def _is_diagram_follow_up_query(query: str) -> bool:
+    q = _normalize_text(query).lower().strip(" ?!.")
+    return any(marker == q or marker in q for marker in _DIAGRAM_FOLLOW_UP_MARKERS)
+
+
+def _resolve_diagram_follow_up_response(query):
+    if not _is_diagram_follow_up_query(query):
+        return None
+    recent_turns = _get_recent_distinct_turns(limit=6)
+    for turn in reversed(recent_turns):
+        prior_query = _normalize_text(turn.get("query")).strip()
+        prior_response = _normalize_text(turn.get("response")).strip()
+        prior_intent = _normalize_text(turn.get("intent")).strip().lower()
+        prior_text = f"{prior_query}\n{prior_response}"
+        if prior_intent in {"architecture", "ava_self"} or _is_ava_self_architecture_query(prior_text):
+            if _is_ava_self_architecture_query(prior_text):
+                resolved = _resolve_architecture_response("show me your architecture in diagram")
+            else:
+                resolved = _resolve_architecture_response(f"{prior_query} diagram")
+            if resolved:
+                return {
+                    "type": "diagram",
+                    "response": resolved["response"],
+                    "confidence": resolved["confidence"],
+                    "sources_used": resolved["sources_used"],
+                    "topic": resolved["topic"],
+                }
+    resolved = _resolve_architecture_response("show me your architecture in diagram")
+    if not resolved:
+        return None
+    return {
+        "type": "diagram",
+        "response": resolved["response"],
+        "confidence": resolved["confidence"],
+        "sources_used": resolved["sources_used"],
+        "topic": resolved["topic"],
     }
 
 
@@ -2444,7 +2492,7 @@ def _resolve_controlled_query(query, *, controlled_route=None, prior_messages=No
 
     if controlled_route.intent == "follow_up":
         resolved = _resolve_follow_up_response(query)
-        if resolved.get("type") == "command":
+        if resolved.get("type") in {"command", "diagram"}:
             return resolved
         return {
             "type": "knowledge",
@@ -3566,7 +3614,7 @@ def _get_about_data() -> dict:
 
     return {
         "version": "2.1.2",
-        "phase": "Phase 5C Complete",
+        "phase": "Phase 9 Day-2 Operations",
         "built_by": "Manoj, Delhi",
         "github": "linuxlearning38/agentic-safety-gate",
         "runtime": "WSL2 Ubuntu, RTX 5060 Ti 16GB, Ryzen 1600, 32GB RAM",
