@@ -65,6 +65,7 @@ FUNCTIONS = {
     "_answer_ava_self_query",
     "_should_direct_unknown_to_llm",
     "_resolve_general_unknown_response",
+    "get_ava_introduction",
     "_resolve_grounded_knowledge_query",
     "score_context_confidence",
     "_apply_confidence_rules",
@@ -394,6 +395,7 @@ def load_helpers():
         "route_capability": capability_router.route_capability,
         "ollama": FakeOllama(),
         "LLM_MODEL": "qwen2.5:14b",
+        "STATS": {"total_chunks": 8809},
         "db": FakeDB(),
         "healer": FakeHealer(),
         "hybrid_retriever": FakeHybridRetriever(),
@@ -1512,7 +1514,11 @@ def main():
     ]
     diagram_follow_up = ns["_resolve_controlled_query"]("in diagram")
     check("diagram follow_up stays diagram", diagram_follow_up["type"] == "diagram")
+    check("diagram follow_up includes intent for web finalizer", diagram_follow_up["intent"] == "architecture")
     check("diagram follow_up reuses AVA architecture", "ava-agent:5443" in diagram_follow_up["response"] and "Application Service" not in diagram_follow_up["response"])
+    ava_intro = ns["get_ava_introduction"]()
+    check("ava introduction is current v2.1", "v2.1" in ava_intro and "Phase 9" in ava_intro)
+    check("ava introduction avoids stale experimental branch", "provisioning-v0.1-experimental" not in ava_intro and "What I Do In v1.0" not in ava_intro)
     fake_db.queries = [
         {
             "query": "what should I investigate on this host",
