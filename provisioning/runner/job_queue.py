@@ -20,6 +20,11 @@ RUNNER_HEARTBEAT_TTL_SECONDS = 90
 DAY2_OPERATION_QUEUE_KEY = "ava:provisioning:day2:operations:approved"
 DAY2_STATUS_KEY_PREFIX = "ava:provisioning:day2:operations:status:"
 DAY2_RESULT_KEY_PREFIX = "ava:provisioning:day2:operations:result:"
+CONSOLE_REQUEST_QUEUE_KEY = "ava:provisioning:console:requests"
+CONSOLE_SESSION_KEY_PREFIX = "ava:provisioning:console:sessions:"
+CONSOLE_INPUT_KEY_PREFIX = "ava:provisioning:console:input:"
+CONSOLE_OUTPUT_KEY_PREFIX = "ava:provisioning:console:output:"
+CONSOLE_TTL_SECONDS = 3600
 ALLOWED_STATUSES = {
     "queued",
     "picked_up",
@@ -190,6 +195,42 @@ class Day2OperationResult:
         )
 
 
+@dataclass(slots=True)
+class ConsoleSessionRequest:
+    """Browser console request consumed by the Windows host runner."""
+
+    console_id: str
+    user_id: str
+    provisioning_session_id: str
+    instance_id: str
+    instance_name: str | None
+    ssh_host: str
+    ssh_port: int
+    username: str = "ava-runner"
+    runner_job_id: str | None = None
+    requested_at: str = field(default_factory=_utc_now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ConsoleSessionRequest":
+        return cls(
+            console_id=str(data["console_id"]),
+            user_id=str(data["user_id"]),
+            provisioning_session_id=str(data["provisioning_session_id"]),
+            instance_id=str(data["instance_id"]),
+            instance_name=data.get("instance_name"),
+            ssh_host=str(data["ssh_host"]),
+            ssh_port=int(data["ssh_port"]),
+            username=str(data.get("username") or "ava-runner"),
+            runner_job_id=data.get("runner_job_id"),
+            requested_at=str(data.get("requested_at") or _utc_now()),
+            metadata=dict(data.get("metadata") or {}),
+        )
+
+
 class ProvisioningJobQueue(Protocol):
     """Small protocol used by serving and runner code."""
 
@@ -253,6 +294,21 @@ class ProvisioningJobQueue(Protocol):
         ...
 
     def write_day2_result(self, result: Day2OperationResult) -> None:
+        ...
+
+    def create_console_session(
+        self,
+        *,
+        user_id: str,
+        provisioning_session_id: str,
+        instance_id: str,
+        instance_name: str | None,
+        ssh_host: str,
+        ssh_port: int,
+        runner_job_id: str | None = None,
+        username: str = "ava-runner",
+        metadata: dict[str, Any] | None = None,
+    ) -> ConsoleSessionRequest:
         ...
 
 
@@ -387,6 +443,85 @@ class RedisProvisioningJobQueue:
     def write_day2_result(self, result: Day2OperationResult) -> None:
         self.client.set(_day2_result_key(result.operation_id), _json_dumps(result.to_dict()), ex=max(self.ttl_seconds, 86400))
 
+    def create_console_session(
+        self,
+        *,
+        user_id: str,
+        provisioning_session_id: str,
+        instance_id: str,
+        instance_name: str | None,
+        ssh_host: str,
+        ssh_port: int,
+        runner_job_id: str | None = None,
+        username: str = "ava-runner",
+        metadata: dict[str, Any] | None = None,
+    ) -> ConsoleSessionRequest:
+        request = ConsoleSessionRequest(
+            console_id=str(uuid4()),
+            user_id=str(user_id or "default"),
+            provisioning_session_id=str(provisioning_session_id),
+            instance_id=str(instance_id),
+            instance_name=instance_name,
+            ssh_host=str(ssh_host),
+            ssh_port=int(ssh_port),
+            username=str(username or "ava-runner"),
+            runner_job_id=runner_job_id,
+            metadata=dict(metadata or {}),
+        )
+        self.client.set(_console_session_key(request.console_id), _json_dumps({
+            **request.to_dict(),
+            "status": "queued",
+            "created_at": request.requested_at,
+            "updated_at": request.requested_at,
+        }), ex=CONSOLE_TTL_SECONDS)
+        self.client.rpush(CONSOLE_REQUEST_QUEUE_KEY, _json_dumps(request.to_dict()))
+        self.client.expire(CONSOLE_REQUEST_QUEUE_KEY, CONSOLE_TTL_SECONDS)
+        self.append_console_output(request.console_id, "AVA console request queued for host runner.\r\n")
+        return request
+
+    def claim_next_console_session(self, *, timeout_seconds: int = 1) -> ConsoleSessionRequest | None:
+        item = self.client.blpop(CONSOLE_REQUEST_QUEUE_KEY, timeout=timeout_seconds)
+        if not item:
+            return None
+        _queue_name, raw = item
+        request = ConsoleSessionRequest.from_dict(_json_loads(raw))
+        self.update_console_session(request.console_id, status="picked_up")
+        return request
+
+    def get_console_session(self, console_id: str) -> dict[str, Any] | None:
+        raw = self.client.get(_console_session_key(console_id))
+        if raw is None:
+            return None
+        return _json_loads(raw)
+
+    def update_console_session(self, console_id: str, **updates: Any) -> None:
+        existing = self.get_console_session(console_id) or {"console_id": console_id}
+        existing.update({key: value for key, value in updates.items() if value is not None})
+        existing["updated_at"] = _utc_now()
+        self.client.set(_console_session_key(console_id), _json_dumps(existing), ex=CONSOLE_TTL_SECONDS)
+
+    def append_console_output(self, console_id: str, text: str) -> None:
+        if text:
+            self.client.rpush(_console_output_key(console_id), text)
+            self.client.expire(_console_output_key(console_id), CONSOLE_TTL_SECONDS)
+
+    def read_console_output(self, console_id: str, offset: int = 0) -> tuple[list[str], int]:
+        key = _console_output_key(console_id)
+        values = self.client.lrange(key, int(offset), -1)
+        next_offset = int(offset) + len(values or [])
+        return [item.decode("utf-8") if isinstance(item, bytes) else str(item) for item in (values or [])], next_offset
+
+    def send_console_input(self, console_id: str, text: str) -> None:
+        self.client.rpush(_console_input_key(console_id), text)
+        self.client.expire(_console_input_key(console_id), CONSOLE_TTL_SECONDS)
+
+    def read_console_input(self, console_id: str, timeout_seconds: int = 1) -> str | None:
+        item = self.client.blpop(_console_input_key(console_id), timeout=timeout_seconds)
+        if not item:
+            return None
+        _key, raw = item
+        return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+
     def write_runner_heartbeat(self, status: str = "idle", metadata: dict[str, Any] | None = None) -> None:
         self.client.set(
             RUNNER_HEARTBEAT_KEY,
@@ -418,6 +553,18 @@ def _day2_status_key(operation_id: str) -> str:
 
 def _day2_result_key(operation_id: str) -> str:
     return f"{DAY2_RESULT_KEY_PREFIX}{operation_id}"
+
+
+def _console_session_key(console_id: str) -> str:
+    return f"{CONSOLE_SESSION_KEY_PREFIX}{console_id}"
+
+
+def _console_input_key(console_id: str) -> str:
+    return f"{CONSOLE_INPUT_KEY_PREFIX}{console_id}"
+
+
+def _console_output_key(console_id: str) -> str:
+    return f"{CONSOLE_OUTPUT_KEY_PREFIX}{console_id}"
 
 
 def _build_redis_client(redis_url: str):
@@ -473,6 +620,9 @@ class SimpleRedisClient:
 
     def expire(self, key: str, ttl: int):
         return self._command("EXPIRE", key, str(int(ttl)))
+
+    def lrange(self, key: str, start: int, end: int):
+        return self._command("LRANGE", key, str(int(start)), str(int(end))) or []
 
     def _command(self, *parts: str, timeout: int = 10):
         with socket.create_connection((self.host, self.port), timeout=timeout) as sock:

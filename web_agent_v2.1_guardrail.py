@@ -3772,6 +3772,124 @@ def auth_me():
     })
 
 
+def _resolve_active_console_target(user_id: str):
+    service = _get_provisioning_chat_service()
+    for session in service.sessions.list_recent(user_id, limit=10):
+        runner = service._runner_snapshot(session)
+        result = runner.get("result")
+        if result and result.instance_id and result.ssh_host and result.ssh_port and not result.error:
+            return service, session, runner, result
+    return service, None, None, None
+
+
+def _require_console_owner(console_id: str, user_id: str):
+    service = _get_provisioning_chat_service()
+    session = service.job_queue.get_console_session(console_id)
+    if not session:
+        return None, (jsonify({"error": "console session not found"}), 404)
+    if str(session.get("user_id")) != str(user_id):
+        return None, (jsonify({"error": "console session not found"}), 404)
+    return session, None
+
+
+@app.route('/console/open', methods=['POST'])
+@limiter.limit("10 per minute")
+@jwt_required()
+def console_open():
+    """Start a browser-based console for the latest AVA-managed VM."""
+    user_id = str(get_jwt_identity() or "admin")
+    service, session, runner, result = _resolve_active_console_target(user_id)
+    if not session or not result:
+        return jsonify({
+            "error": "no_ava_managed_vm",
+            "message": "No completed AVA-managed VM is attached to this account yet.",
+        }), 404
+    if not service.job_queue.is_runner_healthy():
+        return jsonify({
+            "error": "runner_offline",
+            "message": "The Windows host runner must be online before AVA Web Console can open.",
+        }), 503
+
+    console = service.job_queue.create_console_session(
+        user_id=user_id,
+        provisioning_session_id=session.session_id,
+        instance_id=result.instance_id,
+        instance_name=result.instance_name,
+        ssh_host=result.ssh_host,
+        ssh_port=int(result.ssh_port),
+        username="ava-runner",
+        runner_job_id=(session.collected_answers or {}).get("runner_job_id"),
+        metadata={
+            "source": "ava_web_console",
+            "auth": "jwt",
+            "target_scope": "ava_managed_vm",
+        },
+    )
+    return jsonify({
+        "console_id": console.console_id,
+        "status": "queued",
+        "vm": result.instance_name or result.instance_id,
+        "ssh_host": result.ssh_host,
+        "ssh_port": result.ssh_port,
+        "username": "ava-runner",
+        "message": "AVA Web Console queued. The host runner will connect using AVA's retained runner key.",
+    })
+
+
+@app.route('/console/<console_id>/output', methods=['GET'])
+@limiter.limit("180 per minute")
+@jwt_required()
+def console_output(console_id):
+    user_id = str(get_jwt_identity() or "admin")
+    session, error = _require_console_owner(console_id, user_id)
+    if error:
+        return error
+    service = _get_provisioning_chat_service()
+    offset = int(request.args.get("offset", "0") or "0")
+    lines, next_offset = service.job_queue.read_console_output(console_id, offset)
+    session = service.job_queue.get_console_session(console_id) or session
+    return jsonify({
+        "console_id": console_id,
+        "status": session.get("status", "unknown"),
+        "output": lines,
+        "next_offset": next_offset,
+        "vm": session.get("instance_name") or session.get("instance_id"),
+        "username": session.get("username") or "ava-runner",
+    })
+
+
+@app.route('/console/<console_id>/input', methods=['POST'])
+@limiter.limit("60 per minute")
+@jwt_required()
+def console_input(console_id):
+    user_id = str(get_jwt_identity() or "admin")
+    session, error = _require_console_owner(console_id, user_id)
+    if error:
+        return error
+    if session.get("status") in {"closed", "failed"}:
+        return jsonify({"error": "console_not_open", "status": session.get("status")}), 409
+    data = request.json or {}
+    text = str(data.get("input") or "")
+    if len(text) > 4000:
+        return jsonify({"error": "input_too_large"}), 400
+    _get_provisioning_chat_service().job_queue.send_console_input(console_id, text)
+    return jsonify({"ok": True})
+
+
+@app.route('/console/<console_id>/close', methods=['POST'])
+@limiter.limit("30 per minute")
+@jwt_required()
+def console_close(console_id):
+    user_id = str(get_jwt_identity() or "admin")
+    _session, error = _require_console_owner(console_id, user_id)
+    if error:
+        return error
+    service = _get_provisioning_chat_service()
+    service.job_queue.update_console_session(console_id, status="closing")
+    service.job_queue.send_console_input(console_id, "exit\n")
+    return jsonify({"ok": True, "status": "closing"})
+
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -6895,6 +7013,169 @@ HTML_TEMPLATE = r'''
             color: var(--text-main) !important;
         }
 
+        .ava-console-panel {
+            position: fixed;
+            right: 24px;
+            bottom: 24px;
+            width: min(900px, calc(100vw - 48px));
+            height: min(560px, calc(100vh - 80px));
+            background: #07090d;
+            border: 1px solid rgba(120, 140, 255, 0.42);
+            border-radius: 18px;
+            box-shadow: 0 30px 90px rgba(0, 0, 0, 0.55);
+            z-index: 8500;
+            display: none;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .ava-console-panel.open {
+            display: flex;
+        }
+
+        .ava-console-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 12px 14px;
+            background: linear-gradient(135deg, rgba(63, 74, 180, 0.32), rgba(15, 18, 30, 0.98));
+            border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .ava-console-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: #f2f5ff;
+        }
+
+        .ava-console-title-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .ava-console-mode {
+            display: inline-flex;
+            align-items: center;
+            border: 1px solid rgba(143, 161, 255, 0.32);
+            background: rgba(143, 161, 255, 0.14);
+            color: #dfe6ff;
+            border-radius: 999px;
+            padding: 2px 7px;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+        }
+
+        .ava-console-subtitle {
+            font-size: 11px;
+            color: rgba(230, 236, 255, 0.62);
+            margin-top: 2px;
+        }
+
+        .ava-console-status {
+            display: inline-flex;
+            align-items: center;
+            min-width: 74px;
+            justify-content: center;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            background: rgba(255, 255, 255, 0.08);
+            color: #dfe6ff;
+            border-radius: 999px;
+            padding: 6px 9px;
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+        .ava-console-status[data-state="connected"] {
+            border-color: rgba(74, 222, 128, 0.35);
+            background: rgba(74, 222, 128, 0.14);
+            color: #bfffd0;
+        }
+
+        .ava-console-status[data-state="connecting"] {
+            border-color: rgba(251, 191, 36, 0.36);
+            background: rgba(251, 191, 36, 0.12);
+            color: #ffe6a6;
+        }
+
+        .ava-console-status[data-state="failed"],
+        .ava-console-status[data-state="closed"] {
+            border-color: rgba(248, 113, 113, 0.34);
+            background: rgba(248, 113, 113, 0.12);
+            color: #ffc7c7;
+        }
+
+        .ava-console-note {
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(13, 18, 30, 0.92);
+            color: rgba(225, 232, 255, 0.72);
+            padding: 8px 14px;
+            font-size: 11px;
+        }
+
+        .ava-console-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .ava-console-actions button,
+        .ava-console-input button {
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            background: rgba(255, 255, 255, 0.08);
+            color: #eef2ff;
+            border-radius: 10px;
+            padding: 7px 10px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        .ava-console-actions button:hover,
+        .ava-console-input button:hover {
+            background: rgba(126, 145, 255, 0.22);
+        }
+
+        .ava-console-output {
+            flex: 1;
+            margin: 0;
+            padding: 16px;
+            overflow: auto;
+            background:
+                radial-gradient(circle at top right, rgba(75, 91, 210, 0.14), transparent 42%),
+                #05070a;
+            color: #c7ffd8;
+            font: 13px/1.45 "Cascadia Mono", "Consolas", monospace;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .ava-console-input {
+            display: flex;
+            gap: 8px;
+            padding: 12px;
+            background: #090d14;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .ava-console-input input {
+            flex: 1;
+            background: #05070a;
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            color: #f4f7ff;
+            border-radius: 10px;
+            padding: 10px 12px;
+            font: 13px "Cascadia Mono", "Consolas", monospace;
+            outline: none;
+        }
+
+        .ava-console-input input:focus {
+            border-color: rgba(126, 145, 255, 0.72);
+        }
+
         @media (max-width: 980px) {
             .app-container {
                 padding: 10px;
@@ -7064,6 +7345,11 @@ HTML_TEMPLATE = r'''
                 <span class="nav-icon">⛨</span>
                 <span>Security</span>
                 <span id="securityBadge" class="security-inline-badge" style="display: none;"></span>
+            </button>
+
+            <button class="sidebar-btn" onclick="openAvaConsole()">
+                <span class="nav-icon">⌁</span>
+                <span>Web Console</span>
             </button>
 
             <div class="sidebar-quick">
@@ -7237,6 +7523,34 @@ HTML_TEMPLATE = r'''
                     </div>
                 </div>
             </div>
+        </div>
+    </div>
+
+    <div id="avaConsolePanel" class="ava-console-panel" aria-live="polite">
+        <div class="ava-console-header">
+            <div>
+                <div class="ava-console-title-row">
+                    <div class="ava-console-title">AVA Web Console</div>
+                    <span class="ava-console-mode">Basic mode</span>
+                </div>
+                <div class="ava-console-subtitle" id="avaConsoleMeta">Protected browser SSH for AVA-managed VMs</div>
+            </div>
+            <div class="ava-console-actions">
+                <span id="avaConsoleStatus" class="ava-console-status" data-state="idle">Idle</span>
+                <button type="button" onclick="openAvaConsole()">Reconnect</button>
+                <button type="button" onclick="sendAvaConsoleInterrupt()">Interrupt</button>
+                <button type="button" onclick="closeAvaConsole()">Close</button>
+            </div>
+        </div>
+        <div class="ava-console-note">
+            Basic mode supports normal shell checks and server operations. Full PuTTY-speed terminal rendering is planned for the WebSocket/xterm phase.
+        </div>
+        <pre id="avaConsoleOutput" class="ava-console-output">AVA Web Console is ready.
+Click Reconnect or ask AVA to open the console after a VM is provisioned.
+</pre>
+        <div class="ava-console-input">
+            <input id="avaConsoleInput" type="text" placeholder="Type a command and press Enter" onkeydown="handleAvaConsoleKey(event)">
+            <button type="button" onclick="sendAvaConsoleInput()">Send</button>
         </div>
     </div>
     
@@ -7741,6 +8055,274 @@ HTML_TEMPLATE = r'''
             sendQuery();
         }
 
+        const avaConsoleState = {
+            id: null,
+            offset: 0,
+            pollTimer: null,
+            opening: false,
+            pollDelayMs: 500,
+            ansiMode: null
+        };
+
+        function appendConsoleText(text) {
+            const output = document.getElementById('avaConsoleOutput');
+            if (!output) return;
+            output.textContent += cleanConsoleText(text);
+            output.textContent = normalizeConsolePrompts(output.textContent);
+            if (output.textContent.length > 90000) {
+                output.textContent = output.textContent.slice(-70000);
+            }
+            output.scrollTop = output.scrollHeight;
+        }
+
+        function setAvaConsoleStatus(label, state) {
+            const status = document.getElementById('avaConsoleStatus');
+            if (!status) return;
+            status.textContent = label || 'Idle';
+            status.dataset.state = state || 'idle';
+        }
+
+        function cleanConsoleText(text) {
+            if (!text) return '';
+            let cleaned = '';
+            for (const ch of String(text)) {
+                if (avaConsoleState.ansiMode === 'escape') {
+                    if (ch === '[') {
+                        avaConsoleState.ansiMode = 'csi';
+                    } else if (ch === ']') {
+                        avaConsoleState.ansiMode = 'osc';
+                    } else if (ch === '(' || ch === ')') {
+                        avaConsoleState.ansiMode = 'charset';
+                    } else {
+                        avaConsoleState.ansiMode = null;
+                    }
+                    continue;
+                }
+                if (avaConsoleState.ansiMode === 'csi') {
+                    if (ch >= '@' && ch <= '~') {
+                        avaConsoleState.ansiMode = null;
+                    }
+                    continue;
+                }
+                if (avaConsoleState.ansiMode === 'osc') {
+                    if (ch === '\x07') {
+                        avaConsoleState.ansiMode = null;
+                    } else if (ch === '\x1b') {
+                        avaConsoleState.ansiMode = 'osc_escape';
+                    }
+                    continue;
+                }
+                if (avaConsoleState.ansiMode === 'osc_escape') {
+                    avaConsoleState.ansiMode = (ch === '\\') ? null : 'osc';
+                    continue;
+                }
+                if (avaConsoleState.ansiMode === 'charset') {
+                    avaConsoleState.ansiMode = null;
+                    continue;
+                }
+
+                if (ch === '\x1b') {
+                    avaConsoleState.ansiMode = 'escape';
+                    continue;
+                }
+                if (ch === '\x07' || ch === '\x08' || ch === '\r') {
+                    continue;
+                }
+                cleaned += ch;
+            }
+            return cleaned;
+        }
+
+        function normalizeConsolePrompts(text) {
+            if (!text) return '';
+            const promptPattern = '[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^\\n]*[$#] ';
+            const duplicatePrompt = new RegExp(
+                '(^|\\n)(' + promptPattern + ')\\n+\\2',
+                'g'
+            );
+            let normalized = String(text);
+            let previous;
+            do {
+                previous = normalized;
+                normalized = normalized.replace(duplicatePrompt, '$1$2');
+            } while (normalized !== previous);
+            return normalized;
+        }
+
+        async function openAvaConsole() {
+            const panel = document.getElementById('avaConsolePanel');
+            const input = document.getElementById('avaConsoleInput');
+            const meta = document.getElementById('avaConsoleMeta');
+            if (panel) panel.classList.add('open');
+            if (input) input.focus();
+            if (avaConsoleState.opening) return;
+            avaConsoleState.opening = true;
+            setAvaConsoleStatus('Opening', 'connecting');
+            const previousConsoleId = avaConsoleState.id;
+            if (avaConsoleState.pollTimer) {
+                clearInterval(avaConsoleState.pollTimer);
+                avaConsoleState.pollTimer = null;
+            }
+            if (previousConsoleId) {
+                try {
+                    await fetch(`/console/${previousConsoleId}/close`, {method: 'POST'});
+                } catch (err) {
+                    // Reconnect should still proceed if the old session is already gone.
+                }
+            }
+            avaConsoleState.id = null;
+            avaConsoleState.offset = 0;
+            avaConsoleState.pollDelayMs = 500;
+            avaConsoleState.ansiMode = null;
+            const output = document.getElementById('avaConsoleOutput');
+            if (output) output.textContent = 'Opening AVA Web Console...\n';
+            try {
+                const resp = await fetch('/console/open', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({})
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    setAvaConsoleStatus('Failed', 'failed');
+                    appendConsoleText('Console could not open: ' + (data.message || data.error || 'unknown error') + '\n');
+                    return;
+                }
+                avaConsoleState.id = data.console_id;
+                avaConsoleState.offset = 0;
+                if (meta) {
+                    meta.textContent = `${data.vm || 'AVA VM'} - ${data.username || 'ava-runner'}@${data.ssh_host}:${data.ssh_port}`;
+                }
+                appendConsoleText(`Console session ${data.console_id} queued for ${data.vm}.\n`);
+                setAvaConsoleStatus('Queued', 'connecting');
+                pollAvaConsole();
+                avaConsoleState.pollTimer = setInterval(pollAvaConsole, avaConsoleState.pollDelayMs);
+            } catch (err) {
+                setAvaConsoleStatus('Failed', 'failed');
+                appendConsoleText('Console error: ' + (err && err.message ? err.message : 'unknown error') + '\n');
+            } finally {
+                avaConsoleState.opening = false;
+            }
+        }
+
+        function resetAvaConsolePollTimer(delayMs) {
+            avaConsoleState.pollDelayMs = delayMs;
+            if (avaConsoleState.pollTimer) {
+                clearInterval(avaConsoleState.pollTimer);
+                avaConsoleState.pollTimer = setInterval(pollAvaConsole, avaConsoleState.pollDelayMs);
+            }
+        }
+
+        async function pollAvaConsole() {
+            if (!avaConsoleState.id) return;
+            try {
+                const resp = await fetch(`/console/${avaConsoleState.id}/output?offset=${avaConsoleState.offset}`);
+                const data = await resp.json();
+                if (!resp.ok) {
+                    if (resp.status === 429) {
+                        setAvaConsoleStatus('Busy', 'connecting');
+                        resetAvaConsolePollTimer(Math.min(8000, avaConsoleState.pollDelayMs * 2));
+                        appendConsoleText(`Console is slowing polling to ${Math.round(avaConsoleState.pollDelayMs / 1000)}s because AVA is busy.\n`);
+                        return;
+                    }
+                    setAvaConsoleStatus('Failed', 'failed');
+                    appendConsoleText('Console polling failed: ' + (data.error || 'unknown error') + '\n');
+                    return;
+                }
+                if (avaConsoleState.pollDelayMs !== 500) {
+                    resetAvaConsolePollTimer(500);
+                }
+                if (data.status === 'connected') {
+                    setAvaConsoleStatus('Connected', 'connected');
+                } else if (data.status === 'queued') {
+                    setAvaConsoleStatus('Queued', 'connecting');
+                } else if (data.status === 'failed') {
+                    setAvaConsoleStatus('Failed', 'failed');
+                } else if (data.status === 'closed') {
+                    setAvaConsoleStatus('Closed', 'closed');
+                }
+                avaConsoleState.offset = data.next_offset || avaConsoleState.offset;
+                (data.output || []).forEach(chunk => appendConsoleText(chunk));
+                if (['closed', 'failed'].includes(data.status) && avaConsoleState.pollTimer) {
+                    clearInterval(avaConsoleState.pollTimer);
+                    avaConsoleState.pollTimer = null;
+                }
+            } catch (err) {
+                setAvaConsoleStatus('Retrying', 'connecting');
+                appendConsoleText('Console polling error: ' + (err && err.message ? err.message : 'unknown error') + '\n');
+            }
+        }
+
+        function handleAvaConsoleKey(event) {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                sendAvaConsoleInput();
+            }
+        }
+
+        async function sendAvaConsoleInput() {
+            const input = document.getElementById('avaConsoleInput');
+            const command = input ? input.value : '';
+            if (!avaConsoleState.id || command.length === 0) return;
+            input.value = '';
+            const commandText = command.replace(/\\n/g, '\n');
+            try {
+                const resp = await fetch(`/console/${avaConsoleState.id}/input`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({input: commandText.endsWith('\n') ? commandText : commandText + '\n'})
+                });
+                if (!resp.ok) {
+                    const data = await resp.json();
+                    setAvaConsoleStatus('Input failed', 'failed');
+                    appendConsoleText('Input failed: ' + (data.error || 'unknown error') + '\n');
+                }
+            } catch (err) {
+                setAvaConsoleStatus('Input failed', 'failed');
+                appendConsoleText('Input error: ' + (err && err.message ? err.message : 'unknown error') + '\n');
+            }
+        }
+
+        async function sendAvaConsoleInterrupt() {
+            if (!avaConsoleState.id) return;
+            appendConsoleText('^C\n');
+            try {
+                const resp = await fetch(`/console/${avaConsoleState.id}/input`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({input: '\u0003'})
+                });
+                if (!resp.ok) {
+                    const data = await resp.json();
+                    appendConsoleText('Interrupt failed: ' + (data.error || 'unknown error') + '\n');
+                }
+            } catch (err) {
+                appendConsoleText('Interrupt error: ' + (err && err.message ? err.message : 'unknown error') + '\n');
+            }
+        }
+
+        async function closeAvaConsole() {
+            const panel = document.getElementById('avaConsolePanel');
+            if (avaConsoleState.id) {
+                try {
+                    await fetch(`/console/${avaConsoleState.id}/close`, {method: 'POST'});
+                } catch (err) {
+                    appendConsoleText('Close request failed: ' + (err && err.message ? err.message : 'unknown error') + '\n');
+                }
+            }
+            if (avaConsoleState.pollTimer) {
+                clearInterval(avaConsoleState.pollTimer);
+                avaConsoleState.pollTimer = null;
+            }
+            avaConsoleState.id = null;
+            avaConsoleState.offset = 0;
+            avaConsoleState.ansiMode = null;
+            setAvaConsoleStatus('Closed', 'closed');
+            const meta = document.getElementById('avaConsoleMeta');
+            if (meta) meta.textContent = 'Protected browser SSH for AVA-managed VMs';
+            if (panel) panel.classList.remove('open');
+        }
+
         function submitSuggestedPrompt(button) {
             const encodedPrompt = button && button.getAttribute('data-prompt');
             if (!encodedPrompt) return;
@@ -8141,6 +8723,20 @@ HTML_TEMPLATE = r'''
             
             // Detect if it's likely a command
             const queryLower = query.toLowerCase();
+            const isWebConsoleRequest = /^(open|launch|start)\s+(the\s+)?(ava\s+)?(web\s+)?(ssh\s+)?console\b/.test(queryLower)
+                || queryLower === 'console'
+                || queryLower === 'web console';
+            if (isWebConsoleRequest) {
+                addAVAMessage({
+                    type: 'command',
+                    response: 'Opening AVA Web Console for the latest AVA-managed VM. This uses AVA auth and the Windows host runner; it does not depend on PuTTY being installed on this browser machine.'
+                });
+                openAvaConsole();
+                input.disabled = false;
+                sendBtn.disabled = false;
+                input.focus();
+                return;
+            }
             const isCommand = queryLower.startsWith('run ') || 
                             queryLower.startsWith('execute ') || 
                             queryLower.startsWith('shell ') ||

@@ -35,7 +35,7 @@ What is intentionally true on this branch:
 - AVA can answer AVA self/runtime/architecture questions deterministically.
 - AVA can render controlled architecture diagrams for AVA and common DevOps flows.
 - AVA can provision VirtualBox Ubuntu web servers through chat approval and the Windows host runner.
-- AVA can report connection details, provisioning evidence, live web verification, snapshots, and Day-2 operation status.
+- AVA can report connection details, provisioning evidence, live web verification, snapshots, local SSH console launch, browser-based AVA Web Console sessions, and Day-2 operation status.
 - AVA blocks destructive requests and approval-gates medium/high-risk operations.
 - Stored evidence must be labeled as stored evidence; live claims must come from live checks.
 - Stale non-terminal provisioning sessions must fail open for retry instead of blocking the user forever.
@@ -50,7 +50,7 @@ In scope for `v2-development`:
 - Approval-required handling for medium/high-risk actions.
 - Deterministic blocking for destructive requests.
 - Phase 9 chat-to-VM provisioning through VirtualBox.
-- Phase 9 Day-2 operations on AVA-managed VMs: status, verify, logs, restart, snapshot, rollback, stop/start, and evidence-backed responses.
+- Phase 9 Day-2 operations on AVA-managed VMs: status, verify, logs, local SSH console launch, browser-based AVA Web Console, restart, snapshot, rollback, stop/start, and evidence-backed responses.
 
 Out of scope unless explicitly added by a future phase:
 
@@ -83,6 +83,7 @@ Out of scope unless explicitly added by a future phase:
 - Never bypass provisioning approval for VM creation.
 - Never silently create a second VM on top of an active non-terminal request.
 - Never present expired or stored evidence as live truth.
+- Never expose raw VM SSH publicly when AVA can act as the authenticated console gateway.
 - Never let Qwen invent AVA product facts, tools, credentials, host state, or security posture.
 - Keep destructive blocking strict and early.
 - Update this file when the serving contract, scope boundary, or durable product truth changes.
