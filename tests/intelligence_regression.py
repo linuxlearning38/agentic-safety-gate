@@ -22,6 +22,8 @@ FUNCTIONS = {
     "_retrieve_comparison_chunks",
     "_retrieve_definition_chunks",
     "_resolve_follow_up_response",
+    "_is_diagram_follow_up_query",
+    "_resolve_diagram_follow_up_response",
     "_resolve_comparison_response",
     "_resolve_definition_response",
     "_resolve_operational_follow_up_response",
@@ -104,6 +106,7 @@ CONSTANTS = {
     "_RAW_COMMAND_PREFIXES",
     "_RAW_COMMAND_STARTERS",
     "_LEARNING_PREFIXES",
+    "_DIAGRAM_FOLLOW_UP_MARKERS",
     "_FOLLOW_UP_EXECUTION_MARKERS",
     "_FOLLOW_UP_NEXT_STEP_MARKERS",
     "_CORE_DEVOPS_DEFINITION_BLOCKS",
@@ -980,6 +983,22 @@ def main():
         "safety route is controlled — is ava safe",
         ns["_route_query"]("is ava safe").intent == "ava_self",
     )
+    check(
+        "goal route is controlled — what is your goal",
+        ns["_route_query"]("what is your goal").intent == "ava_self",
+    )
+    check(
+        "goal route topic — what is your goal",
+        ns["_route_query"]("what is your goal").topic == "goal",
+    )
+    check(
+        "self architecture route is controlled — what is your architecture",
+        ns["_route_query"]("what is your architecture").intent == "architecture",
+    )
+    check(
+        "self architecture route topic — what is your architecture",
+        ns["_route_query"]("what is your architecture").topic == "self_runtime",
+    )
     architecture_route = ns["_route_query"]("Explain Netflix architecture with Zuul, Kafka, Cassandra, EVCache")
     check("architecture route is controlled", architecture_route.intent == "architecture")
     check("architecture route topic", architecture_route.topic == "external")
@@ -998,6 +1017,7 @@ def main():
         "follow_up route is controlled",
         ns["_route_query"]("How is it different from the previous thing I asked?").intent == "follow_up",
     )
+    check("diagram-only follow_up route is controlled", ns["_route_query"]("in diagram").intent == "follow_up")
     check("operational do-that route is follow_up", ns["_route_query"]("do that").intent == "follow_up")
     check("operational next-step route is follow_up", ns["_route_query"]("what should I do next").intent == "follow_up")
     comparison_route = ns["_route_query"]("What is the difference between readiness probe and liveness probe?")
@@ -1372,6 +1392,19 @@ def main():
         },
     )
     check("ava self kb total is computed", "6,482" in ava_self_kb and "devops_patterns_v1: 64" in ava_self_kb)
+    ava_self_goal = ns["_answer_ava_self_query"](
+        "what is your goal",
+        about={
+            "version": "2.1.2",
+            "built_by": "Manoj, Delhi",
+            "runtime": "WSL2 Ubuntu",
+            "containers": {},
+            "models": {},
+            "knowledge_base": {},
+        },
+    )
+    check("ava self goal is deterministic", "approval-aware" in ava_self_goal.lower() and "host runner" in ava_self_goal.lower())
+    check("ava self goal avoids stale v1 framing", "v1.0" not in ava_self_goal.lower() and "experimental" not in ava_self_goal.lower())
     check("oomkilled intent routes to troubleshooting", ns["detect_query_intent"]("What causes OOMKilled in Kubernetes?") == "troubleshooting")
     check("dns failure routes to troubleshooting", ns["_route_query"]("How do I investigate Kubernetes DNS failure?").topic == "dns_failure")
     check("tls certificate routes to troubleshooting", ns["_route_query"]("How do I fix TLS certificate issues?").topic == "tls_certificate")
@@ -1429,6 +1462,9 @@ def main():
     ava_diagram = ns["_resolve_architecture_response"]("ava diagram")
     check("ava diagram is deterministic", ava_diagram["response"].startswith("```mermaid"))
     check("ava diagram includes ava runtime core nodes", "ava-agent:5443" in ava_diagram["response"] and "PostgreSQL:5432" in ava_diagram["response"])
+    ava_architecture = ns["_resolve_architecture_response"]("what is your architecture")
+    check("ava architecture text is current", "Windows host runner" in ava_architecture["response"] and "VirtualBox" in ava_architecture["response"])
+    check("ava architecture text avoids stale phase framing", "v1.0" not in ava_architecture["response"].lower() and "experimental" not in ava_architecture["response"].lower())
     docker_runtime_diagram = ns["_resolve_architecture_response"]("create a mermaid diagram an acrhcitecture of docker")
     check("docker runtime diagram avoids generic fallback", "Application Service" not in docker_runtime_diagram["response"] and "Data Store" not in docker_runtime_diagram["response"])
     check("docker runtime diagram includes docker engine", "Docker Engine" in docker_runtime_diagram["response"] and "Container Runtime" in docker_runtime_diagram["response"])
@@ -1441,7 +1477,8 @@ def main():
     netflix_diagram = ns["_resolve_architecture_response"]("netflix diagram")
     check("netflix diagram includes netflix stack nodes", all(term in netflix_diagram["response"] for term in ["Zuul", "Kafka", "Cassandra", "EVCache"]))
     provisioning_diagram = ns["_resolve_architecture_response"]("ava linux provisioning diagram")
-    check("ava provisioning diagram is explicit experimental", "Experimental" in provisioning_diagram["response"] and "non-executing" in provisioning_diagram["response"])
+    check("ava provisioning diagram is current Phase 9", all(term in provisioning_diagram["response"] for term in ["Windows Host Runner", "VirtualBox Adapter", "Cloud-init Access", "HTTP 200"]))
+    check("ava provisioning diagram avoids stale experimental framing", "non-executing" not in provisioning_diagram["response"].lower() and "experimental" not in provisioning_diagram["response"].lower())
     lifecycle_diagram_resolved = ns["_resolve_architecture_response"]("create a mermaid diagram of kubernetes, docker, and devops lifecycle")
     check("controlled lifecycle diagram is deterministic", lifecycle_diagram_resolved["response"].startswith("```mermaid"))
     check("controlled lifecycle diagram includes kubernetes", "Kubernetes Cluster" in lifecycle_diagram_resolved["response"])
@@ -1466,6 +1503,16 @@ def main():
     check("terraform diagram includes plan state apply drift", all(term in terraform_diagram["response"] for term in ["Plan", "State Backend", "Apply", "Drift Detection"]))
     follow_up_resolved = ns["_resolve_follow_up_response"]("How is it different from the previous thing I asked?")
     check("controlled follow_up response is deterministic", "latest answer summary" in follow_up_resolved["response"].lower())
+    fake_db.queries = [
+        {
+            "query": "what is your architecture",
+            "response": ava_architecture["response"],
+            "intent": "architecture",
+        }
+    ]
+    diagram_follow_up = ns["_resolve_controlled_query"]("in diagram")
+    check("diagram follow_up stays diagram", diagram_follow_up["type"] == "diagram")
+    check("diagram follow_up reuses AVA architecture", "ava-agent:5443" in diagram_follow_up["response"] and "Application Service" not in diagram_follow_up["response"])
     fake_db.queries = [
         {
             "query": "what should I investigate on this host",

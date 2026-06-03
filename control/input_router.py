@@ -31,18 +31,26 @@ AVA_SELF_TOPIC_PATTERNS = {
     "runtime": [
         "runtime", "your stack", "overview", "how do you work",
         "your pipeline", "your files", "your database",
+        "where are you hosted", "where are you running", "inspect yourself",
+        "inspect your own container", "inspect ava container",
+    ],
+    "goal": [
+        "what is your goal", "what is your purpose", "what are you trying to do",
+        "what do you do", "what can you do",
     ],
 }
 
 ARCHITECTURE_TOPIC_PATTERNS = {
     "self_runtime": [
         "your docker architecture", "your architecture", "ava architecture",
+        "ava diagram", "ava runtime diagram",
         "docker architecture", "your runtime architecture", "your container architecture",
     ],
     "external": [
         "architecture", "request flow", "data flow", "system design",
         "topology", "deployment flow", "sequence flow", "component flow",
         "pipeline flow", "terraform flow", "ingress flow", "plan apply",
+        "devops diagram",
     ],
 }
 
@@ -101,6 +109,8 @@ FOLLOW_UP_MARKERS = (
     "do that", "do it", "run that", "run it", "apply that", "apply it",
     "fix it", "what should i do next", "what is the next step",
     "run the next step", "continue with that",
+    "in diagram", "show it in diagram", "show that in diagram",
+    "show it as diagram", "show that as diagram", "draw that",
 )
 
 COMPARISON_MARKERS = (
@@ -189,6 +199,12 @@ def classify_architecture_topic(normalized_query: str, entities: list[str] | Non
         for patterns in ARCHITECTURE_TOPIC_PATTERNS.values()
         for pattern in patterns
     )
+    known_diagram_subjects = (
+        " ava ", " docker ", " devops ", " netflix ", " kubernetes ", " k8s ",
+        " terraform ", " ci/cd ", " cicd ", " ingress ",
+    )
+    if wants_diagram and any(subject in q for subject in known_diagram_subjects):
+        has_architecture_language = True
     if not wants_diagram and not has_architecture_language:
         return None
 
@@ -196,6 +212,8 @@ def classify_architecture_topic(normalized_query: str, entities: list[str] | Non
     topic = "self_runtime" if any(marker in q for marker in self_runtime_markers) else "external"
     if topic != "self_runtime" and " ava " in q and any(word in q for word in ("your", "docker", "runtime", "container")):
         topic = "self_runtime"
+    if topic != "self_runtime" and wants_diagram and not has_architecture_language and len(entities) < 1:
+        return None
     if topic != "self_runtime" and not wants_diagram and len(entities) < 2 and "architecture" not in q and "flow" not in q:
         return None
     response_mode = "diagram" if wants_diagram else "text"

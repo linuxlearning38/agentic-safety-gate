@@ -156,16 +156,19 @@ def _runtime_architecture_blocks(about: dict) -> tuple[list[str], list[str]]:
     containers = about.get("containers", {})
     models = about.get("models", {})
     blocks = [
-        "ava-agent serves requests through Flask/Gunicorn on port 5443.",
-        "ava-agent reads and writes relational data in PostgreSQL on port 5432.",
-        "ava-agent uses Redis on port 6379 for fast state and caching.",
+        "Browser requests reach ava-agent through Flask/Gunicorn on HTTPS port 5443.",
+        "ava-agent classifies each request before answering: exact self/runtime, grounded DevOps knowledge, provisioning, or guarded operation.",
+        "Qwen via Ollama is the reasoning engine, but ava-agent owns routing, runtime truth, policy, and approval decisions.",
+        "ava-agent uses Redis on port 6379 for fast queue/state signals and server-management operation results.",
+        "ava-agent reads and writes relational application data in PostgreSQL on port 5432.",
         "ava-agent checks policy decisions with Open Policy Agent on port 8181.",
         "ava-agent reads secrets from HashiCorp Vault on port 8200.",
+        "Phase 9 provisioning hands approved jobs to a Windows-native host runner, which controls VirtualBox and creates Ubuntu VMs.",
+        "The host runner writes provisioning and Day-2 operation evidence back for AVA to report in chat.",
         f"ava-agent calls the Ollama host at {models.get('ollama_host', 'unknown')} for local model inference.",
     ]
     entities = list(containers.keys())
-    if models.get("ollama_host"):
-        entities.append("Ollama")
+    entities.extend(["Ollama", "Approval Gate", "Host Runner", "VirtualBox", "Ubuntu VM"])
     return blocks, entities
 
 

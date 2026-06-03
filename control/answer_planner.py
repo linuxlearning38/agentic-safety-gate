@@ -123,19 +123,7 @@ def _should_keep_architecture_entity(entity: str, evidence_blocks: list[str]) ->
 def _build_architecture_mermaid(entities: list[str], evidence_blocks: list[str], topic: str) -> str:
     lower_entities = {entity.lower(): entity for entity in entities}
     if topic == "self_runtime":
-        return _with_mermaid_init(
-            (
-            "```mermaid\n"
-            "graph LR\n"
-            "    Client[\"User Request\"] --> Ava[\"ava-agent:5443\\nFlask/Gunicorn\"]\n"
-            "    Ava --> Postgres[\"PostgreSQL:5432\"]\n"
-            "    Ava --> Redis[\"Redis:6379\"]\n"
-            "    Ava --> OPA[\"Open Policy Agent:8181\"]\n"
-            "    Ava --> Vault[\"HashiCorp Vault:8200\"]\n"
-            "    Ava --> Ollama[\"Ollama Host\"]\n"
-            "```"
-            )
-        )
+        return _known_architecture_mermaid("ava_runtime")
 
     edges = []
     if "zuul" in lower_entities:
@@ -224,22 +212,29 @@ def _known_architecture_text(flow_key: str) -> str:
     templates = {
         "ava_runtime": (
             "**Components and Roles:**\n"
-            "- **ava-agent (Flask/Gunicorn):** Main API/runtime process that handles user requests.\n"
-            "- **PostgreSQL:** Durable relational state.\n"
-            "- **Redis:** Fast cache/session/runtime state.\n"
-            "- **Open Policy Agent (OPA):** Authorization/policy decision point.\n"
-            "- **Vault:** Secret management.\n"
-            "- **Ollama Host:** Local model inference endpoint.\n\n"
+            "- **Browser/UI:** The user-facing chat surface at `https://localhost:5443`.\n"
+            "- **ava-agent (Flask/Gunicorn):** The single serving contract. It classifies requests before producing an answer.\n"
+            "- **AVA router/planner:** Chooses exact self/runtime, grounded DevOps knowledge, provisioning, guarded action, or Qwen reasoning.\n"
+            "- **OPA + approval guard:** Enforces policy and approval before risky actions.\n"
+            "- **Redis:** Fast state, runner heartbeat, provisioning queue, and Day-2 operation result signals.\n"
+            "- **PostgreSQL / runtime data store:** Durable application state and persisted AVA records.\n"
+            "- **Vault:** Secret-management dependency for sensitive runtime configuration.\n"
+            "- **Ollama/Qwen:** Local model inference. Qwen reasons, but AVA owns truth and safety.\n"
+            "- **Windows host runner:** Native runner that executes approved VirtualBox and SSH operations outside the container.\n"
+            "- **VirtualBox + Ubuntu VMs:** Provider layer and managed servers created by Phase 9 provisioning.\n\n"
             "**Request Flow:**\n"
-            "- User requests hit ava-agent first, then policy checks and guarded tool paths execute when required.\n"
-            "- ava-agent coordinates with Redis/PostgreSQL/Ollama based on request type.\n\n"
+            "- User requests hit ava-agent first; AVA classifies the request before any answer is produced.\n"
+            "- Knowledge questions use grounded retrieval and, when needed, Qwen through Ollama.\n"
+            "- Provisioning requests create an approval, enqueue a runner job in Redis, then the Windows host runner creates/verifies the VM.\n"
+            "- Day-2 operations reuse the runner to verify, snapshot, inspect logs, restart services, or manage VM power with approval where required.\n\n"
             "**Data Flow:**\n"
-            "- Operational metadata and history are persisted through AVA state stores.\n"
-            "- Inference prompts/responses flow through the local Ollama runtime.\n\n"
+            "- Stored provisioning evidence is persisted as history; live verification must come from the host runner.\n"
+            "- Redis carries fast queue/status signals; durable state lives in AVA's runtime stores.\n"
+            "- Qwen receives only the context AVA chooses; it is not the owner of routing, policy, or runtime truth.\n\n"
             "**Failure Points:**\n"
-            "- API process health, policy service reachability, database/cache availability, model endpoint health.\n\n"
+            "- AVA container health, Redis/OPA/Postgres/Vault availability, Ollama reachability, runner heartbeat, VirtualBox state, NAT port conflicts, and VM bootstrap/network readiness.\n\n"
             "**Operational Checks:**\n"
-            "- Verify container health, listener port 5443, OPA/Redis/Postgres reachability, and model endpoint readiness."
+            "- Check `/health`, container status, Redis/OPA/Postgres/Vault, Ollama tags, runner heartbeat, VirtualBox VM state, SSH reachability, and HTTP 200 from created servers."
         ),
         "ava_kubernetes": (
             "**Components and Roles:**\n"
@@ -312,15 +307,15 @@ def _known_architecture_text(flow_key: str) -> str:
         ),
         "ava_linux_provisioning": (
             "**Status Note:**\n"
-            "- Linux provisioning is preserved on the experimental branch and is non-executing on master v1.0.3.\n\n"
-            "**Planned Components:**\n"
-            "- **Intent Router -> Approval Gate -> Provisioning Workflow -> VM Adapter -> Verification/Report**\n\n"
-            "**Planned Flow:**\n"
-            "- AVA parses infrastructure intent, enforces approval, then hands off to provider-specific provisioning workflow.\n"
-            "- Post-create bootstrap/verification/reporting complete the lifecycle.\n\n"
-            "**Current Master Boundary:**\n"
-            "- Diagram and architecture references are available for design visibility.\n"
-            "- Execution remains disabled in master; implementation continues on the experimental branch."
+            "- Phase 9 chat-to-VM provisioning is active on `v2-development`, with Day-2 operations in v2.1.\n\n"
+            "**Components:**\n"
+            "- **Chat intent router -> approval gate -> Redis job queue -> Windows host runner -> VirtualBox adapter -> Ubuntu VM -> bootstrap/hardening -> verification/evidence**\n\n"
+            "**Flow:**\n"
+            "- AVA parses the web-server request, collects specs, and requires chat approval.\n"
+            "- After approval, AVA queues a host-side runner job; the Windows runner creates the VirtualBox VM, injects cloud-init access, bootstraps nginx, applies baseline hardening, and verifies SSH/HTTP.\n"
+            "- AVA reports PuTTY details and evidence only after the runner writes the result.\n\n"
+            "**Day-2 Boundary:**\n"
+            "- Later operations such as live verify, nginx logs, snapshots, restart, stop/start, and rollback go back through the same guarded host-runner path."
         ),
         "kubernetes_ingress": (
             "**Components and Roles:**\n"
@@ -402,12 +397,22 @@ def _known_architecture_mermaid(flow_key: str) -> str:
         "ava_runtime": (
             "```mermaid\n"
             "graph LR\n"
-            "    Client[\"User Request\"] --> Ava[\"ava-agent:5443\\nFlask/Gunicorn\"]\n"
-            "    Ava --> Postgres[\"PostgreSQL:5432\"]\n"
-            "    Ava --> Redis[\"Redis:6379\"]\n"
-            "    Ava --> OPA[\"Open Policy Agent:8181\"]\n"
-            "    Ava --> Vault[\"HashiCorp Vault:8200\"]\n"
-            "    Ava --> Ollama[\"Ollama Host\"]\n"
+            "    User[\"User / Browser\"] --> UI[\"AVA UI\\nhttps://localhost:5443\"]\n"
+            "    UI --> Ava[\"ava-agent:5443\\nFlask/Gunicorn\"]\n"
+            "    Ava --> Router[\"AVA Router + Planner\\nmode selection\"]\n"
+            "    Router --> Knowledge[\"Grounded DevOps Knowledge\"]\n"
+            "    Router --> Approval[\"Approval + Policy Guard\"]\n"
+            "    Router --> Qwen[\"Ollama / Qwen\\nreasoning engine\"]\n"
+            "    Ava --> Redis[\"Redis:6379\\nqueues + fast state\"]\n"
+            "    Ava --> Postgres[\"PostgreSQL:5432\\ndurable state\"]\n"
+            "    Ava --> OPA[\"OPA:8181\\npolicy\"]\n"
+            "    Ava --> Vault[\"Vault:8200\\nsecrets\"]\n"
+            "    Approval --> Redis\n"
+            "    Redis --> Runner[\"Windows Host Runner\\nPowerShell/Python\"]\n"
+            "    Runner --> VBox[\"VirtualBox\"]\n"
+            "    VBox --> VM[\"Ubuntu VM\\nnginx/web_server\"]\n"
+            "    Runner --> Evidence[\"Live evidence\\nSSH/HTTP/snapshot/logs\"]\n"
+            "    Evidence --> Ava\n"
             "```"
         ),
         "ava_kubernetes": (
@@ -467,12 +472,16 @@ def _known_architecture_mermaid(flow_key: str) -> str:
             "graph LR\n"
             "    User[\"User Prompt\"] --> Intent[\"AVA Intent Router\"]\n"
             "    Intent --> Approval[\"Approval Gate\"]\n"
-            "    Approval --> Workflow[\"Provisioning Workflow (Experimental)\"]\n"
-            "    Workflow --> Adapter[\"VM Provider Adapter\"]\n"
+            "    Approval --> Queue[\"Redis Provisioning Queue\"]\n"
+            "    Queue --> Runner[\"Windows Host Runner\"]\n"
+            "    Runner --> Adapter[\"VirtualBox Adapter\"]\n"
             "    Adapter --> VM[\"Ubuntu Linux VM\"]\n"
-            "    VM --> Bootstrap[\"Role Bootstrap (Planned)\"]\n"
-            "    Bootstrap --> Verify[\"Verification + Report\"]\n"
-            "    Note[\"Master v1.0.3: non-executing\"] --> Workflow\n"
+            "    VM --> CloudInit[\"Cloud-init Access\"]\n"
+            "    CloudInit --> Bootstrap[\"nginx Bootstrap\"]\n"
+            "    Bootstrap --> Harden[\"baseline_linux Hardening\"]\n"
+            "    Harden --> Verify[\"SSH + HTTP 200 Verification\"]\n"
+            "    Verify --> Evidence[\"Runner Evidence\"]\n"
+            "    Evidence --> Chat[\"AVA Chat Status / PuTTY Details\"]\n"
             "```"
         ),
         "kubernetes_ingress": (
@@ -593,6 +602,15 @@ def build_ava_self_plan(route, evidence) -> AnswerPlan:
         for name, count in kb.items():
             lines.append(f"- {name}: {int(count or 0):,} chunks")
         answer = "\n".join(lines)
+    elif evidence.topic == "goal":
+        answer = (
+            "My goal is to be one local, approval-aware DevOps assistant with one consistent serving contract.\n"
+            "- I explain DevOps topics from grounded knowledge when a factual answer is needed.\n"
+            "- I use Qwen through Ollama as a reasoning engine, but AVA owns routing, policy, memory, and runtime truth.\n"
+            "- I block destructive requests, ask approval for risky operations, and keep operational evidence separate from old history.\n"
+            "- I can provision AVA-managed VirtualBox servers and help inspect or manage them through the Windows host runner.\n"
+            "- I can describe my own container/runtime boundaries without pretending Qwen is the source of truth."
+        )
     else:
         answer = (
             f"I am AVA {about.get('version', '')}, built by {about.get('built_by', 'unknown')}.\n"
@@ -771,6 +789,23 @@ def build_architecture_plan(route, evidence) -> AnswerPlan:
     topic = evidence.topic or route.topic or "external"
     response_mode = evidence.facts.get("response_mode", route.response_mode or "text")
     known_flow = None if topic == "self_runtime" else _known_architecture_flow_key(route.normalized_query, entities)
+
+    if topic == "self_runtime":
+        answer = _known_architecture_mermaid("ava_runtime") if response_mode == "diagram" else _known_architecture_text("ava_runtime")
+        return AnswerPlan(
+            intent="architecture",
+            mode="deterministic",
+            topic="ava_runtime",
+            answer=answer,
+            evidence={
+                "topic": "ava_runtime",
+                "response_mode": response_mode,
+                "evidence_blocks": evidence_blocks,
+                "sources": evidence.facts.get("sources", []),
+            },
+            entities=entities,
+            confidence="high",
+        )
 
     if known_flow:
         answer = _known_architecture_mermaid(known_flow) if response_mode == "diagram" else _known_architecture_text(known_flow)
