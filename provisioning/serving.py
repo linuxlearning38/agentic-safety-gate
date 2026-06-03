@@ -616,8 +616,6 @@ def _runner_failed(runner: dict[str, Any] | None) -> bool:
 def _runner_job_state_expired(session) -> bool:
     if session.phase in {SessionPhase.COMPLETED, SessionPhase.FAILED, SessionPhase.CANCELLED}:
         return False
-    if session.instance_id:
-        return False
     updated_at = getattr(session, "updated_at", None)
     if not updated_at:
         return False

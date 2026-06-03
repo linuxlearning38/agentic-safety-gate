@@ -27,6 +27,7 @@ Current active line on `v2-development`:
 - `v2.0.0` - Phase 9 baseline: chat approval to VirtualBox Ubuntu web server, SSH, nginx, hardening, HTTP 200.
 - `v2.0.1` - Phase 9.5 operational hardening: startup reliability, runner heartbeat, Redis/session resilience, named data volume, cleaner reboot behavior.
 - `v2.1` - Phase 9 Day-2 Operations: manage AVA-created servers after provisioning.
+- `v2.1.x` - Phase 9.6 Runtime Truth And Reliability: reconcile session, Redis, runner, VirtualBox, and live evidence before AVA speaks or blocks.
 
 What is intentionally true on this branch:
 
@@ -37,6 +38,7 @@ What is intentionally true on this branch:
 - AVA can report connection details, provisioning evidence, live web verification, snapshots, and Day-2 operation status.
 - AVA blocks destructive requests and approval-gates medium/high-risk operations.
 - Stored evidence must be labeled as stored evidence; live claims must come from live checks.
+- Stale non-terminal provisioning sessions must fail open for retry instead of blocking the user forever.
 
 ## Product Boundary
 
@@ -114,6 +116,7 @@ Keep `AGENTS.md` as the short operational truth, not the full history.
 - `AGENTS.md` - serving contract, scope boundary, current durable product truth.
 - `docs/AVA_V2_PHASE9_RUNNER_BRIDGE_DESIGN.md` - Phase 9 host runner bridge design.
 - `docs/AVA_V2_PHASE9_DAY2_OPERATIONS.md` - Phase 9 Day-2 Operations contract.
+- `docs/AVA_V2_PHASE9_RUNTIME_TRUTH_RELIABILITY.md` - Phase 9.6 runtime truth and stale-state reliability contract.
 - `docs/AVA_V1_CURRENT_CAPABILITIES.md` - historical v1 capability sheet.
 - release notes and validation docs - version snapshots and test evidence.
 
