@@ -49,6 +49,8 @@ FUNCTIONS = {
     "_response_summary",
     "_grounding_confident_enough",
     "_is_healing_query",
+    "_is_healing_incident_query",
+    "_effective_intent",
     "_json_only_requested",
     "_predict_heal_action",
     "_format_playbook_template",
@@ -1033,6 +1035,11 @@ def main():
     check("server routes to general_qwen", ns["_route_query"]("What is server?").intent == "general_qwen")
     check("photosynthesis routes to general_qwen", ns["_route_query"]("Explain photosynthesis").intent == "general_qwen")
     check("math routes to general_qwen", ns["_route_query"]("What is 2+2?").intent == "general_qwen")
+    disk_alert_route = ns["_route_query"]("worker-1 disk usage is 95% full")
+    check("metric alert raw route is broad before effective intent", disk_alert_route.intent == "general_qwen")
+    check("metric alert effective intent becomes healing", ns["_effective_intent"]("worker-1 disk usage is 95% full", disk_alert_route) == "healing_incident")
+    check("controlled route remains source of truth for ava self", ns["_effective_intent"]("what is your architecture", ns["_route_query"]("what is your architecture")) == "architecture")
+    check("controlled route remains source of truth for provisioning", ns["_effective_intent"]("i want a web server", ns["_route_query"]("i want a web server")) == "provisioning")
     check("general question bypasses kb", ns["_should_direct_unknown_to_llm"]("What is machine learning?") is True)
     check("general comparison bypasses kb", ns["_should_direct_unknown_to_llm"]("TCP vs UDP") is True)
     check("devops definition stays controlled", ns["_should_direct_unknown_to_llm"]("What is readiness probe?") is False)

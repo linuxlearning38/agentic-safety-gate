@@ -121,6 +121,26 @@ def main() -> int:
         ]
     )
 
+    source = SOURCE_PATH.read_text(encoding="utf-8")
+    ask_source = _extract_functions(source, {"ask"})
+    controlled_source = _extract_functions(source, {"_resolve_controlled_query"})
+    failures.extend(
+        [
+            check(
+                "ask endpoint does not re-run detect_query_intent after initial route",
+                "detect_query_intent(query)" not in ask_source,
+            ),
+            check(
+                "controlled resolver does not re-run detect_query_intent after initial route",
+                "detect_query_intent(query)" not in controlled_source,
+            ),
+            check(
+                "ask endpoint routes before meta fallback",
+                ask_source.find("controlled_route = _route_query(query)") < ask_source.find("if is_meta_question(query)"),
+            ),
+        ]
+    )
+
     failed = len([item for item in failures if not item])
     if failed:
         print(f"\nServing contract regression failed: {failed} issue(s)")

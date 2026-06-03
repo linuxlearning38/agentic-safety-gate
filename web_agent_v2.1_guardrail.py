@@ -2524,7 +2524,7 @@ def _resolve_controlled_query(query, *, controlled_route=None, prior_messages=No
             "sources_used": resolved["sources_used"],
         }
 
-    if _is_healing_query(query) or detect_query_intent(query) == "healing_incident":
+    if _effective_intent(query, controlled_route) == "healing_incident":
         response, healing_meta = _build_healing_response(query)
         return {
             "type": "healing",
@@ -3244,13 +3244,10 @@ def _build_healing_response(query):
 
     return response_text, body
 
-def detect_query_intent(query):
+def _is_healing_incident_query(query):
     q = _normalize_user_query(query).lower().strip()
-    controlled_route = _route_query(query)
-    if controlled_route.intent in ("ava_self", "memory_store", "memory_recall", "troubleshooting", "architecture", "follow_up", "comparison", "definition", "provisioning", "general_qwen"):
-        return controlled_route.intent
     if _is_healing_query(q):
-        return "healing_incident"
+        return True
     # Metric-alert patterns not caught by _is_healing_query compound check
     _alert_terms = [
         "disk usage", "disk is", "disk at",
@@ -3259,10 +3256,27 @@ def detect_query_intent(query):
         "worker-", "node-",
     ]
     if any(k in q for k in _alert_terms):
-        return "healing_incident"
+        return True
     if re.search(r'\d+\s*%', q) and any(k in q for k in ["disk", "cpu", "memory", "usage", "full"]):
+        return True
+    return False
+
+
+def _effective_intent(query, controlled_route=None):
+    controlled_route = controlled_route or _route_query(query)
+    if _is_healing_incident_query(query):
         return "healing_incident"
+    if controlled_route.intent in (
+        "ava_self", "memory_store", "memory_recall", "troubleshooting",
+        "architecture", "follow_up", "comparison", "definition",
+        "provisioning", "general_qwen",
+    ):
+        return controlled_route.intent
     return "general"
+
+
+def detect_query_intent(query):
+    return _effective_intent(query)
 
 def build_memory_context(query=None):
     if not AVA_MEMORY:
@@ -4082,7 +4096,8 @@ def ask():
             "run kubectl", "execute", "apply the fix", "apply this", "run this",
             "run the", "kubectl apply", "kubectl exec", "diagnose now", "check now",
         ])
-        graph_name = match_graph(query) if _graph_explicit or detect_query_intent(query) not in ("troubleshooting", "definition", "ava_self", "healing_incident") else None
+        effective_intent = _effective_intent(query, controlled_route)
+        graph_name = match_graph(query) if _graph_explicit or effective_intent not in ("troubleshooting", "definition", "ava_self", "healing_incident") else None
         if graph_name:
             logger.info(f"[*] Command Graph matched: {graph_name}")
             _graph_t0    = time.time()
@@ -4165,7 +4180,7 @@ def ask():
             "run kubectl", "execute", "apply the fix", "apply this", "run this",
             "run the", "kubectl apply", "kubectl exec",
         ])
-        _query_intent_here = detect_query_intent(query)
+        _query_intent_here = effective_intent
         if _query_intent_here == "troubleshooting" and not _explicit_execution:
             is_problem_query = False
 
