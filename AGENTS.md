@@ -1,105 +1,124 @@
-# AVA Project Notes (v1.0 Scope Lock)
+# AVA Project Notes (v2 Development Contract)
 
 ## Serving Contract
 
 AVA must behave like one assistant with one brain:
 
-- AVA decides routing and truth source.
+- AVA decides routing and truth source before any answer is produced.
+- AVA knows when to answer exactly from product/runtime truth.
+- AVA knows when to use grounded DevOps knowledge.
+- AVA knows when to use Qwen for reasoning.
+- AVA knows when to block, ask approval, or hand work to the host runner.
+- AVA never leaks internal subsystem confusion to the user.
+- AVA answers naturally; internal routes stay invisible.
+
+Correct separation:
+
+- AVA is the decision-maker.
 - Qwen is a reasoning engine only when AVA selects it.
-- Security and approval policy are enforced before execution.
-- Internal subsystem boundaries are invisible to the user.
+- Qwen is not the owner of truth, routing, policy, approval, memory, or runtime state.
 
-## Current State
+If AVA does not classify the request first, the serving contract is broken.
 
-Current stable line on `master`:
+## Current Product Line
 
-- `v1.0` - scope-locked baseline release.
-- `v1.0.1` - stabilization and hardening patch.
-- `v1.0.2` - scope enforcement, answer quality fixes, deterministic diagrams.
-- `v1.0.3` - professional polish patch (LICENSE, README credential cleanup, real CI, repo hygiene).
-- `v1.0.4` - runtime quality patch (vulnerability reporting cleanup, host-risk alignment, controlled diagram routing, rigorous validation).
+Current active line on `v2-development`:
 
-What is now intentionally true on `master`:
+- `v2.0.0` - Phase 9 baseline: chat approval to VirtualBox Ubuntu web server, SSH, nginx, hardening, HTTP 200.
+- `v2.0.1` - Phase 9.5 operational hardening: startup reliability, runner heartbeat, Redis/session resilience, named data volume, cleaner reboot behavior.
+- `v2.1` - Phase 9 Day-2 Operations: manage AVA-created servers after provisioning.
 
-- AVA enforces DevOps-only scope on v1.
-- Non-DevOps prompts are redirected instead of answered out of scope.
-- Deterministic diagrams exist for key architecture prompts.
-- Readiness vs liveness answer quality is fixed and regression-covered.
-- Runtime vulnerability scanning is restored and reported more clearly.
-- Host-risk and suspicious-activity outputs stay aligned with environment truth.
-- Repository presentation now matches shipped behavior more honestly.
+What is intentionally true on this branch:
 
-## v1.0 Product Boundary (Master)
+- AVA can answer DevOps knowledge questions from grounded retrieval.
+- AVA can answer AVA self/runtime/architecture questions deterministically.
+- AVA can render controlled architecture diagrams for AVA and common DevOps flows.
+- AVA can provision VirtualBox Ubuntu web servers through chat approval and the Windows host runner.
+- AVA can report connection details, provisioning evidence, live web verification, snapshots, and Day-2 operation status.
+- AVA blocks destructive requests and approval-gates medium/high-risk operations.
+- Stored evidence must be labeled as stored evidence; live claims must come from live checks.
 
-Master branch is intentionally limited to:
+## Product Boundary
+
+In scope for `v2-development`:
 
 - Exact AVA/self/runtime answers.
 - Grounded DevOps knowledge responses.
-- Safe system and container inspection tools.
+- Safe local system and container inspection.
 - Approval-required handling for medium/high-risk actions.
 - Deterministic blocking for destructive requests.
+- Phase 9 chat-to-VM provisioning through VirtualBox.
+- Phase 9 Day-2 operations on AVA-managed VMs: status, verify, logs, restart, snapshot, rollback, stop/start, and evidence-backed responses.
 
-Out of scope on master:
+Out of scope unless explicitly added by a future phase:
 
-- VM provisioning/orchestration.
-- VirtualBox bridge execution path.
-- Unattended OS install + post-install role bootstrap.
-
-Provisioning work is preserved on:
-
-- `provisioning-v0.1-experimental`
+- Cloud provider provisioning beyond the local machine.
+- Multi-role infrastructure beyond the implemented roles.
+- Autonomous destructive changes without approval.
+- Public internet exposure unless the user explicitly configures a tunnel or reverse proxy.
 
 ## Key Modules
 
-- `web_agent_v2.1_guardrail.py` - serving contract, `/ask`, UI.
-- `control/secure_executor.py` - execution authority.
-- `control/tool_registry.py` - structured operational tools.
-- `control/capability_router.py` - deterministic operational capability mapping.
+- `web_agent_v2.1_guardrail.py` - single serving contract, `/ask`, UI, response finalization.
 - `control/input_router.py` - intent-level controlled routing.
+- `control/answer_planner.py` - deterministic controlled answer composition and diagrams.
+- `control/evidence_selector.py` - selects evidence for controlled DevOps answers.
+- `control/capability_router.py` - deterministic operational capability mapping.
+- `control/secure_executor.py` - execution authority and safe tool boundary.
+- `control/tool_registry.py` - structured local operational tools.
 - `control/security_layer.py` - security logging and integrity.
 - `control/approval.py` - approval storage primitives.
+- `provisioning/serving.py` - chat-side provisioning and Day-2 session handling.
+- `provisioning/runner/host_runner.py` - Windows-native VirtualBox and SSH operation runner.
+- `provisioning/runner/job_queue.py` - Redis-backed runner job queue.
+- `provisioning/runner/result_writer.py` - runner status and evidence writer.
 
-## Rules
+## Non-Negotiable Rules
 
-- No new scope on master beyond v1.0.
-- Do not reintroduce provisioning codepaths into master.
+- Route first, answer second.
 - Keep deterministic routing ahead of freeform fallback.
 - Never bypass secure executor or policy checks.
+- Never bypass provisioning approval for VM creation.
+- Never silently create a second VM on top of an active non-terminal request.
+- Never present expired or stored evidence as live truth.
+- Never let Qwen invent AVA product facts, tools, credentials, host state, or security posture.
 - Keep destructive blocking strict and early.
+- Update this file when the serving contract, scope boundary, or durable product truth changes.
 
 ## Verification Baseline
 
 Run before closing major serving changes:
 
 - `tests/intelligence_regression.py`
+- `tests/serving_contract_regression.py`
 - `tests/hybrid_retrieval_regression.py`
-- `tests/ava_benchmark_suite.py`
 - `tests/capability_router_regression.py`
 - `tests/security_hardening_regression.py`
-- `tests/ava_e2e_live_test.py`
+- `tests/provisioning_phase6_serving_regression.py`
+- `tests/provisioning_phase9_runner_bridge_regression.py`
 - `tests/ava_500_robust_audit.py`
+
+Run live checks when the change touches runtime, provisioning, runner, or UI behavior:
+
+- AVA `/health`
+- Docker container status
+- runner heartbeat
+- VirtualBox VM state
+- SSH reachability
+- HTTP 200 for AVA-created web servers
 
 ## Documentation Map
 
 Keep `AGENTS.md` as the short operational truth, not the full history.
 
-- `AGENTS.md` - serving contract, scope lock, branch intent, latest durable state.
-- `docs/AVA_V1_CURRENT_CAPABILITIES.md` - honest current v1 capability sheet.
-- `V1_1_WISHLIST.md` - current polish backlog and next-step sequencing for v1.1 work.
-- `V1_0_RELEASE_NOTES.md` - v1.0 baseline release snapshot.
-- `V1_0_1_RELEASE_NOTES.md` - stabilization and validation snapshot.
-- `V1_0_2_RELEASE_NOTES.md` - scope and answer-quality hardening snapshot.
-- `V1_0_3_RELEASE_NOTES.md` - repo polish and professionalism snapshot.
-- `V1_0_4_RELEASE_NOTES.md` - runtime quality, vulnerability, and validation snapshot.
-
-- `docs/AVA_V2_PHASE9_RUNNER_BRIDGE_DESIGN.md` - Phase 9 design contract: host-side runner
-  bridge that closes the chat-to-VM gap discovered in live validation on 2026-05-02.
-- `docs/AVA_V2_PHASE9_DAY2_OPERATIONS.md` - Phase 9 v2.1 Day-2 Operations contract:
-  manage AVA-created VMs after provisioning with status, logs, restart, snapshot,
-  rollback, stop/start, and evidence-backed responses.
+- `AGENTS.md` - serving contract, scope boundary, current durable product truth.
+- `docs/AVA_V2_PHASE9_RUNNER_BRIDGE_DESIGN.md` - Phase 9 host runner bridge design.
+- `docs/AVA_V2_PHASE9_DAY2_OPERATIONS.md` - Phase 9 Day-2 Operations contract.
+- `docs/AVA_V1_CURRENT_CAPABILITIES.md` - historical v1 capability sheet.
+- release notes and validation docs - version snapshots and test evidence.
 
 Rule of thumb:
 
-- Update `AGENTS.md` when the serving contract, scope boundary, or durable product truth changes.
+- Update `AGENTS.md` when future agents need different behavior.
 - Update release notes when a version ships.
 - Update capability docs when user-visible behavior changes.
