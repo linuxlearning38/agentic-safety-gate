@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Any, Callable
 from urllib.request import urlopen
@@ -22,7 +23,7 @@ from provisioning.rollback import ProvisioningRollbackManager
 from provisioning.roles.web_server import WebServerRole
 from provisioning.verify import VerificationEngine
 
-from .job_queue import Day2OperationJob, Day2OperationResult, ProvisioningJob, RedisProvisioningJobQueue
+from .job_queue import ConsoleSessionRequest, Day2OperationJob, Day2OperationResult, ProvisioningJob, RedisProvisioningJobQueue
 from .result_writer import ProvisioningResultWriter
 
 
@@ -48,6 +49,42 @@ def _run(command: list[str], *, timeout: int = 120, check: bool = True) -> subpr
 
 def _ps_single_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _ps_array_literal(values: list[str]) -> str:
+    return "@(" + ", ".join(_ps_single_quote(str(value)) for value in values) + ")"
+
+
+def _powershell_start_process_command(file_path: str, argument_list: list[str]) -> list[str]:
+    script = (
+        "Start-Process "
+        f"-FilePath {_ps_single_quote(file_path)} "
+        f"-ArgumentList {_ps_array_literal(argument_list)}"
+    )
+    return ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script]
+
+
+def _ssh_config_path_value(path: str | Path | None) -> str:
+    """Quote OpenSSH config path values so Windows paths with spaces survive parsing."""
+    if not path:
+        return "NUL"
+    normalized = str(Path(path)).replace("\\", "/")
+    escaped = normalized.replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _find_putty_binary() -> str | None:
+    candidates = [
+        os.getenv("AVA_PUTTY_PATH"),
+        shutil.which("putty"),
+        shutil.which("putty.exe"),
+        r"C:\Program Files\PuTTY\putty.exe",
+        r"C:\Program Files (x86)\PuTTY\putty.exe",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(candidate)
+    return None
 
 
 def _windows_private_key_acl_command(path: Path) -> list[str]:
@@ -251,6 +288,7 @@ class HostRunner:
             image_name=self.config.template_name,
         )
         self.logger = logger or _build_logger(self.config.log_path)
+        self._console_threads: dict[str, threading.Thread] = {}
 
     def run_forever(self) -> None:
         processed = 0
@@ -260,6 +298,10 @@ class HostRunner:
             if self.config.max_jobs is not None and processed >= self.config.max_jobs:
                 self.logger.info("Max jobs reached; exiting")
                 return
+            console = self.queue.claim_next_console_session(timeout_seconds=1)
+            if console is not None:
+                self._start_console_session(console)
+                continue
             operation = self.queue.claim_next_day2_operation(timeout_seconds=1)
             if operation is not None:
                 self._write_day2_processing_heartbeat(operation)
@@ -277,6 +319,10 @@ class HostRunner:
 
     def run_once(self) -> bool:
         self._write_idle_heartbeat()
+        console = self.queue.claim_next_console_session(timeout_seconds=1)
+        if console is not None:
+            self._start_console_session(console)
+            return True
         operation = self.queue.claim_next_day2_operation(timeout_seconds=1)
         if operation is not None:
             self._write_day2_processing_heartbeat(operation)
@@ -335,10 +381,12 @@ class HostRunner:
                 result = self._execute_live_verify(operation)
             elif operation.operation == "nginx_logs":
                 result = self._execute_nginx_logs(operation)
+            elif operation.operation == "open_ssh_console":
+                result = self._execute_open_ssh_console(operation)
             else:
                 raise RuntimeError(
                     f"Operation '{operation.operation}' is approved but not executable yet. "
-                    "Snapshot, live web verification, and nginx log retrieval are enabled first."
+                    "Snapshot, live web verification, nginx log retrieval, and SSH console launch are enabled first."
                 )
             self.queue.write_day2_status(operation.operation_id, result.status)
             self.queue.write_day2_result(result)
@@ -361,6 +409,136 @@ class HostRunner:
                     error={"message": str(exc), "failure_class": "day2_operation_failed"},
                 )
             )
+
+    def _start_console_session(self, request: ConsoleSessionRequest) -> None:
+        if request.console_id in self._console_threads and self._console_threads[request.console_id].is_alive():
+            return
+        worker = threading.Thread(
+            target=self._run_console_session,
+            args=(request,),
+            name=f"ava-console-{request.console_id[:8]}",
+            daemon=True,
+        )
+        self._console_threads[request.console_id] = worker
+        worker.start()
+
+    def _run_console_session(self, request: ConsoleSessionRequest) -> None:
+        proc: subprocess.Popen[str] | None = None
+        try:
+            self._validate_binaries()
+            state = self.adapter.get_instance_state(request.instance_id)
+            if not state.exists:
+                raise RuntimeError(f"VirtualBox VM '{request.instance_id}' does not exist")
+            if state.power_state != "running":
+                raise RuntimeError(f"VirtualBox VM '{request.instance_id}' is not running")
+
+            key_path = self._find_runner_key_path_for(
+                instance_id=request.instance_id,
+                instance_name=request.instance_name,
+                runner_job_id=request.runner_job_id,
+            )
+            if not key_path:
+                raise RuntimeError(
+                    "Runner SSH key is not available for this VM. Browser console requires a retained AVA runner key."
+                )
+
+            command = [
+                self.config.ssh_binary,
+                "-tt",
+                "-i",
+                str(key_path),
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "UserKnownHostsFile=" + _ssh_config_path_value(self._console_known_hosts_path(request)),
+                "-p",
+                str(request.ssh_port),
+                f"{request.username}@{request.ssh_host}",
+                self._console_shell_command(request),
+            ]
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            self.queue.update_console_session(
+                request.console_id,
+                status="connected",
+                pid=proc.pid,
+                username=request.username,
+                ssh_host=request.ssh_host,
+                ssh_port=request.ssh_port,
+                instance_id=request.instance_id,
+                instance_name=request.instance_name,
+            )
+            self.queue.append_console_output(
+                request.console_id,
+                f"AVA Web Console connected to {request.instance_name or request.instance_id} as {request.username}.\r\n",
+            )
+
+            def _reader() -> None:
+                assert proc is not None and proc.stdout is not None
+                while True:
+                    chunk = proc.stdout.read(1)
+                    if not chunk:
+                        break
+                    self.queue.append_console_output(request.console_id, chunk)
+
+            reader = threading.Thread(target=_reader, name=f"ava-console-reader-{request.console_id[:8]}", daemon=True)
+            reader.start()
+
+            idle_deadline = time.monotonic() + 30 * 60
+            while proc.poll() is None:
+                state_doc = self.queue.get_console_session(request.console_id) or {}
+                if state_doc.get("status") == "closing":
+                    break
+                item = self.queue.read_console_input(request.console_id, timeout_seconds=1)
+                if item is not None:
+                    idle_deadline = time.monotonic() + 30 * 60
+                    if proc.stdin:
+                        proc.stdin.write(item)
+                        proc.stdin.flush()
+                if time.monotonic() > idle_deadline:
+                    self.queue.append_console_output(request.console_id, "\r\nAVA Web Console idle timeout reached.\r\n")
+                    break
+
+            if proc.poll() is None:
+                proc.terminate()
+            self.queue.update_console_session(request.console_id, status="closed", exit_code=proc.poll())
+            self.queue.append_console_output(request.console_id, "\r\nAVA Web Console closed.\r\n")
+        except Exception as exc:
+            self.logger.exception("Console session %s failed: %s", request.console_id, exc)
+            self.queue.update_console_session(request.console_id, status="failed", error=str(exc))
+            self.queue.append_console_output(request.console_id, f"\r\nAVA Web Console failed: {exc}\r\n")
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+
+    def _console_known_hosts_path(self, request: ConsoleSessionRequest) -> Path:
+        """Use a scoped known_hosts file so recreated NAT VMs do not collide."""
+        safe_console_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in request.console_id)
+        path = self.config.work_root / "known_hosts_console_sessions" / f"{safe_console_id}.known_hosts"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _console_shell_command(self, request: ConsoleSessionRequest) -> str:
+        """Start a quiet shell suitable for the simple browser console."""
+        label = request.instance_name or request.instance_id or "ava-vm"
+        safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in label)
+        prompt = f"{request.username}@{safe_label}:\\w$ "
+        return (
+            "TERM=dumb "
+            "PAGER=cat "
+            "SYSTEMD_PAGER=cat "
+            "SYSTEMD_COLORS=0 "
+            "GIT_PAGER=cat "
+            f"PS1='{prompt}' "
+            "bash --noprofile --norc -i"
+        )
 
     def _execute_snapshot(self, operation: Day2OperationJob) -> Day2OperationResult:
         self._validate_vboxmanage()
@@ -392,6 +570,56 @@ class HostRunner:
                 "power_state": state.power_state,
                 "provider": "virtualbox",
                 "runner": "host_runner",
+            },
+        )
+
+    def _execute_open_ssh_console(self, operation: Day2OperationJob) -> Day2OperationResult:
+        self._validate_vboxmanage()
+        state = self.adapter.get_instance_state(operation.instance_id)
+        if not state.exists:
+            raise RuntimeError(f"VirtualBox VM '{operation.instance_id}' does not exist")
+        if state.power_state != "running":
+            raise RuntimeError(f"VirtualBox VM '{operation.instance_id}' is not running")
+
+        connection = self.adapter.get_connection_info(operation.instance_id)
+        host = operation.ssh_host or connection.host
+        port = int(operation.ssh_port or connection.port)
+        username = str((operation.metadata or {}).get("username") or "avaadmin").strip() or "avaadmin"
+
+        putty = _find_putty_binary()
+        if putty:
+            tool = "PuTTY"
+            command = _powershell_start_process_command(
+                putty,
+                ["-ssh", f"{username}@{host}", "-P", str(port)],
+            )
+        else:
+            tool = "Windows OpenSSH"
+            ssh_binary = str(self.config.ssh_binary or "ssh")
+            if not Path(ssh_binary).exists():
+                ssh_binary = shutil.which("ssh") or shutil.which("ssh.exe") or "ssh"
+            ssh_command = f"& {_ps_single_quote(ssh_binary)} -p {port} {_ps_single_quote(f'{username}@{host}')}"
+            command = _powershell_start_process_command(
+                "powershell.exe",
+                ["-NoExit", "-Command", ssh_command],
+            )
+
+        _run(command, timeout=30)
+        return Day2OperationResult(
+            operation_id=operation.operation_id,
+            operation=operation.operation,
+            status="completed",
+            instance_id=operation.instance_id,
+            instance_name=operation.instance_name,
+            evidence={
+                "action": "ssh_console_launched",
+                "tool": tool,
+                "ssh_host": host,
+                "ssh_port": port,
+                "username": username,
+                "provider": "virtualbox",
+                "runner": "host_runner",
+                "password_handling": "not_passed_to_process",
             },
         )
 
@@ -544,14 +772,27 @@ class HostRunner:
         )
 
     def _find_runner_key_path(self, operation: Day2OperationJob) -> Path | None:
+        return self._find_runner_key_path_for(
+            instance_id=operation.instance_id,
+            instance_name=operation.instance_name,
+            runner_job_id=str((operation.metadata or {}).get("runner_job_id") or "").strip() or None,
+            metadata_key=str((operation.metadata or {}).get("runner_key_path") or "").strip() or None,
+        )
+
+    def _find_runner_key_path_for(
+        self,
+        *,
+        instance_id: str,
+        instance_name: str | None = None,
+        runner_job_id: str | None = None,
+        metadata_key: str | None = None,
+    ) -> Path | None:
         candidates: list[Path] = []
-        metadata_key = str((operation.metadata or {}).get("runner_key_path") or "").strip()
         if metadata_key:
             candidates.append(Path(metadata_key))
-        if operation.instance_name:
-            candidates.append(self.config.work_root / "keys" / f"{operation.instance_name}_ava_runner_ed25519")
-        candidates.append(self.config.work_root / "keys" / f"{operation.instance_id}_ava_runner_ed25519")
-        runner_job_id = str((operation.metadata or {}).get("runner_job_id") or "").strip()
+        if instance_name:
+            candidates.append(self.config.work_root / "keys" / f"{instance_name}_ava_runner_ed25519")
+        candidates.append(self.config.work_root / "keys" / f"{instance_id}_ava_runner_ed25519")
         if runner_job_id:
             candidates.append(self.config.work_root / runner_job_id / "ava_runner_ed25519")
         for candidate in candidates:

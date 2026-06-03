@@ -20,6 +20,8 @@ from provisioning.day2 import (
     format_live_nginx_logs_response,
     format_live_verify_queued_response,
     format_live_verify_response,
+    format_open_ssh_console_queued_response,
+    format_open_ssh_console_response,
     format_read_only_response,
 )
 from provisioning.runner import ProvisioningJobQueue, ProvisioningJobResult, RedisProvisioningJobQueue
@@ -394,7 +396,7 @@ class ProvisioningChatService:
                 session,
             )
         if not operation.requires_approval:
-            if operation.operation in {"verify", "nginx_logs"}:
+            if operation.operation in {"verify", "nginx_logs", "open_ssh_console"}:
                 live_operation = self._queue_live_read_only_operation(operation, session, runner, result)
                 if live_operation:
                     return live_operation
@@ -545,7 +547,11 @@ class ProvisioningChatService:
             ssh_host=result.ssh_host,
             ssh_port=result.ssh_port,
             http_port=result.http_port,
-            metadata={"read_only": True, "runner_job_id": runner.get("job_id")},
+            metadata={
+                "read_only": True,
+                "runner_job_id": runner.get("job_id"),
+                "username": (session.collected_answers or {}).get("username", "avaadmin"),
+            },
         )
         existing_operations = list((session.collected_answers or {}).get("day2_operation_ids") or [])
         existing_operations.append(day2_job.operation_id)
@@ -560,9 +566,13 @@ class ProvisioningChatService:
         if operation_result:
             if operation.operation == "nginx_logs":
                 return self._result(format_live_nginx_logs_response(operation_result, result=result), session)
+            if operation.operation == "open_ssh_console":
+                return self._result(format_open_ssh_console_response(operation_result, result=result), session)
             return self._result(format_live_verify_response(operation_result, result=result), session)
         if operation.operation == "nginx_logs":
             return self._result(format_live_nginx_logs_queued_response(day2_job.operation_id, result=result), session)
+        if operation.operation == "open_ssh_console":
+            return self._result(format_open_ssh_console_queued_response(day2_job.operation_id, result=result), session)
         return self._result(format_live_verify_queued_response(day2_job.operation_id, result=result), session)
 
     def _wait_for_day2_result(self, operation_id: str, *, timeout_seconds: float) -> Any | None:

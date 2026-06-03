@@ -1,7 +1,7 @@
 # AVA v2 Phase 9 — Day-2 Operations
 
 Branch: `v2-development`
-Status: Slice 2 started — chat routing, approval contract, operation queue, and snapshot execution
+Status: Slice 2 expanded — chat routing, approval contract, operation queue, snapshot execution, live verification, log retrieval, and SSH console launch
 Target version: `v2.1`
 
 ## Purpose
@@ -46,6 +46,9 @@ Initial supported commands:
 - `rollback to last snapshot`
 - `stop the VM`
 - `start the VM`
+- `open PuTTY`
+- `open SSH console`
+- `open web console`
 - `what did you do and what evidence do you have?`
 
 These operations prove AVA can manage a server lifecycle, not just create a
@@ -85,17 +88,37 @@ Implemented in this slice:
 - approved `snapshot` operations execute through `VBoxManage snapshot <vm> take <name>`
 - snapshot results are written back to Redis with structured evidence
 - chat status/evidence can show the latest server-management operation result
+- live `verify the web server` checks current VirtualBox state, SSH TCP reachability, and host HTTP 200 through the runner
+- live `show nginx logs` retrieves recent nginx service/access/error evidence through the retained runner key
+- `open PuTTY` and `open SSH console` queue a low-risk host-runner operation that launches a local SSH console
 
 Still pending in this slice:
 
-- live nginx log retrieval through SSH
 - approved nginx restart through SSH
-- live read-only service checks through SSH
+- embedded browser terminal integration
 
-Important design note: guest SSH actions need durable runner identity. Earlier
-provisioning used a per-job runner key that may be deleted after cleanup. AVA
-must not pretend to restart nginx or read logs until a durable, protected runner
-SSH identity is added for future provisioned VMs.
+Important design note: guest SSH actions need durable runner identity. Newer
+Phase 9 VMs retain a protected `ava-runner` SSH key for live log and service
+operations. Older VMs created before that retention behavior may not support
+guest SSH Day-2 actions; AVA must report that honestly instead of pretending
+logs or service changes were executed.
+
+SSH console launch boundary:
+
+- AVA opens a local PuTTY window when PuTTY is installed.
+- If PuTTY is not installed, AVA falls back to a Windows OpenSSH terminal.
+- AVA never passes the VM password on the process command line.
+- The user types the temporary or changed VM password manually in the opened console.
+- This is not yet an embedded browser terminal; that belongs to a later UI slice.
+
+AVA Web Console boundary:
+
+- `open web console` opens the browser-based AVA Web Console panel.
+- The browser talks only to AVA, not directly to the VM SSH port.
+- The Windows host runner bridges the console to the VM using the retained
+  `ava-runner` key.
+- This is the preferred path for future LAN/public AVA access.
+- See `docs/AVA_V2_PHASE9_WEB_CONSOLE.md`.
 
 ### Slice 3 — Rollback And Power Controls
 
@@ -235,6 +258,7 @@ Low-risk read-only operations should not require approval:
 - show connection details
 - show recent logs
 - show disk/memory usage
+- open local SSH console for an AVA-managed VM
 
 Medium-risk operations require approval:
 

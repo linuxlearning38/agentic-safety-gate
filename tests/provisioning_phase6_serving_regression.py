@@ -170,6 +170,24 @@ class FakeProvisioningJobQueue:
                 },
                 completion_timestamp="2026-05-02T00:15:45+00:00",
             )
+        if operation == "open_ssh_console":
+            self.day2_statuses[operation_id] = "completed"
+            self.day2_results[operation_id] = Day2OperationResult(
+                operation_id=operation_id,
+                operation="open_ssh_console",
+                status="completed",
+                instance_id=instance_id,
+                instance_name=instance_name,
+                evidence={
+                    "action": "ssh_console_launched",
+                    "tool": "PuTTY",
+                    "ssh_host": ssh_host,
+                    "ssh_port": ssh_port,
+                    "username": "avaadmin",
+                    "password_handling": "not_passed_to_process",
+                },
+                completion_timestamp="2026-05-02T00:15:50+00:00",
+            )
         return job
 
     def claim_next_day2_operation(self, *, timeout_seconds=1):
@@ -401,6 +419,10 @@ def main() -> int:
         completed_evidence = service.handle("user-1", "what did you do and what evidence do you have?", route_intent=None)
         day2_status = service.handle("user-1", "show status of my web server", route_intent=None)
         day2_logs = service.handle("user-1", "show nginx logs", route_intent=None)
+        day2_job_count_before_connection_help = len(job_queue.day2_jobs)
+        day2_connection_help = service.handle("user-1", "how do I connect with PuTTY?", route_intent=None)
+        day2_job_count_after_connection_help = len(job_queue.day2_jobs)
+        day2_open_console = service.handle("user-1", "open PuTTY", route_intent=None)
         day2_restart = service.handle("user-1", "restart nginx", route_intent=None)
         day2_approval_id = day2_restart.metadata["provisioning"]["approval_id"]
         day2_approval_entry = approval.get_by_id(day2_approval_id)
@@ -431,6 +453,11 @@ def main() -> int:
                 check("day-2 status is handled", day2_status.handled),
                 check("day-2 status reports active vm", "ava-web-01" in day2_status.response),
                 check("day-2 logs are handled", day2_logs.handled),
+                check("putty help stays informational", "putty settings" in day2_connection_help.response.lower()),
+                check("putty help does not queue console launch", day2_job_count_after_connection_help == day2_job_count_before_connection_help),
+                check("open putty is handled", day2_open_console.handled),
+                check("open putty queues host-runner console launch", "ssh console launch requested" in day2_open_console.response.lower()),
+                check("open putty records no password passing", "does not pass or reprint the password" in day2_open_console.response.lower()),
                 check("day-2 status hides internal phase name", "day-2" not in day2_status.response.lower() and "phase 9" not in day2_status.response.lower()),
                 check("day-2 logs uses live runner evidence", "live nginx logs" in day2_logs.response.lower()),
                 check("day-2 logs hides internal phase name", "day-2" not in day2_logs.response.lower() and "phase 9" not in day2_logs.response.lower()),

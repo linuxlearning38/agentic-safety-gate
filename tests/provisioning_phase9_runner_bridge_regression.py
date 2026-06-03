@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 from types import SimpleNamespace
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ from provisioning.runner import (  # noqa: E402
     DAY2_OPERATION_QUEUE_KEY,
     JOB_QUEUE_KEY,
     RUNNER_HEARTBEAT_KEY,
+    ConsoleSessionRequest,
     Day2OperationResult,
     ProvisioningJobResult,
     ProvisioningResultWriter,
@@ -28,6 +30,7 @@ from provisioning.runner.host_runner import (  # noqa: E402
     HostRunner,
     HostRunnerConfig,
     _ISO_UNLINK_ATTEMPTS,
+    _ssh_config_path_value,
     _windows_private_key_acl_command,
     _write_cloud_init_seed,
 )
@@ -59,6 +62,11 @@ class FakeRedis:
 
     def expire(self, key, ttl):
         self.expirations[key] = ttl
+
+    def lrange(self, key, start, end):
+        values = self.lists.get(key) or []
+        end = len(values) - 1 if int(end) == -1 else int(end)
+        return values[int(start):end + 1]
 
 
 def check(name: str, condition: bool, detail: str = "") -> bool:
@@ -579,6 +587,269 @@ def test_day2_live_verify_uses_fresh_host_checks() -> list[bool]:
     ]
 
 
+def test_day2_open_ssh_console_uses_putty_without_password() -> list[bool]:
+    fake = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
+    operation = queue.enqueue_day2_operation(
+        session_id="session-day2-open-console",
+        operation="open_ssh_console",
+        target="ssh_console",
+        instance_id="ava-web-day2",
+        instance_name="ava-web-day2",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+        http_port=8080,
+        metadata={"username": "avaadmin", "temporary_password": "NeverPutThisOnCommandLine"},
+    )
+    claimed = queue.claim_next_day2_operation(timeout_seconds=1)
+
+    class MockAdapter:
+        def get_instance_state(self, iid):
+            return SimpleNamespace(exists=True, power_state="running")
+
+        def get_connection_info(self, iid):
+            return SimpleNamespace(host="127.0.0.1", port=2222, metadata={"http_host_port": 8080})
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.queue = queue
+    runner.config = HostRunnerConfig(
+        vboxmanage="VBoxManage",
+        ssh_binary="ssh",
+        ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image",
+        work_root=Path(tempfile.gettempdir()) / "ava-day2-open-console-test",
+        log_path=Path(tempfile.gettempdir()) / "ava-day2-open-console-test.log",
+        retain_debug=False,
+        timeout_seconds=30,
+        max_jobs=1,
+    )
+    runner.adapter = MockAdapter()
+    runner.logger = logging.getLogger("ava.test.day2_open_console")
+
+    import provisioning.runner.host_runner as hr_mod
+
+    launched_commands: list[list[str]] = []
+    original_validate = HostRunner._validate_vboxmanage
+    original_find_putty = hr_mod._find_putty_binary
+    original_run = hr_mod._run
+    try:
+        HostRunner._validate_vboxmanage = lambda self: None
+        hr_mod._find_putty_binary = lambda: r"C:\Program Files\PuTTY\putty.exe"
+        hr_mod._run = lambda cmd, **kw: launched_commands.append(cmd) or SimpleNamespace(returncode=0, stdout="", stderr="")
+        runner.execute_day2_operation(claimed)
+    finally:
+        HostRunner._validate_vboxmanage = original_validate
+        hr_mod._find_putty_binary = original_find_putty
+        hr_mod._run = original_run
+
+    loaded = queue.get_day2_result(operation.operation_id)
+    command_text = " ".join(str(part) for command in launched_commands for part in command)
+    evidence_text = str(loaded.evidence if loaded else {})
+
+    return [
+        check("open console operation status is completed", queue.get_day2_status(operation.operation_id) == "completed"),
+        check("open console result is stored", loaded is not None and loaded.status == "completed"),
+        check("open console uses PuTTY when available", loaded is not None and loaded.evidence.get("tool") == "PuTTY"),
+        check("open console launches through Start-Process", "Start-Process" in command_text),
+        check("open console includes SSH host", "127.0.0.1" in command_text),
+        check("open console includes SSH port", "2222" in command_text),
+        check("open console does not pass password to command", "NeverPutThisOnCommandLine" not in command_text),
+        check("open console evidence records no password passing", "not_passed_to_process" in evidence_text),
+    ]
+
+
+def test_web_console_session_queue_roundtrip() -> list[bool]:
+    fake = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
+    request = queue.create_console_session(
+        user_id="admin",
+        provisioning_session_id="session-console",
+        instance_id="ava-web-console",
+        instance_name="ava-web-console",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+        runner_job_id="job-console",
+    )
+    claimed = queue.claim_next_console_session(timeout_seconds=1)
+    queue.update_console_session(request.console_id, status="connected", pid=1234)
+    queue.append_console_output(request.console_id, "hello")
+    output, next_offset = queue.read_console_output(request.console_id, 0)
+    queue.send_console_input(request.console_id, "hostname\n")
+    input_text = queue.read_console_input(request.console_id, timeout_seconds=1)
+    stored = queue.get_console_session(request.console_id)
+
+    return [
+        check("web console request is queued", claimed is not None),
+        check("web console claim preserves instance", claimed is not None and claimed.instance_id == "ava-web-console"),
+        check("web console session status can be updated", stored is not None and stored.get("status") == "connected"),
+        check("web console output can be read by offset", output == ["AVA console request queued for host runner.\r\n", "hello"]),
+        check("web console output offset advances", next_offset == 2),
+        check("web console input roundtrips", input_text == "hostname\n"),
+    ]
+
+
+def test_web_console_known_hosts_is_scoped_per_session() -> list[bool]:
+    tmp = Path(tempfile.mkdtemp())
+    runner = HostRunner.__new__(HostRunner)
+    runner.config = HostRunnerConfig(
+        vboxmanage="VBoxManage",
+        ssh_binary="ssh",
+        ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image",
+        work_root=tmp,
+        log_path=tmp / "runner.log",
+        retain_debug=False,
+        timeout_seconds=30,
+        max_jobs=1,
+    )
+    first = ConsoleSessionRequest(
+        console_id="console-one",
+        user_id="admin",
+        provisioning_session_id="session-1",
+        instance_id="ava-web-01",
+        instance_name="ava-web-01",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+    )
+    second = ConsoleSessionRequest(
+        console_id="console-two",
+        user_id="admin",
+        provisioning_session_id="session-1",
+        instance_id="ava-web-01",
+        instance_name="ava-web-01",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+    )
+
+    first_path = runner._console_known_hosts_path(first)
+    second_path = runner._console_known_hosts_path(second)
+    quoted_first_path = _ssh_config_path_value(first_path)
+
+    return [
+        check("web console known_hosts directory is created", first_path.parent.exists()),
+        check("web console known_hosts is scoped per console session", first_path != second_path),
+        check("web console known_hosts uses non-conflicting session directory", first_path.parent.name == "known_hosts_console_sessions"),
+        check("web console known_hosts path is quoted for OpenSSH", quoted_first_path.startswith('"') and quoted_first_path.endswith('"')),
+        check("web console known_hosts does not use shared flat file", first_path.name.endswith(".known_hosts")),
+    ]
+
+
+def test_web_console_subprocess_uses_utf8_and_disables_pagers() -> list[bool]:
+    tmp = Path(tempfile.mkdtemp())
+    key_path = tmp / "keys" / "ava-web-01_ava_runner_ed25519"
+    key_path.parent.mkdir(parents=True)
+    key_path.write_text("fake-private-key", encoding="utf-8")
+
+    fake = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
+    request = ConsoleSessionRequest(
+        console_id="console-utf8",
+        user_id="admin",
+        provisioning_session_id="session-utf8",
+        instance_id="ava-web-01",
+        instance_name="ava-web-01",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+        runner_job_id="job-utf8",
+    )
+    queue.update_console_session(request.console_id, status="queued")
+    queue.update_console_session(request.console_id, status="closing")
+
+    class MockAdapter:
+        def get_instance_state(self, iid):
+            return SimpleNamespace(exists=True, power_state="running")
+
+    class FakeStdin:
+        def __init__(self):
+            self.writes: list[str] = []
+
+        def write(self, text):
+            self.writes.append(text)
+
+        def flush(self):
+            return None
+
+    class FakeStdout:
+        def read(self, _size):
+            return ""
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakeStdin()
+            self.stdout = FakeStdout()
+            self.pid = 4321
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            return None
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.queue = queue
+    runner.config = HostRunnerConfig(
+        vboxmanage="VBoxManage",
+        ssh_binary="ssh",
+        ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image",
+        work_root=tmp,
+        log_path=tmp / "runner.log",
+        retain_debug=False,
+        timeout_seconds=30,
+        max_jobs=1,
+    )
+    runner.adapter = MockAdapter()
+    runner.logger = logging.getLogger("ava.test.console_utf8")
+
+    import provisioning.runner.host_runner as hr_mod
+
+    popen_kwargs: dict[str, Any] = {}
+    popen_command: list[str] = []
+    fake_proc = FakeProc()
+    original_validate = HostRunner._validate_binaries
+    original_find_key = HostRunner._find_runner_key_path_for
+    original_popen = hr_mod.subprocess.Popen
+    try:
+        HostRunner._validate_binaries = lambda self: None
+        HostRunner._find_runner_key_path_for = lambda self, **kw: key_path
+
+        def fake_popen(command, **kwargs):
+            popen_command.extend(str(part) for part in command)
+            popen_kwargs.update(kwargs)
+            return fake_proc
+
+        hr_mod.subprocess.Popen = fake_popen
+        runner._run_console_session(request)
+    finally:
+        HostRunner._validate_binaries = original_validate
+        HostRunner._find_runner_key_path_for = original_find_key
+        hr_mod.subprocess.Popen = original_popen
+
+    command_text = " ".join(popen_command)
+    return [
+        check("web console subprocess forces utf-8 decoding", popen_kwargs.get("encoding") == "utf-8"),
+        check("web console subprocess replaces undecodable bytes", popen_kwargs.get("errors") == "replace"),
+        check("web console starts quiet non-login shell", "bash --noprofile --norc -i" in command_text),
+        check("web console disables systemd pager", "SYSTEMD_PAGER=cat" in command_text),
+        check("web console disables generic pager", "PAGER=cat" in command_text),
+        check("web console does not echo bootstrap commands through stdin", fake_proc.stdin.writes == []),
+    ]
+
+
+def test_web_console_ui_normalizes_duplicate_prompts() -> list[bool]:
+    source = (ROOT / "web_agent_v2.1_guardrail.py").read_text(encoding="utf-8")
+
+    return [
+        check("web console normalizes adjacent duplicate prompts", "normalizeConsolePrompts" in source),
+        check("web console normalizes after appending output", "output.textContent = normalizeConsolePrompts(output.textContent)" in source),
+        check("web console prompt normalizer matches user and host", "[A-Za-z0-9._-]+@[A-Za-z0-9._-]+" in source),
+        check("web console labels basic mode", "Basic mode" in source),
+        check("web console exposes status badge", "avaConsoleStatus" in source),
+        check("web console updates status through helper", "setAvaConsoleStatus" in source),
+        check("web console reconnect closes previous session", "previousConsoleId" in source and "/close`" in source),
+    ]
+
+
 def test_day2_nginx_logs_uses_retained_runner_key() -> list[bool]:
     tmp = Path(tempfile.mkdtemp())
     fake = FakeRedis()
@@ -860,6 +1131,11 @@ def main() -> int:
     print("\n--- server-management operation queue (v2.1 snapshot execution) ---")
     failures.extend(test_day2_snapshot_execution_uses_vboxmanage())
     failures.extend(test_day2_live_verify_uses_fresh_host_checks())
+    failures.extend(test_day2_open_ssh_console_uses_putty_without_password())
+    failures.extend(test_web_console_session_queue_roundtrip())
+    failures.extend(test_web_console_known_hosts_is_scoped_per_session())
+    failures.extend(test_web_console_subprocess_uses_utf8_and_disables_pagers())
+    failures.extend(test_web_console_ui_normalizes_duplicate_prompts())
     failures.extend(test_day2_nginx_logs_uses_retained_runner_key())
     failures.extend(test_windows_runner_key_acl_command_restricts_private_key())
     failures.extend(test_day2_key_lookup_self_heals_private_key_permissions())

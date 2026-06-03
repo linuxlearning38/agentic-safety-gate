@@ -15,7 +15,7 @@ from typing import Any
 from provisioning.runner import Day2OperationResult, ProvisioningJobResult
 
 
-READ_ONLY_OPERATIONS = {"status", "verify", "nginx_logs"}
+READ_ONLY_OPERATIONS = {"status", "verify", "nginx_logs", "open_ssh_console"}
 APPROVAL_OPERATIONS = {"restart_nginx", "snapshot", "rollback_snapshot", "stop_vm", "start_vm"}
 HIGH_RISK_OPERATIONS = {"rollback_snapshot"}
 
@@ -48,6 +48,8 @@ def classify_day2_operation(query: str) -> Day2Operation | None:
         return Day2Operation("verify", "web_server", "low", False, "verify web server health")
     if _is_nginx_logs(normalized):
         return Day2Operation("nginx_logs", "nginx", "low", False, "show recent nginx logs")
+    if _is_open_ssh_console(normalized):
+        return Day2Operation("open_ssh_console", "ssh_console", "low", False, "open an SSH console")
     if _is_restart_nginx(normalized):
         return Day2Operation("restart_nginx", "nginx", "medium", True, "restart nginx and verify HTTP")
     if _is_snapshot(normalized):
@@ -70,6 +72,8 @@ def format_read_only_response(operation: Day2Operation, *, session: Any, result:
         return _format_verify(session=session, result=result)
     if operation.operation == "nginx_logs":
         return _format_nginx_logs(session=session, result=result)
+    if operation.operation == "open_ssh_console":
+        return _format_open_ssh_console(session=session, result=result)
     raise ValueError(f"Unsupported read-only server-management operation: {operation.operation}")
 
 
@@ -145,6 +149,33 @@ def format_live_nginx_logs_response(operation_result: Day2OperationResult, *, re
     )
 
 
+def format_open_ssh_console_response(operation_result: Day2OperationResult, *, result: ProvisioningJobResult) -> str:
+    """Format evidence after the host runner launches a local SSH console."""
+
+    evidence = dict(operation_result.evidence or {})
+    if operation_result.status != "completed":
+        error = operation_result.error or {}
+        return (
+            "SSH console launch could not complete.\n\n"
+            f"- VM: `{operation_result.instance_name or operation_result.instance_id}`\n"
+            f"- SSH / PuTTY: `{result.ssh_host or evidence.get('ssh_host', 'unknown')}:{result.ssh_port or evidence.get('ssh_port', 'unknown')}`\n"
+            f"- Status: `{operation_result.status}`\n"
+            f"- Error: `{error.get('message') or error.get('failure_class') or 'console launch failed'}`\n"
+            f"- Checked: `{operation_result.completion_timestamp}`"
+        )
+
+    return (
+        "SSH console launch requested through the Windows host runner.\n\n"
+        f"- VM: `{operation_result.instance_name or operation_result.instance_id}`\n"
+        f"- Tool: `{evidence.get('tool') or 'ssh'}`\n"
+        f"- SSH / PuTTY: `{evidence.get('ssh_host', result.ssh_host or 'unknown')}:{evidence.get('ssh_port', result.ssh_port or 'unknown')}`\n"
+        f"- Username: `{evidence.get('username') or 'avaadmin'}`\n"
+        f"- Status: `{operation_result.status}`\n"
+        f"- Launched: `{operation_result.completion_timestamp}`\n\n"
+        "AVA does not pass or reprint the password. Type the VM password manually in the opened SSH window."
+    )
+
+
 def format_live_verify_queued_response(operation_id: str, *, result: ProvisioningJobResult) -> str:
     return (
         "Live verification has been queued for the Windows host runner.\n\n"
@@ -162,6 +193,17 @@ def format_live_nginx_logs_queued_response(operation_id: str, *, result: Provisi
         f"- Operation ID: `{operation_id}`\n"
         "- Status: `queued`\n\n"
         "Ask `show nginx logs` again in a few seconds to see the fresh logs."
+    )
+
+
+def format_open_ssh_console_queued_response(operation_id: str, *, result: ProvisioningJobResult) -> str:
+    return (
+        "SSH console launch has been queued for the Windows host runner.\n\n"
+        f"- VM: `{result.instance_name or result.instance_id}`\n"
+        f"- SSH / PuTTY: `{result.ssh_host}:{result.ssh_port}`\n"
+        f"- Operation ID: `{operation_id}`\n"
+        "- Status: `queued`\n\n"
+        "If a console does not open shortly, ask `show status of my web server` for the latest operation evidence."
     )
 
 
@@ -249,6 +291,32 @@ def _is_nginx_logs(query: str) -> bool:
     return "log" in query and ("nginx" in query or "web server" in query)
 
 
+def _is_open_ssh_console(query: str) -> bool:
+    informational = (
+        query.startswith("how ")
+        or query.startswith("what ")
+        or query.startswith("show ")
+        or "details" in query
+    )
+    if informational:
+        return False
+    return any(
+        marker in query
+        for marker in (
+            "open putty",
+            "launch putty",
+            "start putty",
+            "open ssh console",
+            "open ssh terminal",
+            "open ssh session",
+            "open terminal",
+            "open shell",
+            "connect me to ssh",
+            "connect to ssh",
+        )
+    )
+
+
 def _is_restart_nginx(query: str) -> bool:
     return ("restart" in query or "reload" in query) and ("nginx" in query or "web server" in query)
 
@@ -313,6 +381,16 @@ def _format_nginx_logs(*, session: Any, result: ProvisioningJobResult) -> str:
         "- Live log retrieval: `not enabled yet`\n\n"
         "No SSH log command was executed from chat yet. AVA will run `journalctl -u nginx` and recent "
         "access/error log checks after live server-management actions are connected to the Windows host runner."
+    )
+
+
+def _format_open_ssh_console(*, session: Any, result: ProvisioningJobResult) -> str:
+    return (
+        "SSH console can be opened for the active AVA-managed web server.\n\n"
+        f"- VM: `{result.instance_name or result.instance_id}`\n"
+        f"- SSH / PuTTY: `{result.ssh_host}:{result.ssh_port}`\n"
+        "- Status: `ready for host-runner launch`\n\n"
+        "Ask `open PuTTY` or `open SSH console` to launch it through the Windows host runner."
     )
 
 
