@@ -2041,6 +2041,7 @@ def _resolve_diagram_follow_up_response(query):
             if resolved:
                 return {
                     "type": "diagram",
+                    "intent": "architecture",
                     "response": resolved["response"],
                     "confidence": resolved["confidence"],
                     "sources_used": resolved["sources_used"],
@@ -2051,6 +2052,7 @@ def _resolve_diagram_follow_up_response(query):
         return None
     return {
         "type": "diagram",
+        "intent": "architecture",
         "response": resolved["response"],
         "confidence": resolved["confidence"],
         "sources_used": resolved["sources_used"],
@@ -3889,13 +3891,15 @@ def get_ava_introduction():
     """Return AVA's self-introduction"""
     chunk_count = int(STATS.get('total_chunks') or 0)
     chunk_count_label = f"{chunk_count:,}"
-    return f"""I'm **AVA** (Automated Virtual Assistant), a local DevOps knowledge and operations assistant.
+    return f"""I'm **AVA**, a local-first DevOps knowledge, provisioning, and operations assistant.
 
-### What I Do In v1.0
+### What I Do In v2.1
 
 - Provide grounded DevOps answers from **{chunk_count_label} knowledge chunks**.
 - Run safe, read-only operational checks (system, Docker, ports, memory, disk).
-- Queue medium-risk actions behind approval.
+- Provision approved VirtualBox Ubuntu web servers through the Windows host runner.
+- Verify AVA-managed servers with live SSH/HTTP evidence when the runner is available.
+- Queue medium-risk actions behind approval and route Day-2 operations through guarded runner paths.
 - Block destructive requests before execution.
 
 ### Security Model
@@ -3908,10 +3912,10 @@ def get_ava_introduction():
 
 ### Product Boundary
 
-- v1.0 focuses on DevOps knowledge, observability, and guarded actions.
-- Linux VM provisioning is tracked separately on branch `provisioning-v0.1-experimental`.
+- v2.1 focuses on grounded DevOps knowledge, guarded actions, Phase 9 chat-to-VM provisioning, and Day-2 server operations.
+- Qwen is the reasoning engine; AVA owns routing, policy, approval, memory, and runtime truth.
 
-Ask me about system state, Docker health, DevOps troubleshooting, or architecture concepts."""
+Ask me about system state, Docker health, DevOps troubleshooting, AVA architecture, provisioning status, or AVA-managed servers."""
 
 @app.route('/ask', methods=['POST'])
 @jwt_required()
@@ -3934,6 +3938,15 @@ def ask():
         if not query:
             return jsonify({'error': 'No query provided'}), 400
 
+        logger.info(f"Query: {query}")
+        controlled_route = _route_query(query)
+
+        if is_meta_question(query) and controlled_route.intent in {"ava_self", "architecture", "follow_up"}:
+            resolved = _resolve_controlled_query(query, controlled_route=controlled_route)
+            if resolved:
+                elapsed = time.time() - start_time
+                return jsonify(_finalize_resolved_payload(query, resolved, elapsed))
+
         if is_meta_question(query):
             elapsed = time.time() - start_time
             return jsonify(_finalize_resolved_payload(query, {
@@ -3943,9 +3956,6 @@ def ask():
                 "sources_used": 0,
                 "confidence": "high",
             }, elapsed))
-
-        logger.info(f"Query: {query}")
-        controlled_route = _route_query(query)
 
         # Dependency gate only for routes that genuinely require the general LLM path.
         deps = _check_dependencies()
