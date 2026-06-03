@@ -88,13 +88,24 @@ def format_live_verify_response(operation_result: Day2OperationResult, *, result
         check_lines = ["- live verification completed, but no detailed check list was stored"]
 
     http_port = result.http_port or evidence.get("http_port")
+    title = "Live web-server verification from the host runner:"
+    error_lines: list[str] = []
+    if operation_result.status != "completed":
+        error = operation_result.error or {}
+        title = "Live web-server verification could not confirm the server:"
+        error_lines = [
+            "",
+            f"- Error: `{error.get('message') or error.get('failure_class') or 'live verification failed'}`",
+        ]
     return (
-        "Live web-server verification from the host runner:\n\n"
+        f"{title}\n\n"
         f"- VM: `{operation_result.instance_name or operation_result.instance_id}`\n"
         f"- SSH / PuTTY: `{result.ssh_host or evidence.get('ssh_host', 'unknown')}:{result.ssh_port or evidence.get('ssh_port', 'unknown')}`\n"
         f"- HTTP: `http://127.0.0.1:{http_port}/`\n"
         f"- Status: `{operation_result.status}`\n"
-        f"- Verified: `{operation_result.completion_timestamp}`\n\n"
+        f"- Verified: `{operation_result.completion_timestamp}`"
+        + ("\n" + "\n".join(error_lines) if error_lines else "")
+        + "\n\n"
         + "\n".join(check_lines)
     )
 

@@ -518,8 +518,18 @@ class ProvisioningChatService:
         result: ProvisioningJobResult,
     ) -> ProvisioningServingResult | None:
         if not getattr(self.job_queue, "is_runner_healthy", lambda: False)():
+            if operation.operation == "verify":
+                return self._result(
+                    "Live web-server verification needs the Windows host runner online.\n\n"
+                    "- Live status: `not checked`\n"
+                    "- Reason: `host runner is not reporting healthy`\n\n"
+                    "Stored provisioning evidence may still exist, but AVA will not use stored history "
+                    "as proof that the VM is currently running.",
+                    session,
+                )
             return self._result(
-                "I can show the last stored verification, but live verification needs the Windows host runner online.\n\n"
+                "Live server-management evidence needs the Windows host runner online. "
+                "The details below are last-known stored history, not a fresh live check.\n\n"
                 + format_read_only_response(operation, session=session, result=result),
                 session,
             )
@@ -892,12 +902,17 @@ def _format_desired_state(desired: dict[str, Any]) -> str:
     )
 
 
-def _connection_lines(session, result: ProvisioningJobResult | None) -> list[str]:
+def _connection_lines(
+    session,
+    result: ProvisioningJobResult | None,
+    *,
+    heading: str = "Connection details:",
+) -> list[str]:
     answers = session.collected_answers or {}
     username = answers.get("username", "avaadmin")
     if not result or not result.instance_id:
         return [
-            "Connection details:",
+            heading,
             "- SSH host/IP: `pending until runner completes`",
             "- SSH port: `pending until runner completes`",
             f"- Username: `{username}`",
@@ -905,7 +920,7 @@ def _connection_lines(session, result: ProvisioningJobResult | None) -> list[str
             "- Web URL: `pending until runner completes`",
         ]
     return [
-        "Connection details:",
+        heading,
         f"- Hostname / VM name: `{result.instance_name or result.instance_id}`",
         f"- SSH host/IP: `{result.ssh_host or 'unknown'}` (PuTTY Host Name)",
         f"- SSH port: `{result.ssh_port or 'unknown'}` (PuTTY Port)",
@@ -935,6 +950,41 @@ def _format_hardening_summary(session, result: ProvisioningJobResult | None) -> 
         else "- Web role hardening: `pending runner completion`",
         "- Apache hardening: `not applied in v2.0.0 because the active role is nginx/web_server`",
     ]
+
+
+def _latest_live_verify_result(runner: dict[str, Any] | None):
+    runner = runner or {}
+    operation_result = runner.get("day2_result")
+    if operation_result and getattr(operation_result, "operation", None) == "verify":
+        return operation_result
+    return None
+
+
+def _format_runtime_truth_lines(runner: dict[str, Any] | None) -> list[str]:
+    runner = runner or {}
+    result = runner.get("result")
+    live_verify = _latest_live_verify_result(runner)
+    if live_verify:
+        error = getattr(live_verify, "error", None) or {}
+        lines = [
+            "Runtime truth:",
+            "- Stored provisioning result: `available`",
+            f"- Latest live verification: `{getattr(live_verify, 'status', 'unknown')}`",
+            f"- Live verification checked: `{getattr(live_verify, 'completion_timestamp', 'unknown')}`",
+        ]
+        if getattr(live_verify, "status", None) != "completed":
+            lines.append(
+                f"- Live verification error: `{error.get('message') or error.get('failure_class') or 'live verification failed'}`"
+            )
+        return lines
+    if result and result.instance_id:
+        return [
+            "Runtime truth:",
+            "- Stored provisioning result: `available`",
+            "- Latest live verification: `not checked in this response`",
+            "- Note: stored connection details are last-known history until `verify the web server` passes live.",
+        ]
+    return []
 
 
 def _format_connection_response(session, runner: dict[str, Any] | None = None) -> str:
@@ -1009,7 +1059,16 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
             ]
         )
     elif result and result.instance_id:
-        lines.extend(["", *_connection_lines(session, result), "", *_format_hardening_summary(session, result)])
+        lines.extend(
+            [
+                "",
+                *_format_runtime_truth_lines(runner),
+                "",
+                *_connection_lines(session, result, heading="Last-known connection details:"),
+                "",
+                *_format_hardening_summary(session, result),
+            ]
+        )
         operation_lines = _format_latest_server_operation_lines(runner)
         if operation_lines:
             lines.extend(["", *operation_lines])
@@ -1047,25 +1106,23 @@ def _format_verification_response(session, runner: dict[str, Any] | None = None)
             f"- Timestamp: `{result.completion_timestamp}`"
         )
     if result and result.instance_id:
-        checks = (result.verification_evidence or {}).get("checks") or []
-        check_lines = [
-            f"- {check.get('name')}: `{'passed' if check.get('passed') else 'failed'}` ({check.get('evidence', '')})"
-            for check in checks[:8]
-            if isinstance(check, dict)
-        ]
-        if not check_lines:
-            check_lines = ["- verification evidence recorded by host runner"]
+        live_verify = _latest_live_verify_result(runner)
+        if live_verify:
+            return format_live_verify_response(live_verify, result=result)
         return (
-            "Web-server verification evidence from the host runner:\n\n"
+            "Live verification is required for current server truth.\n\n"
+            "AVA has stored provisioning evidence for this VM, but stored history is not proof "
+            "that the VM still exists, is running, or is serving HTTP now.\n\n"
+            "Last-known provisioning evidence:\n\n"
             f"- Instance: `{result.instance_id}`\n"
             f"- Hostname / VM name: `{result.instance_name or result.instance_id}`\n"
             f"- SSH / PuTTY: `{result.ssh_host}:{result.ssh_port}`\n"
             f"- Username: `{(session.collected_answers or {}).get('username', 'avaadmin')}`\n"
             f"- HTTP: `http://127.0.0.1:{result.http_port}/`\n"
             f"- Completed: `{result.completion_timestamp}`\n\n"
-            + "\n".join(check_lines)
-            + "\n\n"
-            + "\n".join(_format_hardening_summary(session, result))
+            "No current pass/fail checks are shown here because this response did not receive "
+            "fresh live verification evidence.\n\n"
+            "Ask `verify the web server` with the Windows host runner online to produce fresh live evidence."
         )
     if runner.get("job_id"):
         return (
@@ -1138,7 +1195,9 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
         evidence.extend(
             [
                 "",
-                "Runner result evidence:",
+                *_format_runtime_truth_lines(runner),
+                "",
+                "Stored runner result evidence:",
                 f"- Instance name: `{result.instance_name or result.instance_id}`",
                 f"- SSH host/IP: `{result.ssh_host or 'unknown'}` (PuTTY Host Name)",
                 f"- SSH port: `{result.ssh_port or 'unknown'}` (PuTTY Port)",

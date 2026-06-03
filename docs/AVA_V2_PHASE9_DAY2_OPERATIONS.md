@@ -165,6 +165,38 @@ AVA should use this priority order when answering Day-2 operation prompts:
 Qwen may explain concepts, but Qwen must not decide whether an operation is safe
 or whether a VM exists. AVA owns routing, safety, and runtime truth.
 
+## Live Vs Stored Evidence Contract
+
+Phase 9 provisioning creates durable stored evidence: VM name, PuTTY endpoint,
+HTTP port, hardening profile, and the verification checks captured when the
+runner completed the original job. That evidence is useful history, but it is
+not proof that the VM still exists or is still running later.
+
+For product behavior, AVA must keep two truth layers separate:
+
+- stored provisioning evidence means "this is what the runner created and
+  verified at completion time"
+- live server verification means "the Windows host runner checked VirtualBox,
+  SSH, and HTTP now"
+
+Rules:
+
+- `show status of my web server` may include stored connection details, but it
+  must label them as last-known history unless a recent live check exists.
+- `what did you do and what evidence do you have?` may include stored runner
+  evidence, but it must not imply that old HTTP 200 evidence proves current
+  health.
+- `verify the web server` must use a live host-runner verification result when
+  the runner is online.
+- If live verification fails because the VM was deleted, powered off, or the
+  host ports are closed, AVA must report the live failure and must not fall back
+  to old successful provisioning evidence.
+- If the host runner is offline, AVA must say live verification is unavailable
+  instead of presenting stored history as a current pass.
+
+This contract prevents stale session state from making AVA look confident about
+a server that no longer exists.
+
 ## Operation Contract
 
 Every Day-2 operation should produce structured evidence:
