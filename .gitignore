@@ -57,3 +57,5 @@ docs/
 .ava-runner/
 .claude/
 approval_queue.json
+scripts/cve_scanner*
+scripts/test_cve_scanner*
