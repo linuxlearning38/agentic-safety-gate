@@ -645,6 +645,39 @@ def main() -> int:
             ]
         )
 
+        stale_attached_db = temp_dir / "stale_attached_sessions.sqlite3"
+        stale_attached_queue = FakeProvisioningJobQueue()
+        stale_attached_service = ProvisioningChatService(stale_attached_db, job_queue=stale_attached_queue)
+        stale_attached_service.handle("user-stale-attached", "I want a web server", route_intent="provisioning")
+        stale_attached_specs = stale_attached_service.handle("user-stale-attached", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
+        stale_attached_approval_id = stale_attached_specs.metadata["provisioning"]["approval_id"]
+        stale_attached_service.handle("user-stale-attached", f"approve {stale_attached_approval_id}", route_intent=None)
+        stale_attached_session = stale_attached_service.sessions.list_active("user-stale-attached")[0]
+        stale_attached_job_id = stale_attached_session.collected_answers["runner_job_id"]
+        stale_attached_queue.statuses.pop(stale_attached_job_id, None)
+        stale_attached_queue.results.pop(stale_attached_job_id, None)
+        with sqlite3.connect(stale_attached_db) as conn:
+            conn.execute(
+                "UPDATE provisioning_sessions SET phase = ?, instance_id = ?, updated_at = ? WHERE session_id = ?",
+                (
+                    SessionPhase.AWAITING_POST_LOGIN_CHOICES.value,
+                    "ava-web-gone",
+                    "2026-05-02T00:00:00+00:00",
+                    stale_attached_session.session_id,
+                ),
+            )
+        stale_attached_status = stale_attached_service.handle("user-stale-attached", "show status", route_intent=None)
+        stale_attached_retry = stale_attached_service.handle("user-stale-attached", "I want a web server", route_intent="provisioning")
+        failures.extend(
+            [
+                check("expired attached session is reported as failed", "phase: `failed`" in stale_attached_status.response.lower()),
+                check("expired attached session explains stale runner truth", "runner job state expired" in stale_attached_status.response.lower()),
+                check("expired attached session no longer blocks retry", stale_attached_retry.handled),
+                check("expired attached retry starts a clean request", "cpu" in stale_attached_retry.response.lower() and "ram" in stale_attached_retry.response.lower()),
+                check("expired attached retry avoids active guard", "already active" not in stale_attached_retry.response.lower()),
+            ]
+        )
+
         unrelated = service.handle("user-2", "What is Kubernetes?", route_intent=route_query("What is Kubernetes?").intent)
         failures.append(check("unrelated knowledge prompt is not hijacked", unrelated.handled is False))
 
