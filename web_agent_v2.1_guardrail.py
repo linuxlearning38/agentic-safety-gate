@@ -3859,7 +3859,7 @@ def console_output(console_id):
 
 
 @app.route('/console/<console_id>/input', methods=['POST'])
-@limiter.limit("60 per minute")
+@limiter.limit("1200 per minute")
 @jwt_required()
 def console_input(console_id):
     user_id = str(get_jwt_identity() or "admin")
@@ -7151,6 +7151,12 @@ HTML_TEMPLATE = r'''
             font: 13px/1.45 "Cascadia Mono", "Consolas", monospace;
             white-space: pre-wrap;
             word-break: break-word;
+            outline: none;
+            cursor: text;
+        }
+
+        .ava-console-output:focus {
+            box-shadow: inset 0 0 0 1px rgba(126, 145, 255, 0.42);
         }
 
         .ava-console-input {
@@ -7347,7 +7353,7 @@ HTML_TEMPLATE = r'''
                 <span id="securityBadge" class="security-inline-badge" style="display: none;"></span>
             </button>
 
-            <button class="sidebar-btn" onclick="openAvaConsole()">
+            <button class="sidebar-btn" onclick="openAvaConsole(true)">
                 <span class="nav-icon">⌁</span>
                 <span>Web Console</span>
             </button>
@@ -7531,26 +7537,26 @@ HTML_TEMPLATE = r'''
             <div>
                 <div class="ava-console-title-row">
                     <div class="ava-console-title">AVA Web Console</div>
-                    <span class="ava-console-mode">Basic mode</span>
+                    <span class="ava-console-mode">Interactive key mode</span>
                 </div>
                 <div class="ava-console-subtitle" id="avaConsoleMeta">Protected browser SSH for AVA-managed VMs</div>
             </div>
             <div class="ava-console-actions">
                 <span id="avaConsoleStatus" class="ava-console-status" data-state="idle">Idle</span>
-                <button type="button" onclick="openAvaConsole()">Reconnect</button>
+                <button type="button" onclick="openAvaConsole(true)">Reconnect</button>
                 <button type="button" onclick="sendAvaConsoleInterrupt()">Interrupt</button>
                 <button type="button" onclick="closeAvaConsole()">Close</button>
             </div>
         </div>
         <div class="ava-console-note">
-            Basic mode supports normal shell checks and server operations. Full PuTTY-speed terminal rendering is planned for the WebSocket/xterm phase.
+            Phase 9.8 interactive mode sends keys directly from this browser terminal. Full xterm/WebSocket rendering remains the next transport upgrade.
         </div>
-        <pre id="avaConsoleOutput" class="ava-console-output">AVA Web Console is ready.
+        <pre id="avaConsoleOutput" class="ava-console-output" tabindex="0" onclick="focusAvaConsole()" onkeydown="handleAvaConsoleTerminalKey(event)" onpaste="handleAvaConsolePaste(event)">AVA Web Console is ready.
 Click Reconnect or ask AVA to open the console after a VM is provisioned.
 </pre>
         <div class="ava-console-input">
-            <input id="avaConsoleInput" type="text" placeholder="Type a command and press Enter" onkeydown="handleAvaConsoleKey(event)">
-            <button type="button" onclick="sendAvaConsoleInput()">Send</button>
+            <input id="avaConsoleInput" type="text" placeholder="Optional paste bar: type a full command and press Enter" onkeydown="handleAvaConsoleKey(event)">
+            <button type="button" onclick="sendAvaConsoleInput()">Send line</button>
         </div>
     </div>
     
@@ -8063,7 +8069,11 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             pollDelayMs: 500,
             ansiMode: null,
             ansiBuffer: '',
-            clearRequested: false
+            clearRequested: false,
+            backspaceCount: 0,
+            inputBuffer: '',
+            inputFlushTimer: null,
+            openStartedAt: 0
         };
 
         function appendConsoleText(text) {
@@ -8073,6 +8083,10 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             if (avaConsoleState.clearRequested) {
                 output.textContent = '';
                 avaConsoleState.clearRequested = false;
+            }
+            if (avaConsoleState.backspaceCount > 0) {
+                output.textContent = output.textContent.slice(0, Math.max(0, output.textContent.length - avaConsoleState.backspaceCount));
+                avaConsoleState.backspaceCount = 0;
             }
             output.textContent += cleaned;
             output.textContent = normalizeConsolePrompts(output.textContent);
@@ -8087,6 +8101,11 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             if (!status) return;
             status.textContent = label || 'Idle';
             status.dataset.state = state || 'idle';
+        }
+
+        function focusAvaConsole() {
+            const output = document.getElementById('avaConsoleOutput');
+            if (output) output.focus();
         }
 
         function cleanConsoleText(text) {
@@ -8141,7 +8160,20 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                     avaConsoleState.ansiMode = 'escape';
                     continue;
                 }
-                if (ch === '\x07' || ch === '\x08' || ch === '\r') {
+                if (ch === '\x0c') {
+                    cleaned = '';
+                    avaConsoleState.clearRequested = true;
+                    continue;
+                }
+                if (ch === '\x08' || ch === '\x7f') {
+                    if (cleaned.length > 0) {
+                        cleaned = cleaned.slice(0, -1);
+                    } else {
+                        avaConsoleState.backspaceCount += 1;
+                    }
+                    continue;
+                }
+                if (ch === '\x07' || ch === '\r') {
                     continue;
                 }
                 cleaned += ch;
@@ -8172,20 +8204,38 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             return normalized;
         }
 
-        async function openAvaConsole() {
-            const panel = document.getElementById('avaConsolePanel');
-            const input = document.getElementById('avaConsoleInput');
-            const meta = document.getElementById('avaConsoleMeta');
-            if (panel) panel.classList.add('open');
-            if (input) input.focus();
-            if (avaConsoleState.opening) return;
-            avaConsoleState.opening = true;
-            setAvaConsoleStatus('Opening', 'connecting');
-            const previousConsoleId = avaConsoleState.id;
+        function resetAvaConsoleTransportState() {
             if (avaConsoleState.pollTimer) {
                 clearInterval(avaConsoleState.pollTimer);
                 avaConsoleState.pollTimer = null;
             }
+            if (avaConsoleState.inputFlushTimer) {
+                clearTimeout(avaConsoleState.inputFlushTimer);
+                avaConsoleState.inputFlushTimer = null;
+            }
+            avaConsoleState.id = null;
+            avaConsoleState.offset = 0;
+            avaConsoleState.pollDelayMs = 500;
+            avaConsoleState.ansiMode = null;
+            avaConsoleState.ansiBuffer = '';
+            avaConsoleState.clearRequested = false;
+            avaConsoleState.backspaceCount = 0;
+            avaConsoleState.inputBuffer = '';
+        }
+
+        async function openAvaConsole(force = false) {
+            const panel = document.getElementById('avaConsolePanel');
+            const input = document.getElementById('avaConsoleInput');
+            const meta = document.getElementById('avaConsoleMeta');
+            if (panel) panel.classList.add('open');
+            focusAvaConsole();
+            const now = Date.now();
+            if (avaConsoleState.opening && !force && now - avaConsoleState.openStartedAt < 8000) return;
+            avaConsoleState.opening = true;
+            avaConsoleState.openStartedAt = now;
+            setAvaConsoleStatus('Opening', 'connecting');
+            const previousConsoleId = avaConsoleState.id;
+            resetAvaConsoleTransportState();
             if (previousConsoleId) {
                 try {
                     await fetch(`/console/${previousConsoleId}/close`, {method: 'POST'});
@@ -8193,10 +8243,6 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                     // Reconnect should still proceed if the old session is already gone.
                 }
             }
-            avaConsoleState.id = null;
-            avaConsoleState.offset = 0;
-            avaConsoleState.pollDelayMs = 500;
-            avaConsoleState.ansiMode = null;
             const output = document.getElementById('avaConsoleOutput');
             if (output) output.textContent = 'Opening AVA Web Console...\n';
             try {
@@ -8207,6 +8253,7 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                 });
                 const data = await resp.json();
                 if (!resp.ok) {
+                    resetAvaConsoleTransportState();
                     setAvaConsoleStatus('Failed', 'failed');
                     appendConsoleText('Console could not open: ' + (data.message || data.error || 'unknown error') + '\n');
                     return;
@@ -8218,13 +8265,16 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                 }
                 appendConsoleText(`Console session ${data.console_id} queued for ${data.vm}.\n`);
                 setAvaConsoleStatus('Queued', 'connecting');
+                focusAvaConsole();
                 pollAvaConsole();
                 avaConsoleState.pollTimer = setInterval(pollAvaConsole, avaConsoleState.pollDelayMs);
             } catch (err) {
+                resetAvaConsoleTransportState();
                 setAvaConsoleStatus('Failed', 'failed');
                 appendConsoleText('Console error: ' + (err && err.message ? err.message : 'unknown error') + '\n');
             } finally {
                 avaConsoleState.opening = false;
+                avaConsoleState.openStartedAt = 0;
             }
         }
 
@@ -8283,17 +8333,83 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             }
         }
 
-        async function sendAvaConsoleInput() {
-            const input = document.getElementById('avaConsoleInput');
-            const command = input ? input.value : '';
-            if (!avaConsoleState.id || command.length === 0) return;
-            input.value = '';
-            const commandText = command.replace(/\\n/g, '\n');
+        function handleAvaConsoleTerminalKey(event) {
+            if (!avaConsoleState.id) return;
+            let input = '';
+            if (event.ctrlKey && !event.altKey && !event.metaKey) {
+                const key = event.key.toLowerCase();
+                if (key === 'c') input = '\u0003';
+                else if (key === 'd') input = '\u0004';
+                else if (key === 'l') {
+                    input = '\u000c';
+                    const output = document.getElementById('avaConsoleOutput');
+                    if (output) output.textContent = '';
+                }
+            } else if (!event.altKey && !event.metaKey) {
+                const specialKeys = {
+                    Enter: '\n',
+                    Backspace: '\u007f',
+                    Tab: '\t',
+                    ArrowUp: '\u001b[A',
+                    ArrowDown: '\u001b[B',
+                    ArrowRight: '\u001b[C',
+                    ArrowLeft: '\u001b[D',
+                    Delete: '\u001b[3~',
+                    Home: '\u001b[H',
+                    End: '\u001b[F',
+                    PageUp: '\u001b[5~',
+                    PageDown: '\u001b[6~'
+                };
+                if (specialKeys[event.key]) {
+                    input = specialKeys[event.key];
+                } else if (event.key && event.key.length === 1) {
+                    input = event.key;
+                }
+            }
+
+            if (!input) return;
+            event.preventDefault();
+            queueAvaConsoleInput(input, input.length > 1 || input === '\n' || input.charCodeAt(0) < 32);
+        }
+
+        function handleAvaConsolePaste(event) {
+            if (!avaConsoleState.id) return;
+            const text = event.clipboardData ? event.clipboardData.getData('text') : '';
+            if (!text) return;
+            event.preventDefault();
+            queueAvaConsoleInput(text, true);
+        }
+
+        function queueAvaConsoleInput(text, immediate) {
+            if (!text) return;
+            avaConsoleState.inputBuffer += text;
+            if (immediate) {
+                flushAvaConsoleInput();
+                return;
+            }
+            if (!avaConsoleState.inputFlushTimer) {
+                avaConsoleState.inputFlushTimer = setTimeout(flushAvaConsoleInput, 35);
+            }
+        }
+
+        async function flushAvaConsoleInput() {
+            if (avaConsoleState.inputFlushTimer) {
+                clearTimeout(avaConsoleState.inputFlushTimer);
+                avaConsoleState.inputFlushTimer = null;
+            }
+            const text = avaConsoleState.inputBuffer;
+            avaConsoleState.inputBuffer = '';
+            if (!text) return;
+            await postAvaConsoleInput(text);
+        }
+
+        async function postAvaConsoleInput(text) {
+            if (!avaConsoleState.id || text.length === 0) return;
             try {
                 const resp = await fetch(`/console/${avaConsoleState.id}/input`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({input: commandText.endsWith('\n') ? commandText : commandText + '\n'})
+                    body: JSON.stringify({input: text})
                 });
                 if (!resp.ok) {
                     const data = await resp.json();
@@ -8306,22 +8422,21 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             }
         }
 
+        async function sendAvaConsoleInput() {
+            const input = document.getElementById('avaConsoleInput');
+            const command = input ? input.value : '';
+            if (!avaConsoleState.id || command.length === 0) return;
+            input.value = '';
+            const commandText = command.replace(/\\n/g, '\n');
+            queueAvaConsoleInput(commandText.endsWith('\n') ? commandText : commandText + '\n', true);
+            focusAvaConsole();
+        }
+
         async function sendAvaConsoleInterrupt() {
             if (!avaConsoleState.id) return;
             appendConsoleText('^C\n');
-            try {
-                const resp = await fetch(`/console/${avaConsoleState.id}/input`, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({input: '\u0003'})
-                });
-                if (!resp.ok) {
-                    const data = await resp.json();
-                    appendConsoleText('Interrupt failed: ' + (data.error || 'unknown error') + '\n');
-                }
-            } catch (err) {
-                appendConsoleText('Interrupt error: ' + (err && err.message ? err.message : 'unknown error') + '\n');
-            }
+            queueAvaConsoleInput('\u0003', true);
+            focusAvaConsole();
         }
 
         async function closeAvaConsole() {
@@ -8333,13 +8448,9 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                     appendConsoleText('Close request failed: ' + (err && err.message ? err.message : 'unknown error') + '\n');
                 }
             }
-            if (avaConsoleState.pollTimer) {
-                clearInterval(avaConsoleState.pollTimer);
-                avaConsoleState.pollTimer = null;
-            }
-            avaConsoleState.id = null;
-            avaConsoleState.offset = 0;
-            avaConsoleState.ansiMode = null;
+            resetAvaConsoleTransportState();
+            avaConsoleState.opening = false;
+            avaConsoleState.openStartedAt = 0;
             setAvaConsoleStatus('Closed', 'closed');
             const meta = document.getElementById('avaConsoleMeta');
             if (meta) meta.textContent = 'Protected browser SSH for AVA-managed VMs';
@@ -8754,7 +8865,7 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                     type: 'command',
                     response: 'Opening AVA Web Console for the latest AVA-managed VM. This uses AVA auth and the Windows host runner; it does not depend on PuTTY being installed on this browser machine.'
                 });
-                openAvaConsole();
+                openAvaConsole(true);
                 input.disabled = false;
                 sendBtn.disabled = false;
                 input.focus();
