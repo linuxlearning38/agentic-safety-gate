@@ -526,12 +526,12 @@ class HostRunner:
         return path
 
     def _console_shell_command(self, request: ConsoleSessionRequest) -> str:
-        """Start a quiet shell suitable for the simple browser console."""
+        """Start a quiet shell suitable for the browser terminal bridge."""
         label = request.instance_name or request.instance_id or "ava-vm"
         safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in label)
         prompt = f"{request.username}@{safe_label}:\\w$ "
         return (
-            "TERM=dumb "
+            "TERM=xterm-256color "
             "PAGER=cat "
             "SYSTEMD_PAGER=cat "
             "SYSTEMD_COLORS=0 "
