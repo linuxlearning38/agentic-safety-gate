@@ -109,6 +109,8 @@ class FakeProvisioningJobQueue:
         self.day2_jobs[operation_id] = job
         self.day2_statuses[operation_id] = "queued"
         if operation == "verify":
+            if self.live_verify_status == "pending":
+                return job
             if self.live_verify_status == "failed":
                 self.day2_statuses[operation_id] = "failed"
                 self.day2_results[operation_id] = Day2OperationResult(
@@ -595,6 +597,7 @@ def main() -> int:
         )
         missing_live_verify = missing_live_service.handle("user-missing-live", "verify the web server", route_intent=None)
         missing_live_status = missing_live_service.handle("user-missing-live", "show status of my web server", route_intent=None)
+        missing_live_retry = missing_live_service.handle("user-missing-live", "I want a web server", route_intent="provisioning")
         failures.extend(
             [
                 check("missing live VM verify is handled", missing_live_verify.handled),
@@ -603,6 +606,70 @@ def main() -> int:
                 check("missing live VM verify shows failed vm_exists", "vm_exists: `failed`" in missing_live_verify.response.lower()),
                 check("missing live VM status labels stored evidence", "stored provisioning result" in missing_live_status.response.lower()),
                 check("missing live VM status shows failed live verification", "latest live verification: `failed`" in missing_live_status.response.lower()),
+                check("missing live VM no longer blocks new request", missing_live_retry.handled),
+                check("missing live VM retry asks for specs", "cpu" in missing_live_retry.response.lower() and "ram" in missing_live_retry.response.lower()),
+                check("missing live VM retry avoids active guard", "already active" not in missing_live_retry.response.lower()),
+            ]
+        )
+
+        offline_existing_queue = FakeProvisioningJobQueue()
+        offline_existing_queue.runner_healthy = False
+        offline_existing_service = ProvisioningChatService(temp_dir / "offline_existing_sessions.sqlite3", job_queue=offline_existing_queue)
+        offline_existing_service.handle("user-offline-existing", "I want a web server", route_intent="provisioning")
+        offline_existing_specs = offline_existing_service.handle("user-offline-existing", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
+        offline_existing_approval_id = offline_existing_specs.metadata["provisioning"]["approval_id"]
+        offline_existing_queue.runner_healthy = True
+        offline_existing_service.handle("user-offline-existing", f"approve {offline_existing_approval_id}", route_intent=None)
+        offline_existing_queue.write_status("job-0001", "completed")
+        offline_existing_queue.write_result(
+            ProvisioningJobResult(
+                job_id="job-0001",
+                instance_id="ava-web-last-known",
+                instance_name="ava-web-last-known",
+                ssh_host="127.0.0.1",
+                ssh_port=2222,
+                http_port=8080,
+                verification_evidence={"checks": [{"name": "host_http_200", "passed": True, "evidence": "old HTTP 200"}]},
+                completion_timestamp="2026-05-02T00:27:00+00:00",
+                error=None,
+            )
+        )
+        offline_existing_queue.runner_healthy = False
+        offline_existing_retry = offline_existing_service.handle("user-offline-existing", "I want a web server", route_intent="provisioning")
+        failures.extend(
+            [
+                check("offline live truth does not use stored VM as active guard", offline_existing_retry.handled),
+                check("offline live truth retry asks for specs", "cpu" in offline_existing_retry.response.lower() and "ram" in offline_existing_retry.response.lower()),
+                check("offline live truth retry avoids active guard", "already active" not in offline_existing_retry.response.lower()),
+            ]
+        )
+
+        pending_live_queue = FakeProvisioningJobQueue(live_verify_status="pending")
+        pending_live_service = ProvisioningChatService(temp_dir / "pending_live_sessions.sqlite3", job_queue=pending_live_queue)
+        pending_live_service.handle("user-pending-live", "I want a web server", route_intent="provisioning")
+        pending_live_specs = pending_live_service.handle("user-pending-live", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
+        pending_live_approval_id = pending_live_specs.metadata["provisioning"]["approval_id"]
+        pending_live_service.handle("user-pending-live", f"approve {pending_live_approval_id}", route_intent=None)
+        pending_live_queue.write_status("job-0001", "completed")
+        pending_live_queue.write_result(
+            ProvisioningJobResult(
+                job_id="job-0001",
+                instance_id="ava-web-timeout",
+                instance_name="ava-web-timeout",
+                ssh_host="127.0.0.1",
+                ssh_port=2222,
+                http_port=8080,
+                verification_evidence={"checks": [{"name": "host_http_200", "passed": True, "evidence": "old HTTP 200"}]},
+                completion_timestamp="2026-05-02T00:28:00+00:00",
+                error=None,
+            )
+        )
+        pending_live_retry = pending_live_service.handle("user-pending-live", "I want a web server", route_intent="provisioning")
+        failures.extend(
+            [
+                check("unconfirmed live truth does not use stored VM as active guard", pending_live_retry.handled),
+                check("unconfirmed live truth retry asks for specs", "cpu" in pending_live_retry.response.lower() and "ram" in pending_live_retry.response.lower()),
+                check("unconfirmed live truth retry avoids active guard", "already active" not in pending_live_retry.response.lower()),
             ]
         )
 
