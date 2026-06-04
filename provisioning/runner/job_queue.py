@@ -263,6 +263,9 @@ class ProvisioningJobQueue(Protocol):
     def write_runner_heartbeat(self, status: str = "idle", metadata: dict[str, Any] | None = None) -> None:
         ...
 
+    def get_runner_heartbeat(self) -> dict[str, Any] | None:
+        ...
+
     def is_runner_healthy(self) -> bool:
         ...
 
@@ -534,6 +537,12 @@ class RedisProvisioningJobQueue:
             ),
             ex=RUNNER_HEARTBEAT_TTL_SECONDS,
         )
+
+    def get_runner_heartbeat(self) -> dict[str, Any] | None:
+        raw = self.client.get(RUNNER_HEARTBEAT_KEY)
+        if raw is None:
+            return None
+        return _json_loads(raw)
 
     def is_runner_healthy(self) -> bool:
         return bool(self.client.get(RUNNER_HEARTBEAT_KEY))

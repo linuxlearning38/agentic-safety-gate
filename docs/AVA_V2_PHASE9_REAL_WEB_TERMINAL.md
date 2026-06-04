@@ -100,11 +100,56 @@ Phase 9.8 interactive key mode is acceptable when:
 
 Recommended next slices:
 
-- Phase 9.8.1: add a terminal capability/status response so AVA can explain whether the current console is interactive-key mode or future xterm mode.
-- Phase 9.8.2: vendor xterm.js locally, no CDN dependency.
-- Phase 9.8.3: introduce a WebSocket terminal transport behind AVA authentication.
-- Phase 9.8.4: add terminal resize support.
-- Phase 9.8.5: add an optional approved manual SSH target flow for IP/port/username access, with allowlist and audit.
+- Phase 9.9: console reliability and UX polish.
+- Phase 9.10: vendor xterm.js locally, no CDN dependency.
+- Phase 9.11: introduce a WebSocket terminal transport behind AVA authentication.
+- Phase 9.12: add terminal resize support.
+- Phase 9.13: add an optional approved manual SSH target flow for IP/port/username access, with allowlist and audit.
+
+## Phase 9.9 - Console Reliability And UX Polish
+
+Date: 2026-06-04
+
+Phase 9.9 hardens the browser console experience around the messy operational
+edges that made the console feel unreliable.
+
+Implemented behavior:
+
+- AVA exposes a console readiness endpoint at `/console/status`.
+- The readiness response reports whether the Windows host runner heartbeat is
+  online.
+- The readiness response reports whether an AVA-managed VM target is available.
+- The console UI has a manual `Check` action so the user can see why the console
+  can or cannot open.
+- Opening the console while the runner is offline now returns an actionable
+  message: start AVA with `scripts/start-ava.ps1`, then retry.
+- Opening the console when no AVA-managed VM exists now says no console target
+  is available instead of failing generically.
+- Queued console sessions that never get picked up by the host runner are marked
+  failed after a timeout instead of remaining stuck forever.
+- Failed or closed sessions tell the user to click `Reconnect` for a fresh
+  console session.
+- Repeated polling rate-limit noise is throttled so the console does not flood
+  the panel with the same message.
+- Runner heartbeat details can be read as structured payload, not only as a
+  boolean.
+
+This does not change the security model: AVA remains the authenticated gateway,
+the browser does not receive SSH private keys, and the console still targets
+AVA-managed VMs only.
+
+## Phase 9.9 Acceptance Checklist
+
+Phase 9.9 is acceptable when:
+
+- `/console/status` returns runner health and target availability.
+- If the host runner is offline, Web Console clearly says the runner must be
+  started before opening.
+- If no AVA-managed VM exists, Web Console clearly says no target is available.
+- A stale queued console session fails with a reconnect instruction.
+- Reconnect opens a fresh console session after a failed/stale session.
+- Console rate-limit messages are not spammed continuously.
+- The Phase 9 runner bridge regression suite passes.
 
 ## Product Note
 
