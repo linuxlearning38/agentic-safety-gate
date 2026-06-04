@@ -859,6 +859,12 @@ def test_web_console_ui_normalizes_duplicate_prompts() -> list[bool]:
         check("web console buffers typed keys before sending", "queueAvaConsoleInput" in source and "inputFlushTimer" in source),
         check("web console allows terminal typing rate", '@limiter.limit("1200 per minute")' in source),
         check("web console renders remote backspace echo", "backspaceCount" in source and "cleaned = cleaned.slice(0, -1)" in source),
+        check("web console exposes readiness endpoint", "@app.route('/console/status'" in source),
+        check("web console has manual readiness check", "checkAvaConsoleReadiness" in source and "formatConsoleReadiness" in source),
+        check("web console reports runner offline actionably", "The Windows host runner is offline" in source),
+        check("web console times out stale queued sessions", "Console session timed out before the host runner connected" in source),
+        check("web console tells user to reconnect closed sessions", "Click Reconnect to start a fresh session" in source),
+        check("web console throttles rate-limit noise", "lastBusyNoticeAt" in source and "8000" in source),
     ]
 
 
@@ -1087,10 +1093,12 @@ def main() -> int:
 
     writer = ProvisioningResultWriter(queue)
     queue.write_runner_heartbeat("idle", {"pid": 1234})
+    heartbeat = queue.get_runner_heartbeat()
     failures.extend(
         [
             check("runner heartbeat is written", bool(fake.values.get(RUNNER_HEARTBEAT_KEY))),
             check("runner heartbeat has ttl", fake.expirations.get(RUNNER_HEARTBEAT_KEY) == 90),
+            check("runner heartbeat can be read as payload", heartbeat is not None and heartbeat.get("metadata", {}).get("pid") == 1234),
             check("runner health reads heartbeat", queue.is_runner_healthy() is True),
         ]
     )

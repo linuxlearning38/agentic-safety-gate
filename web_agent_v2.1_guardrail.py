@@ -16,7 +16,7 @@ import json
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from control.secure_executor import execute_approved_command, execute_command_secure, execute_tool_safe
 from control.tool_registry import registry as tool_registry
 from control.command_graph import match_graph, execute_graph
@@ -3792,6 +3792,64 @@ def _require_console_owner(console_id: str, user_id: str):
     return session, None
 
 
+def _console_session_age_seconds(session: dict) -> float | None:
+    updated_at = session.get("updated_at") or session.get("created_at")
+    if not updated_at:
+        return None
+    try:
+        updated = datetime.fromisoformat(str(updated_at))
+    except ValueError:
+        return None
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds())
+
+
+def _console_target_payload(user_id: str) -> dict:
+    service, session, runner, result = _resolve_active_console_target(user_id)
+    heartbeat = service.job_queue.get_runner_heartbeat()
+    web_url = f"http://127.0.0.1:{result.http_port}/" if result and result.http_port else None
+    payload = {
+        "runner_healthy": bool(heartbeat),
+        "runner_heartbeat": heartbeat,
+        "target_available": bool(session and result),
+        "mode": "interactive_key",
+        "transport": "http_polling",
+        "renderer": "pre_ansi_subset",
+        "next_transport": "xterm_websocket",
+        "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    if session and result:
+        payload["target"] = {
+            "session_id": session.session_id,
+            "vm": result.instance_name or result.instance_id,
+            "instance_id": result.instance_id,
+            "ssh_host": result.ssh_host,
+            "ssh_port": result.ssh_port,
+            "username": "ava-runner",
+            "web_url": web_url,
+        }
+    else:
+        payload["target"] = None
+    return payload
+
+
+@app.route('/console/status', methods=['GET'])
+@limiter.limit("60 per minute")
+@jwt_required()
+def console_status():
+    """Report browser console readiness without creating a new session."""
+    user_id = str(get_jwt_identity() or "admin")
+    payload = _console_target_payload(user_id)
+    if not payload["target_available"]:
+        payload["message"] = "No completed AVA-managed VM is available for Web Console yet."
+    elif not payload["runner_healthy"]:
+        payload["message"] = "The Windows host runner is offline. Start AVA with scripts/start-ava.ps1, then retry Web Console."
+    else:
+        payload["message"] = "AVA Web Console is ready for the latest AVA-managed VM."
+    return jsonify(payload)
+
+
 @app.route('/console/open', methods=['POST'])
 @limiter.limit("10 per minute")
 @jwt_required()
@@ -3799,15 +3857,21 @@ def console_open():
     """Start a browser-based console for the latest AVA-managed VM."""
     user_id = str(get_jwt_identity() or "admin")
     service, session, runner, result = _resolve_active_console_target(user_id)
+    heartbeat = service.job_queue.get_runner_heartbeat()
     if not session or not result:
         return jsonify({
             "error": "no_ava_managed_vm",
             "message": "No completed AVA-managed VM is attached to this account yet.",
+            "runner_healthy": bool(heartbeat),
+            "target_available": False,
         }), 404
-    if not service.job_queue.is_runner_healthy():
+    if not heartbeat:
         return jsonify({
             "error": "runner_offline",
-            "message": "The Windows host runner must be online before AVA Web Console can open.",
+            "message": "The Windows host runner is offline. Start AVA with scripts/start-ava.ps1, then retry Web Console.",
+            "runner_healthy": False,
+            "target_available": True,
+            "target": result.instance_name or result.instance_id,
         }), 503
 
     console = service.job_queue.create_console_session(
@@ -3832,6 +3896,8 @@ def console_open():
         "ssh_host": result.ssh_host,
         "ssh_port": result.ssh_port,
         "username": "ava-runner",
+        "runner_healthy": True,
+        "heartbeat": heartbeat,
         "message": "AVA Web Console queued. The host runner will connect using AVA's retained runner key.",
     })
 
@@ -3848,6 +3914,16 @@ def console_output(console_id):
     offset = int(request.args.get("offset", "0") or "0")
     lines, next_offset = service.job_queue.read_console_output(console_id, offset)
     session = service.job_queue.get_console_session(console_id) or session
+    age_seconds = _console_session_age_seconds(session)
+    if session.get("status") in {"queued", "picked_up"} and age_seconds is not None and age_seconds > 45:
+        error_message = (
+            "Console session timed out before the host runner connected. "
+            "The runner may have restarted or missed this console request. Click Reconnect to open a fresh session."
+        )
+        service.job_queue.update_console_session(console_id, status="failed", error=error_message)
+        service.job_queue.append_console_output(console_id, f"\r\n{error_message}\r\n")
+        session = service.job_queue.get_console_session(console_id) or session
+        lines, next_offset = service.job_queue.read_console_output(console_id, offset)
     return jsonify({
         "console_id": console_id,
         "status": session.get("status", "unknown"),
@@ -3855,6 +3931,9 @@ def console_output(console_id):
         "next_offset": next_offset,
         "vm": session.get("instance_name") or session.get("instance_id"),
         "username": session.get("username") or "ava-runner",
+        "error": session.get("error"),
+        "age_seconds": age_seconds,
+        "runner_healthy": service.job_queue.is_runner_healthy(),
     })
 
 
@@ -3867,7 +3946,11 @@ def console_input(console_id):
     if error:
         return error
     if session.get("status") in {"closed", "failed"}:
-        return jsonify({"error": "console_not_open", "status": session.get("status")}), 409
+        return jsonify({
+            "error": "console_not_open",
+            "status": session.get("status"),
+            "message": "This console session is no longer open. Click Reconnect to start a fresh session.",
+        }), 409
     data = request.json or {}
     text = str(data.get("input") or "")
     if len(text) > 4000:
@@ -7543,6 +7626,7 @@ HTML_TEMPLATE = r'''
             </div>
             <div class="ava-console-actions">
                 <span id="avaConsoleStatus" class="ava-console-status" data-state="idle">Idle</span>
+                <button type="button" onclick="checkAvaConsoleReadiness()">Check</button>
                 <button type="button" onclick="openAvaConsole(true)">Reconnect</button>
                 <button type="button" onclick="sendAvaConsoleInterrupt()">Interrupt</button>
                 <button type="button" onclick="closeAvaConsole()">Close</button>
@@ -8073,7 +8157,8 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             backspaceCount: 0,
             inputBuffer: '',
             inputFlushTimer: null,
-            openStartedAt: 0
+            openStartedAt: 0,
+            lastBusyNoticeAt: 0
         };
 
         function appendConsoleText(text) {
@@ -8106,6 +8191,21 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
         function focusAvaConsole() {
             const output = document.getElementById('avaConsoleOutput');
             if (output) output.focus();
+        }
+
+        function formatConsoleReadiness(data) {
+            const lines = [];
+            lines.push(data.message || 'Console readiness checked.');
+            lines.push(`- Runner: ${data.runner_healthy ? 'online' : 'offline'}`);
+            lines.push(`- Target VM: ${data.target_available ? 'available' : 'not available'}`);
+            if (data.target) {
+                lines.push(`- VM: ${data.target.vm}`);
+                lines.push(`- SSH: ${data.target.ssh_host}:${data.target.ssh_port}`);
+                if (data.target.web_url) lines.push(`- Web: ${data.target.web_url}`);
+            }
+            lines.push(`- Mode: ${data.mode || 'interactive_key'} over ${data.transport || 'http_polling'}`);
+            lines.push(`- Next terminal upgrade: ${data.next_transport || 'xterm_websocket'}`);
+            return lines.join('\n') + '\n';
         }
 
         function cleanConsoleText(text) {
@@ -8221,6 +8321,28 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             avaConsoleState.clearRequested = false;
             avaConsoleState.backspaceCount = 0;
             avaConsoleState.inputBuffer = '';
+            avaConsoleState.lastBusyNoticeAt = 0;
+        }
+
+        async function checkAvaConsoleReadiness() {
+            const panel = document.getElementById('avaConsolePanel');
+            if (panel) panel.classList.add('open');
+            setAvaConsoleStatus('Checking', 'connecting');
+            const output = document.getElementById('avaConsoleOutput');
+            if (output && !avaConsoleState.id) output.textContent = 'Checking AVA Web Console readiness...\n';
+            try {
+                const resp = await fetch('/console/status');
+                const data = await resp.json();
+                appendConsoleText(formatConsoleReadiness(data));
+                if (data.runner_healthy && data.target_available) {
+                    setAvaConsoleStatus('Ready', 'connected');
+                } else {
+                    setAvaConsoleStatus('Needs runner', 'failed');
+                }
+            } catch (err) {
+                setAvaConsoleStatus('Check failed', 'failed');
+                appendConsoleText('Console readiness check failed: ' + (err && err.message ? err.message : 'unknown error') + '\n');
+            }
         }
 
         async function openAvaConsole(force = false) {
@@ -8256,6 +8378,12 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                     resetAvaConsoleTransportState();
                     setAvaConsoleStatus('Failed', 'failed');
                     appendConsoleText('Console could not open: ' + (data.message || data.error || 'unknown error') + '\n');
+                    if (data.runner_healthy === false) {
+                        appendConsoleText('Runner status: offline. Start AVA normally, then click Reconnect.\n');
+                    }
+                    if (data.target_available === false) {
+                        appendConsoleText('Target status: no completed AVA-managed VM is available yet.\n');
+                    }
                     return;
                 }
                 avaConsoleState.id = data.console_id;
@@ -8295,11 +8423,15 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                     if (resp.status === 429) {
                         setAvaConsoleStatus('Busy', 'connecting');
                         resetAvaConsolePollTimer(Math.min(8000, avaConsoleState.pollDelayMs * 2));
-                        appendConsoleText(`Console is slowing polling to ${Math.round(avaConsoleState.pollDelayMs / 1000)}s because AVA is busy.\n`);
+                        const now = Date.now();
+                        if (now - avaConsoleState.lastBusyNoticeAt > 8000) {
+                            appendConsoleText(`Console is slowing polling to ${Math.round(avaConsoleState.pollDelayMs / 1000)}s because AVA is busy.\n`);
+                            avaConsoleState.lastBusyNoticeAt = now;
+                        }
                         return;
                     }
                     setAvaConsoleStatus('Failed', 'failed');
-                    appendConsoleText('Console polling failed: ' + (data.error || 'unknown error') + '\n');
+                    appendConsoleText('Console polling failed: ' + (data.message || data.error || 'unknown error') + '\n');
                     return;
                 }
                 if (avaConsoleState.pollDelayMs !== 500) {
@@ -8316,6 +8448,9 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                 }
                 avaConsoleState.offset = data.next_offset || avaConsoleState.offset;
                 (data.output || []).forEach(chunk => appendConsoleText(chunk));
+                if (data.status === 'failed' && data.error) {
+                    appendConsoleText('\n' + data.error + '\n');
+                }
                 if (['closed', 'failed'].includes(data.status) && avaConsoleState.pollTimer) {
                     clearInterval(avaConsoleState.pollTimer);
                     avaConsoleState.pollTimer = null;
@@ -8414,7 +8549,7 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                 if (!resp.ok) {
                     const data = await resp.json();
                     setAvaConsoleStatus('Input failed', 'failed');
-                    appendConsoleText('Input failed: ' + (data.error || 'unknown error') + '\n');
+                    appendConsoleText('Input failed: ' + (data.message || data.error || 'unknown error') + '\n');
                 }
             } catch (err) {
                 setAvaConsoleStatus('Input failed', 'failed');
