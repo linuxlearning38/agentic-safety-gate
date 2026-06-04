@@ -790,15 +790,19 @@ class HostRunner:
         candidates: list[Path] = []
         if metadata_key:
             candidates.append(Path(metadata_key))
+        if runner_job_id:
+            candidates.append(self.config.work_root / "keys" / f"{runner_job_id}_ava_runner_ed25519")
+            candidates.append(self.config.work_root / runner_job_id / "ava_runner_ed25519")
         if instance_name:
             candidates.append(self.config.work_root / "keys" / f"{instance_name}_ava_runner_ed25519")
         candidates.append(self.config.work_root / "keys" / f"{instance_id}_ava_runner_ed25519")
-        if runner_job_id:
-            candidates.append(self.config.work_root / runner_job_id / "ava_runner_ed25519")
         for candidate in candidates:
-            if candidate.exists():
-                _lock_down_private_key(candidate)
-                return candidate
+            try:
+                if candidate.exists():
+                    _lock_down_private_key(candidate)
+                    return candidate
+            except OSError:
+                self.logger.warning("Skipping inaccessible retained runner key candidate: %s", candidate)
         return None
 
     def execute_job(self, job: ProvisioningJob) -> None:
@@ -832,7 +836,7 @@ class HostRunner:
             public_key = (key_path.with_suffix(".pub")).read_text(encoding="utf-8").strip()
             retained_key_dir = self.config.work_root / "keys"
             retained_key_dir.mkdir(parents=True, exist_ok=True)
-            retained_key_path = retained_key_dir / f"{vm_name}_ava_runner_ed25519"
+            retained_key_path = retained_key_dir / f"{job.job_id}_ava_runner_ed25519"
             shutil.copy2(key_path, retained_key_path)
             shutil.copy2(key_path.with_suffix(".pub"), retained_key_path.with_suffix(".pub"))
             _lock_down_private_key(retained_key_path)

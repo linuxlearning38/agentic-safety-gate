@@ -847,6 +847,8 @@ def test_web_console_ui_normalizes_duplicate_prompts() -> list[bool]:
         check("web console exposes status badge", "avaConsoleStatus" in source),
         check("web console updates status through helper", "setAvaConsoleStatus" in source),
         check("web console reconnect closes previous session", "previousConsoleId" in source and "/close`" in source),
+        check("web console handles clear-screen sequences", "isConsoleClearSequence" in source and "clearRequested" in source),
+        check("web console clears output before appending post-clear text", "output.textContent = ''" in source),
     ]
 
 
@@ -943,9 +945,11 @@ def test_windows_runner_key_acl_command_restricts_private_key() -> list[bool]:
 
 def test_day2_key_lookup_self_heals_private_key_permissions() -> list[bool]:
     tmp = Path(tempfile.mkdtemp())
-    key_path = tmp / "keys" / "ava-web-day2_ava_runner_ed25519"
+    key_path = tmp / "keys" / "job-day2_ava_runner_ed25519"
+    legacy_key_path = tmp / "keys" / "ava-web-day2_ava_runner_ed25519"
     key_path.parent.mkdir(parents=True)
     key_path.write_text("fake-private-key", encoding="utf-8")
+    legacy_key_path.write_text("legacy-hostname-key", encoding="utf-8")
 
     runner = HostRunner.__new__(HostRunner)
     runner.config = HostRunnerConfig(
@@ -962,7 +966,7 @@ def test_day2_key_lookup_self_heals_private_key_permissions() -> list[bool]:
     operation = SimpleNamespace(
         instance_id="ava-web-day2",
         instance_name="ava-web-day2",
-        metadata={},
+        metadata={"runner_job_id": "job-day2"},
     )
 
     import provisioning.runner.host_runner as hr_mod
@@ -977,7 +981,8 @@ def test_day2_key_lookup_self_heals_private_key_permissions() -> list[bool]:
         shutil.rmtree(tmp, ignore_errors=True)
 
     return [
-        check("retained key lookup finds private key", found == key_path),
+        check("retained key lookup finds job-specific private key", found == key_path),
+        check("retained key lookup prefers job-specific key over hostname key", found != legacy_key_path),
         check("retained key lookup locks down private key before use", locked == [key_path]),
     ]
 

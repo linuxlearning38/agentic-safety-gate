@@ -79,6 +79,9 @@ Implemented:
 - Reconnect closes the previous console session before opening a replacement.
 - Repeated adjacent shell prompts are normalized so normal command output stays
   readable.
+- Clear-screen terminal sequences from commands such as `clear` are interpreted
+  by the browser panel, so the visible console is wiped instead of showing raw
+  escape text or leaving old output behind.
 
 This first slice uses HTTP polling, not WebSockets. That keeps the feature
 inside the current Flask/Gunicorn stack. A later slice can replace polling with
@@ -96,6 +99,7 @@ Phase 9.7 is considered complete when:
 - Basic commands work from the browser console:
   - `whoami`
   - `hostname`
+  - `clear`
   - `curl -I http://127.0.0.1`
   - `systemctl --no-pager status nginx`
 - The console does not expose the private runner key or VM password to the
@@ -114,8 +118,8 @@ These are accepted limits for Phase 9.7 and are intentionally deferred:
 - The console is polling-based, so it is slower than PuTTY.
 - It is suitable for ordinary commands and troubleshooting, not full-screen TUI
   programs such as `vim`, `top`, `less`, or interactive installers.
-- Arrow-key history, tab completion rendering, terminal resize, and perfect ANSI
-  handling require the WebSocket/xterm phase.
+- Arrow-key history, tab completion rendering, terminal resize, cursor-perfect
+  editing, and full ANSI handling require the WebSocket/xterm phase.
 - The first slice targets the latest AVA-managed VM only. A VM picker is a
   future slice.
 - Manual public SSH targets are not enabled in this phase.

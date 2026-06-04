@@ -8061,13 +8061,20 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             pollTimer: null,
             opening: false,
             pollDelayMs: 500,
-            ansiMode: null
+            ansiMode: null,
+            ansiBuffer: '',
+            clearRequested: false
         };
 
         function appendConsoleText(text) {
             const output = document.getElementById('avaConsoleOutput');
             if (!output) return;
-            output.textContent += cleanConsoleText(text);
+            const cleaned = cleanConsoleText(text);
+            if (avaConsoleState.clearRequested) {
+                output.textContent = '';
+                avaConsoleState.clearRequested = false;
+            }
+            output.textContent += cleaned;
             output.textContent = normalizeConsolePrompts(output.textContent);
             if (output.textContent.length > 90000) {
                 output.textContent = output.textContent.slice(-70000);
@@ -8089,6 +8096,7 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                 if (avaConsoleState.ansiMode === 'escape') {
                     if (ch === '[') {
                         avaConsoleState.ansiMode = 'csi';
+                        avaConsoleState.ansiBuffer = '';
                     } else if (ch === ']') {
                         avaConsoleState.ansiMode = 'osc';
                     } else if (ch === '(' || ch === ')') {
@@ -8100,7 +8108,15 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                 }
                 if (avaConsoleState.ansiMode === 'csi') {
                     if (ch >= '@' && ch <= '~') {
+                        const sequence = avaConsoleState.ansiBuffer + ch;
+                        if (isConsoleClearSequence(sequence)) {
+                            cleaned = '';
+                            avaConsoleState.clearRequested = true;
+                        }
                         avaConsoleState.ansiMode = null;
+                        avaConsoleState.ansiBuffer = '';
+                    } else {
+                        avaConsoleState.ansiBuffer += ch;
                     }
                     continue;
                 }
@@ -8131,6 +8147,13 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                 cleaned += ch;
             }
             return cleaned;
+        }
+
+        function isConsoleClearSequence(sequence) {
+            const normalized = String(sequence || '').replace(/[?;]/g, '');
+            return normalized === '2J'
+                || normalized === '3J'
+                || normalized === 'J';
         }
 
         function normalizeConsolePrompts(text) {

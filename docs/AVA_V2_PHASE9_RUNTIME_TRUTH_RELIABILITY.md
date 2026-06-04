@@ -1,7 +1,7 @@
 # AVA v2 Phase 9.6 — Runtime Truth And Reliability
 
 Branch: `v2-development`
-Status: Slice 1 started
+Status: Slice 1 expanded
 Target version: `v2.1.x`
 
 ## Purpose
@@ -72,6 +72,59 @@ Fix:
 
 This prevents stale SQLite state from trapping the user after Redis expiry,
 runner failure, or manual VM cleanup.
+
+### Slice 1B — Completed History Must Not Block If The VM Was Deleted
+
+Status: implemented.
+
+Problem found:
+
+- The runner had completed a previous VM job and stored successful evidence.
+- The user manually deleted the VM from VirtualBox.
+- The chat session was still in a follow-up checkpoint such as
+  `awaiting_first_login` or `awaiting_post_login_choices`.
+- AVA displayed the effective runner phase as `completed`, but still treated the
+  session as an active provisioning request.
+- A new `I want a web server` request was blocked even though VirtualBox had no
+  AVA-created web server left.
+
+Fix:
+
+- A completed runner result now makes the provisioning execution terminal for
+  the active-request guard.
+- Existing completed VM history blocks accidental duplicate creation only after
+  a live host-runner verification confirms the VM still exists and is running.
+- If live verification says the VM is missing or not running, AVA treats the old
+  stored evidence as history and allows a fresh provisioning request.
+- If live verification cannot return a clear answer before the guard timeout,
+  AVA must not use stored history as proof that the old VM still exists.
+
+This preserves the safety guard against accidental duplicate web servers while
+removing the stale-history trap after manual VM deletion.
+
+### Slice 1C — Hostname Reuse Must Not Reuse Protected Runner Keys
+
+Status: implemented.
+
+Problem found:
+
+- A user deleted `ava-web-01` and requested a new VM with the same hostname.
+- The runner generated a new job, but retained the `ava-runner` SSH private key
+  at a hostname-derived path:
+  `.ava-runner/keys/ava-web-01_ava_runner_ed25519`.
+- A protected stale key from the previous VM could not be overwritten on
+  Windows, causing provisioning to fail with `Permission denied`.
+
+Fix:
+
+- Retained runner keys are now stored with a job-derived filename:
+  `.ava-runner/keys/<runner-job-id>_ava_runner_ed25519`.
+- Day-2 operations and the browser console look up the job-specific key before
+  legacy hostname-derived key paths.
+- Inaccessible legacy key candidates are skipped instead of crashing key lookup.
+
+This lets users safely reuse normal hostnames such as `ava-web-01` without
+manually cleaning hidden runner key files.
 
 ## Next Slices
 

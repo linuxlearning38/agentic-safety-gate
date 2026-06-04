@@ -66,6 +66,10 @@ class ProvisioningChatService:
                 active_runner = self._runner_snapshot(active)
                 if _runner_failed(active_runner):
                     active = None
+                elif _runner_completed(active_runner):
+                    if active.phase != SessionPhase.COMPLETED:
+                        self.sessions.save(active.with_updates(phase=SessionPhase.COMPLETED))
+                    active = None
                 else:
                     return self._result(_format_active_provisioning_guard(active, active_runner), active)
             existing = self._existing_managed_vm_session(user_id)
@@ -269,9 +273,54 @@ class ProvisioningChatService:
         for session in recent_sessions:
             runner = self._runner_snapshot(session)
             result = runner.get("result")
-            if result and result.instance_id and not result.error:
+            if result and result.instance_id and not result.error and self._existing_vm_still_live(session, runner, result):
                 return session
         return None
+
+    def _existing_vm_still_live(self, session, runner: dict[str, Any], result: ProvisioningJobResult) -> bool:
+        """Use live runner truth before letting an old completed VM block new provisioning."""
+        if not getattr(self.job_queue, "is_runner_healthy", lambda: False)():
+            return False
+        enqueue_operation = getattr(self.job_queue, "enqueue_day2_operation", None)
+        if enqueue_operation is None:
+            return False
+        try:
+            day2_job = enqueue_operation(
+                session_id=session.session_id,
+                operation="verify",
+                target="web_server",
+                instance_id=result.instance_id,
+                instance_name=result.instance_name,
+                ssh_host=result.ssh_host,
+                ssh_port=result.ssh_port,
+                http_port=result.http_port,
+                metadata={
+                    "read_only": True,
+                    "guard_check": True,
+                    "runner_job_id": runner.get("job_id"),
+                    "username": (session.collected_answers or {}).get("username", "avaadmin"),
+                },
+            )
+        except Exception:
+            return False
+        operation_result = self._wait_for_day2_result(day2_job.operation_id, timeout_seconds=6)
+        if operation_result is None:
+            return False
+        existing_operations = list((session.collected_answers or {}).get("day2_operation_ids") or [])
+        existing_operations.append(day2_job.operation_id)
+        self.sessions.record_answers(
+            session.session_id,
+            {
+                "last_day2_operation_id": day2_job.operation_id,
+                "day2_operation_ids": existing_operations[-10:],
+            },
+        )
+        if getattr(operation_result, "status", None) != "completed" or getattr(operation_result, "error", None):
+            return False
+        checks = ((getattr(operation_result, "evidence", None) or {}).get("checks") or [])
+        required = {"vm_exists", "vm_running"}
+        passed = {check.get("name") for check in checks if check.get("passed") is True}
+        return required.issubset(passed)
 
     def _maybe_queue_approval(self, response):
         if response.requires_approval and response.desired_state_ready:
