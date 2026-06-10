@@ -385,20 +385,49 @@ class ProvisioningChatService:
                 "day2_status": day2_status,
                 "day2_result": day2_result,
             }
-        status = self.job_queue.get_status(job_id)
-        result = self.job_queue.get_result(job_id)
+        # I5: defensive reads — ConnectionError / expired key degrades to None, never raises.
+        try:
+            status = self.job_queue.get_status(job_id)
+        except Exception:
+            status = None
+        try:
+            result = self.job_queue.get_result(job_id)
+        except Exception:
+            result = None
         get_progress = getattr(self.job_queue, "get_progress", None)
-        progress = get_progress(job_id) if get_progress else None
+        try:
+            progress = get_progress(job_id) if get_progress else None
+        except Exception:
+            progress = None
         if progress and not status:
             status = getattr(progress, "status", None)
         if progress and getattr(progress, "instance_id", None) and not session.instance_id:
             session = self.sessions.save(session.with_updates(instance_id=progress.instance_id))
-        if result and result.instance_id:
-            status = "completed"
-        elif result and result.error:
+        # I1: error is the authoritative terminal signal and is evaluated BEFORE instance_id.
+        # A result with both instance_id and error set (instance_id identifies the rolled-back
+        # VM for tracing) is FAILED — instance_id alone must never mask a failure.
+        if result and result.error:
             status = "failed"
+            # I2 + I3: write terminal phase AND identity in one save so SQLite is always
+            # consistent with the Redis result. instance_id is recorded as identity even on
+            # failure so AVA can say "VM X was created then rolled back".
+            _updates: dict[str, Any] = {}
+            if result.instance_id and session.instance_id != result.instance_id:
+                _updates["instance_id"] = result.instance_id
             if session.phase != SessionPhase.FAILED:
-                session = self.sessions.save(session.with_updates(phase=SessionPhase.FAILED))
+                _updates["phase"] = SessionPhase.FAILED
+            if _updates:
+                session = self.sessions.save(session.with_updates(**_updates))
+        elif result and result.instance_id:
+            status = "completed"
+            # I2 + I3: write COMPLETED and identity for successful results too.
+            _updates = {}
+            if session.instance_id != result.instance_id:
+                _updates["instance_id"] = result.instance_id
+            if session.phase not in {SessionPhase.COMPLETED, SessionPhase.FAILED, SessionPhase.CANCELLED}:
+                _updates["phase"] = SessionPhase.COMPLETED
+            if _updates:
+                session = self.sessions.save(session.with_updates(**_updates))
         elif _runner_job_orphaned(session, status, self.job_queue):
             status = "failed"
             result = ProvisioningJobResult(
@@ -437,8 +466,14 @@ class ProvisioningChatService:
             )
             if session.phase != SessionPhase.FAILED:
                 session = self.sessions.save(session.with_updates(phase=SessionPhase.FAILED))
-        if result and result.instance_id and session.instance_id != result.instance_id:
-            session = self.sessions.save(session.with_updates(instance_id=result.instance_id))
+        # I2 catch-all: if status resolved to a terminal value through any path but the
+        # session phase wasn't written above (e.g. status-only "failed" key, no result),
+        # write through now so no session stays non-terminal with a terminal job status.
+        if status in {"failed", "completed"} and session.phase not in {
+            SessionPhase.COMPLETED, SessionPhase.FAILED, SessionPhase.CANCELLED
+        }:
+            target = SessionPhase.FAILED if status == "failed" else SessionPhase.COMPLETED
+            session = self.sessions.save(session.with_updates(phase=target))
         return {
             "job_id": job_id,
             "status": status,
@@ -758,7 +793,9 @@ def _runner_job_state_expired(session) -> bool:
 def _runner_job_orphaned(session, status: str | None, job_queue: ProvisioningJobQueue) -> bool:
     if session.phase in {SessionPhase.COMPLETED, SessionPhase.FAILED, SessionPhase.CANCELLED}:
         return False
-    if status not in {"queued", "picked_up", "provisioning", "bootstrapping", "hardening", "verifying"}:
+    # I6: status=None means Redis was wiped (e.g. after a reboot) — treat the same as an
+    # in-flight status so the offline-runner + elapsed-age check below can fire.
+    if status is not None and status not in {"queued", "picked_up", "provisioning", "bootstrapping", "hardening", "verifying"}:
         return False
     if _runner_is_healthy(job_queue):
         return False
@@ -1187,7 +1224,12 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
     runner = runner or {}
     result = runner.get("result")
     progress_result = _runner_progress_result(runner)
-    attached_instance = session.instance_id or (result.instance_id if result else None) or (progress_result.instance_id if progress_result else None)
+    failed_error = result.error if result and result.error else None
+    failed_rollback = failed_error.get("rollback") if isinstance(failed_error, dict) else None
+    failed_cleanup_destroyed = (failed_rollback or {}).get("status") == "destroyed"
+    attached_instance = None
+    if not failed_cleanup_destroyed:
+        attached_instance = session.instance_id or (result.instance_id if result else None) or (progress_result.instance_id if progress_result else None)
     effective_phase = _effective_phase(session, runner)
     lines = [
         "Provisioning status for the active AVA v2 web-server session:",
@@ -1220,7 +1262,8 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
                 f"- Error: `{error.get('message') or 'unknown error'}`",
                 f"- Partial VM cleanup: `{(rollback or {}).get('status') or 'not reported'}`",
                 "",
-                "No PuTTY or web URL is available because this VM did not finish provisioning. "
+                "No active VM is attached to this session, and no PuTTY or web URL is available because "
+                "this VM did not finish provisioning. "
                 "You can start a fresh request now.",
             ]
         )
@@ -1358,6 +1401,12 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
     result = runner.get("result")
     progress_result = _runner_progress_result(runner)
     effective_phase = _effective_phase(session, runner)
+    failed_error = result.error if result and result.error else None
+    failed_rollback = failed_error.get("rollback") if isinstance(failed_error, dict) else None
+    failed_cleanup_destroyed = (failed_rollback or {}).get("status") == "destroyed"
+    attached_instance = None
+    if not failed_cleanup_destroyed:
+        attached_instance = session.instance_id or (result.instance_id if result else None) or (progress_result.instance_id if progress_result else None)
     evidence = [
         "Provisioning evidence for the active AVA v2 session:",
         "",
@@ -1372,7 +1421,7 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
         f"- Effective phase: `{effective_phase}`",
         f"- Conversation checkpoint: `{session.phase.value}`",
         f"- Recorded hardening profile: `{answers.get('hardening_profile', 'not recorded yet')}`",
-        f"- Attached VM instance: `{session.instance_id or (result.instance_id if result else None) or (progress_result.instance_id if progress_result else None) or 'none yet'}`",
+        f"- Attached VM instance: `{attached_instance or 'none yet'}`",
         f"- Evidence timestamp: `{_utc_now()}`",
         "",
         _format_desired_state(session.desired_state or {}),
@@ -1380,6 +1429,7 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
     if result and result.error:
         error = result.error or {}
         rollback = error.get("rollback") if isinstance(error, dict) else None
+        failed_instance = result.instance_id or result.instance_name or session.instance_id
         evidence.extend(
             [
                 "",
@@ -1388,6 +1438,7 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
                 f"- Failure class: `{error.get('failure_class') or 'runner_failed'}`",
                 f"- Error: `{error.get('message') or 'unknown error'}`",
                 f"- Partial VM cleanup: `{(rollback or {}).get('status') or 'not reported'}`",
+                f"- Historical failed VM identity: `{failed_instance or 'not available'}`",
                 f"- Completion timestamp: `{result.completion_timestamp}`",
             ]
         )

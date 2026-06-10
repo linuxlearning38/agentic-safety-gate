@@ -49,6 +49,7 @@ Thumbs.db
 *.bak
 scan_output.txt
 security_audit.json
+test-results/
 docs/
 .env
 
