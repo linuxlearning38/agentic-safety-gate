@@ -14,6 +14,7 @@ from uuid import uuid4
 
 JOB_QUEUE_KEY = "ava:provisioning:jobs:approved"
 STATUS_KEY_PREFIX = "ava:provisioning:jobs:status:"
+PROGRESS_KEY_PREFIX = "ava:provisioning:jobs:progress:"
 RESULT_KEY_PREFIX = "ava:provisioning:jobs:result:"
 RUNNER_HEARTBEAT_KEY = "ava:provisioning:runner:heartbeat"
 RUNNER_HEARTBEAT_TTL_SECONDS = 90
@@ -125,6 +126,46 @@ class ProvisioningJobResult:
             http_port=int(data["http_port"]) if data.get("http_port") is not None else None,
             verification_evidence=dict(data.get("verification_evidence") or {}),
             completion_timestamp=str(data.get("completion_timestamp") or _utc_now()),
+            error=data.get("error"),
+        )
+
+
+@dataclass(slots=True)
+class ProvisioningJobProgress:
+    """Durable runner progress before a terminal provisioning result exists."""
+
+    job_id: str
+    session_id: str
+    status: str
+    stage: str
+    instance_id: str | None = None
+    instance_name: str | None = None
+    ssh_host: str | None = None
+    ssh_port: int | None = None
+    http_port: int | None = None
+    runner_key_path: str | None = None
+    message: str | None = None
+    updated_at: str = field(default_factory=_utc_now)
+    error: dict[str, Any] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ProvisioningJobProgress":
+        return cls(
+            job_id=str(data["job_id"]),
+            session_id=str(data.get("session_id") or ""),
+            status=str(data.get("status") or "unknown"),
+            stage=str(data.get("stage") or data.get("status") or "unknown"),
+            instance_id=data.get("instance_id"),
+            instance_name=data.get("instance_name"),
+            ssh_host=data.get("ssh_host"),
+            ssh_port=int(data["ssh_port"]) if data.get("ssh_port") is not None else None,
+            http_port=int(data["http_port"]) if data.get("http_port") is not None else None,
+            runner_key_path=data.get("runner_key_path"),
+            message=data.get("message"),
+            updated_at=str(data.get("updated_at") or _utc_now()),
             error=data.get("error"),
         )
 
@@ -252,6 +293,12 @@ class ProvisioningJobQueue(Protocol):
         ...
 
     def write_status(self, job_id: str, status: str) -> None:
+        ...
+
+    def get_progress(self, job_id: str) -> ProvisioningJobProgress | None:
+        ...
+
+    def write_progress(self, progress: ProvisioningJobProgress) -> None:
         ...
 
     def get_result(self, job_id: str) -> ProvisioningJobResult | None:
@@ -417,6 +464,15 @@ class RedisProvisioningJobQueue:
             raise ValueError(f"Unsupported provisioning job status: {status}")
         self.client.set(_status_key(job_id), status, ex=self.ttl_seconds)
 
+    def get_progress(self, job_id: str) -> ProvisioningJobProgress | None:
+        raw = self.client.get(_progress_key(job_id))
+        if raw is None:
+            return None
+        return ProvisioningJobProgress.from_dict(_json_loads(raw))
+
+    def write_progress(self, progress: ProvisioningJobProgress) -> None:
+        self.client.set(_progress_key(progress.job_id), _json_dumps(progress.to_dict()), ex=max(self.ttl_seconds, 86400))
+
     def get_result(self, job_id: str) -> ProvisioningJobResult | None:
         raw = self.client.get(_result_key(job_id))
         if raw is None:
@@ -550,6 +606,10 @@ class RedisProvisioningJobQueue:
 
 def _status_key(job_id: str) -> str:
     return f"{STATUS_KEY_PREFIX}{job_id}"
+
+
+def _progress_key(job_id: str) -> str:
+    return f"{PROGRESS_KEY_PREFIX}{job_id}"
 
 
 def _result_key(job_id: str) -> str:

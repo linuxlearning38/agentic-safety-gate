@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
 import sqlite3
@@ -17,7 +18,13 @@ sys.path.insert(0, str(ROOT))
 from control import approval  # noqa: E402
 from control.input_router import route_query  # noqa: E402
 from provisioning.conversation import SessionPhase  # noqa: E402
-from provisioning.runner import Day2OperationJob, Day2OperationResult, ProvisioningJob, ProvisioningJobResult  # noqa: E402
+from provisioning.runner import (  # noqa: E402
+    Day2OperationJob,
+    Day2OperationResult,
+    ProvisioningJob,
+    ProvisioningJobProgress,
+    ProvisioningJobResult,
+)
 from provisioning.serving import ProvisioningChatService  # noqa: E402
 
 
@@ -32,6 +39,7 @@ class FakeProvisioningJobQueue:
     def __init__(self, *, live_verify_status: str = "completed"):
         self.jobs: dict[str, ProvisioningJob] = {}
         self.statuses: dict[str, str] = {}
+        self.progress: dict[str, ProvisioningJobProgress] = {}
         self.results: dict[str, ProvisioningJobResult] = {}
         self.day2_jobs: dict[str, Day2OperationJob] = {}
         self.day2_statuses: dict[str, str] = {}
@@ -71,6 +79,12 @@ class FakeProvisioningJobQueue:
 
     def get_result(self, job_id):
         return self.results.get(job_id)
+
+    def get_progress(self, job_id):
+        return self.progress.get(job_id)
+
+    def write_progress(self, progress):
+        self.progress[progress.job_id] = progress
 
     def write_result(self, result):
         self.results[result.job_id] = result
@@ -380,6 +394,40 @@ def main() -> int:
                 check("hardening choice is handled", hardening.handled),
                 check("hardening moves to bootstrapping checkpoint", hardening_session.phase == SessionPhase.BOOTSTRAPPING, hardening_session.phase.value),
                 check("post-login action recorded", hardening_session.collected_answers.get("post_login_actions") == ["baseline_linux"]),
+            ]
+        )
+
+        job_queue.write_status("job-0001", "bootstrapping")
+        job_queue.write_progress(
+            ProvisioningJobProgress(
+                job_id="job-0001",
+                session_id=hardening_session.session_id,
+                status="bootstrapping",
+                stage="web_bootstrap",
+                instance_id="ava-web-progress",
+                instance_name="ava-web-progress",
+                ssh_host="127.0.0.1",
+                ssh_port=2222,
+                http_port=8080,
+                runner_key_path=".ava-runner/keys/job-0001_ava_runner_ed25519",
+                message="Installing and enabling the web-server role.",
+                updated_at="2026-05-02T00:08:00+00:00",
+            )
+        )
+        progress_status = service.handle("user-1", "show me the provisioning status", route_intent=None)
+        progress_connection = service.handle("user-1", "how do I connect with PuTTY?", route_intent=None)
+        progress_verify = service.handle("user-1", "verify the web server", route_intent=None)
+        progress_session = service.sessions.list_active("user-1")[0]
+        failures.extend(
+            [
+                check("runner progress attaches visible VM", progress_session.instance_id == "ava-web-progress", progress_session.instance_id or ""),
+                check("progress status shows attached VM", "ava-web-progress" in progress_status.response),
+                check("progress status shows runner progress", "runner progress" in progress_status.response.lower()),
+                check("progress status shows SSH details", "ssh host/ip: `127.0.0.1`" in progress_status.response.lower()),
+                check("progress connection shows in-progress details", "runner progress details" in progress_connection.response.lower()),
+                check("progress connection includes SSH port", "ssh port: `2222`" in progress_connection.response.lower()),
+                check("progress verification is honest", "verification is not complete" in progress_verify.response.lower()),
+                check("progress verification names visible VM", "ava-web-progress" in progress_verify.response),
             ]
         )
 
@@ -769,6 +817,35 @@ def main() -> int:
                 check("expired attached session no longer blocks retry", stale_attached_retry.handled),
                 check("expired attached retry starts a clean request", "cpu" in stale_attached_retry.response.lower() and "ram" in stale_attached_retry.response.lower()),
                 check("expired attached retry avoids active guard", "already active" not in stale_attached_retry.response.lower()),
+            ]
+        )
+
+        orphaned_db = temp_dir / "orphaned_runner_sessions.sqlite3"
+        orphaned_queue = FakeProvisioningJobQueue()
+        orphaned_service = ProvisioningChatService(orphaned_db, job_queue=orphaned_queue)
+        orphaned_service.handle("user-orphaned", "I want a web server", route_intent="provisioning")
+        orphaned_specs = orphaned_service.handle("user-orphaned", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
+        orphaned_approval_id = orphaned_specs.metadata["provisioning"]["approval_id"]
+        orphaned_service.handle("user-orphaned", f"approve {orphaned_approval_id}", route_intent=None)
+        orphaned_session = orphaned_service.sessions.list_active("user-orphaned")[0]
+        orphaned_job_id = orphaned_session.collected_answers["runner_job_id"]
+        orphaned_queue.write_status(orphaned_job_id, "bootstrapping")
+        orphaned_queue.runner_healthy = False
+        orphaned_updated_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+        with sqlite3.connect(orphaned_db) as conn:
+            conn.execute(
+                "UPDATE provisioning_sessions SET updated_at = ? WHERE session_id = ?",
+                (orphaned_updated_at, orphaned_session.session_id),
+            )
+        orphaned_status = orphaned_service.handle("user-orphaned", "show status", route_intent=None)
+        orphaned_retry = orphaned_service.handle("user-orphaned", "I want a web server", route_intent="provisioning")
+        failures.extend(
+            [
+                check("orphaned runner job is reported as failed", "phase: `failed`" in orphaned_status.response.lower()),
+                check("orphaned runner failure explains stopped runner", "runner stopped before ava received" in orphaned_status.response.lower()),
+                check("orphaned runner job no longer blocks retry", orphaned_retry.handled),
+                check("orphaned runner retry starts a clean request", "cpu" in orphaned_retry.response.lower() and "ram" in orphaned_retry.response.lower()),
+                check("orphaned runner retry avoids active guard", "already active" not in orphaned_retry.response.lower()),
             ]
         )
 

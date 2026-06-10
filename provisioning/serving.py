@@ -387,10 +387,35 @@ class ProvisioningChatService:
             }
         status = self.job_queue.get_status(job_id)
         result = self.job_queue.get_result(job_id)
+        get_progress = getattr(self.job_queue, "get_progress", None)
+        progress = get_progress(job_id) if get_progress else None
+        if progress and not status:
+            status = getattr(progress, "status", None)
+        if progress and getattr(progress, "instance_id", None) and not session.instance_id:
+            session = self.sessions.save(session.with_updates(instance_id=progress.instance_id))
         if result and result.instance_id:
             status = "completed"
         elif result and result.error:
             status = "failed"
+            if session.phase != SessionPhase.FAILED:
+                session = self.sessions.save(session.with_updates(phase=SessionPhase.FAILED))
+        elif _runner_job_orphaned(session, status, self.job_queue):
+            status = "failed"
+            result = ProvisioningJobResult(
+                job_id=job_id,
+                instance_id=session.instance_id,
+                instance_name=session.instance_id,
+                verification_evidence={},
+                completion_timestamp=_utc_now(),
+                error={
+                    "failed_step": "host_runner",
+                    "failure_class": "runner_orphaned",
+                    "message": (
+                        "The Windows host runner stopped before AVA received a final provisioning result. "
+                        "The previous attempt is no longer safe to track; start AVA normally and retry."
+                    ),
+                },
+            )
             if session.phase != SessionPhase.FAILED:
                 session = self.sessions.save(session.with_updates(phase=SessionPhase.FAILED))
         elif status is None and _runner_job_state_expired(session):
@@ -412,12 +437,13 @@ class ProvisioningChatService:
             )
             if session.phase != SessionPhase.FAILED:
                 session = self.sessions.save(session.with_updates(phase=SessionPhase.FAILED))
-        if result and result.instance_id and not session.instance_id:
-            self.sessions.save(session.with_updates(instance_id=result.instance_id))
+        if result and result.instance_id and session.instance_id != result.instance_id:
+            session = self.sessions.save(session.with_updates(instance_id=result.instance_id))
         return {
             "job_id": job_id,
             "status": status,
             "result": result,
+            "progress": progress,
             "day2_operation_id": day2_operation_id,
             "day2_status": day2_status,
             "day2_result": day2_result,
@@ -665,6 +691,47 @@ def _runner_completed(runner: dict[str, Any] | None) -> bool:
     return runner.get("status") == "completed" and bool(result and result.instance_id)
 
 
+def _runner_progress_result(runner: dict[str, Any] | None) -> ProvisioningJobResult | None:
+    runner = runner or {}
+    progress = runner.get("progress")
+    if not progress or not getattr(progress, "instance_id", None):
+        return None
+    return ProvisioningJobResult(
+        job_id=getattr(progress, "job_id", runner.get("job_id") or ""),
+        instance_id=getattr(progress, "instance_id", None),
+        instance_name=getattr(progress, "instance_name", None) or getattr(progress, "instance_id", None),
+        ssh_host=getattr(progress, "ssh_host", None),
+        ssh_port=getattr(progress, "ssh_port", None),
+        http_port=getattr(progress, "http_port", None),
+        verification_evidence={"runner_progress": progress.to_dict() if hasattr(progress, "to_dict") else {}},
+        completion_timestamp=getattr(progress, "updated_at", None) or _utc_now(),
+        error=getattr(progress, "error", None),
+    )
+
+
+def _runner_connection_result(runner: dict[str, Any] | None) -> ProvisioningJobResult | None:
+    runner = runner or {}
+    result = runner.get("result")
+    if result and result.instance_id:
+        return result
+    return _runner_progress_result(runner)
+
+
+def _runner_progress_lines(runner: dict[str, Any] | None) -> list[str]:
+    runner = runner or {}
+    progress = runner.get("progress")
+    if not progress:
+        return []
+    return [
+        "Runner progress:",
+        f"- Stage: `{getattr(progress, 'stage', 'unknown')}`",
+        f"- Status: `{getattr(progress, 'status', 'unknown')}`",
+        f"- VM: `{getattr(progress, 'instance_name', None) or getattr(progress, 'instance_id', None) or 'not created yet'}`",
+        f"- Message: `{getattr(progress, 'message', None) or 'runner is working'}`",
+        f"- Updated: `{getattr(progress, 'updated_at', 'unknown')}`",
+    ]
+
+
 def _runner_failed(runner: dict[str, Any] | None) -> bool:
     if not runner:
         return False
@@ -686,6 +753,26 @@ def _runner_job_state_expired(session) -> bool:
         updated = updated.replace(tzinfo=timezone.utc)
     age_seconds = (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds()
     return age_seconds > 30 * 60
+
+
+def _runner_job_orphaned(session, status: str | None, job_queue: ProvisioningJobQueue) -> bool:
+    if session.phase in {SessionPhase.COMPLETED, SessionPhase.FAILED, SessionPhase.CANCELLED}:
+        return False
+    if status not in {"queued", "picked_up", "provisioning", "bootstrapping", "hardening", "verifying"}:
+        return False
+    if _runner_is_healthy(job_queue):
+        return False
+    updated_at = getattr(session, "updated_at", None)
+    if not updated_at:
+        return False
+    try:
+        updated = datetime.fromisoformat(str(updated_at))
+    except ValueError:
+        return False
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    age_seconds = (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds()
+    return age_seconds > 2 * 60
 
 
 def _runner_is_healthy(job_queue: ProvisioningJobQueue) -> bool:
@@ -724,12 +811,20 @@ def _is_explicit_additional_provisioning(query: str) -> bool:
 
 
 def _format_active_provisioning_guard(session, runner: dict[str, Any]) -> str:
+    progress_result = _runner_progress_result(runner)
+    progress_lines = _runner_progress_lines(runner)
+    progress_block = ""
+    if progress_lines:
+        progress_block = "\n\n" + "\n".join(progress_lines)
+        if progress_result and progress_result.ssh_host and progress_result.ssh_port:
+            progress_block += f"\n- SSH / PuTTY: `{progress_result.ssh_host}:{progress_result.ssh_port}`"
     return (
         "A provisioning request is already active, so I will not start another one on top of it.\n\n"
         f"- Current session: `{session.session_id}`\n"
         f"- Phase: `{_effective_phase(session, runner)}`\n"
         f"- Runner job ID: `{runner.get('job_id') or 'not queued yet'}`\n"
-        f"- Runner status: `{runner.get('status') or 'not available yet'}`\n\n"
+        f"- Runner status: `{runner.get('status') or 'not available yet'}`"
+        f"{progress_block}\n\n"
         "Ask `show me the provisioning status` to continue tracking it, or say `cancel provisioning` "
         "if you want to stop this request before starting a different one."
     )
@@ -771,10 +866,13 @@ def _format_runner_unavailable_response() -> str:
 def _effective_phase(session, runner: dict[str, Any] | None) -> str:
     if runner:
         result = runner.get("result")
+        progress = runner.get("progress")
         if result and result.error:
             return SessionPhase.FAILED.value
         if _runner_completed(runner):
             return SessionPhase.COMPLETED.value
+        if progress and getattr(progress, "status", None):
+            return str(getattr(progress, "status"))
     return session.phase.value
 
 
@@ -1047,13 +1145,14 @@ def _format_runtime_truth_lines(runner: dict[str, Any] | None) -> list[str]:
 def _format_connection_response(session, runner: dict[str, Any] | None = None) -> str:
     runner = runner or {}
     result = runner.get("result")
+    connection_result = _runner_connection_result(runner)
     lines = [
         "AVA connection details for the active provisioning session:",
         "",
         f"- Runner job ID: `{runner.get('job_id') or 'not queued yet'}`",
         f"- Runner status: `{runner.get('status') or 'not available yet'}`",
         "",
-        *_connection_lines(session, result),
+        *_connection_lines(session, connection_result),
     ]
     if result and result.instance_id:
         lines.extend(
@@ -1063,6 +1162,14 @@ def _format_connection_response(session, runner: dict[str, Any] | None = None) -
                 f"- Host Name: `{result.ssh_host}`",
                 f"- Port: `{result.ssh_port}`",
                 "- Connection type: `SSH`",
+            ]
+        )
+    elif connection_result and connection_result.instance_id:
+        lines.extend(
+            [
+                "",
+                "Note: these are runner progress details. AVA will mark the VM fully complete only "
+                "after bootstrap, hardening, and HTTP verification pass.",
             ]
         )
     else:
@@ -1079,6 +1186,8 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
     answers = session.collected_answers or {}
     runner = runner or {}
     result = runner.get("result")
+    progress_result = _runner_progress_result(runner)
+    attached_instance = session.instance_id or (result.instance_id if result else None) or (progress_result.instance_id if progress_result else None)
     effective_phase = _effective_phase(session, runner)
     lines = [
         "Provisioning status for the active AVA v2 web-server session:",
@@ -1094,7 +1203,7 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
         "- Temporary password: `shown once at approval; not recoverable from status`",
         f"- First-login confirmation: `{'yes' if session.phase in {SessionPhase.AWAITING_POST_LOGIN_CHOICES, SessionPhase.BOOTSTRAPPING, SessionPhase.VERIFYING, SessionPhase.COMPLETED} else 'pending'}`",
         f"- Hardening choice: `{answers.get('hardening_profile', 'not recorded yet')}`",
-        f"- Attached VM instance: `{session.instance_id or (result.instance_id if result else None) or 'none yet'}`",
+        f"- Attached VM instance: `{attached_instance or 'none yet'}`",
         f"- Timestamp: `{_utc_now()}`",
         "",
         _format_desired_state(session.desired_state or {}),
@@ -1129,6 +1238,18 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
         operation_lines = _format_latest_server_operation_lines(runner)
         if operation_lines:
             lines.extend(["", *operation_lines])
+    elif progress_result and progress_result.instance_id:
+        lines.extend(
+            [
+                "",
+                *_runner_progress_lines(runner),
+                "",
+                *_connection_lines(session, progress_result, heading="Current runner progress connection details:"),
+                "",
+                "Completion boundary: the VM is visible to AVA, but final provisioning is still waiting "
+                "for bootstrap, hardening, and HTTP verification evidence.",
+            ]
+        )
     elif runner.get("job_id"):
         lines.extend(
             [
@@ -1154,6 +1275,7 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
 def _format_verification_response(session, runner: dict[str, Any] | None = None) -> str:
     runner = runner or {}
     result = runner.get("result")
+    progress_result = _runner_progress_result(runner)
     if result and result.error:
         return (
             "Web-server verification failed for the host runner job.\n\n"
@@ -1180,6 +1302,26 @@ def _format_verification_response(session, runner: dict[str, Any] | None = None)
             "No current pass/fail checks are shown here because this response did not receive "
             "fresh live verification evidence.\n\n"
             "Ask `verify the web server` with the Windows host runner online to produce fresh live evidence."
+        )
+    if progress_result and progress_result.instance_id:
+        http_line = (
+            f"- HTTP: `http://127.0.0.1:{progress_result.http_port}/`"
+            if progress_result.http_port
+            else "- HTTP: `pending`"
+        )
+        return "\n".join(
+            [
+                "The VM is visible to the host runner, but web-server verification is not complete yet.",
+                "",
+                f"- Job ID: `{runner.get('job_id')}`",
+                f"- Runner status: `{runner.get('status') or 'working'}`",
+                f"- Stage: `{getattr(runner.get('progress'), 'stage', 'unknown')}`",
+                f"- VM: `{progress_result.instance_name or progress_result.instance_id}`",
+                f"- SSH / PuTTY: `{progress_result.ssh_host or 'pending'}:{progress_result.ssh_port or 'pending'}`",
+                http_line,
+                "",
+                "AVA will show final verification after nginx and host HTTP checks pass.",
+            ]
         )
     if runner.get("job_id"):
         return (
@@ -1214,6 +1356,7 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
     answers = session.collected_answers or {}
     runner = runner or {}
     result = runner.get("result")
+    progress_result = _runner_progress_result(runner)
     effective_phase = _effective_phase(session, runner)
     evidence = [
         "Provisioning evidence for the active AVA v2 session:",
@@ -1229,7 +1372,7 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
         f"- Effective phase: `{effective_phase}`",
         f"- Conversation checkpoint: `{session.phase.value}`",
         f"- Recorded hardening profile: `{answers.get('hardening_profile', 'not recorded yet')}`",
-        f"- Attached VM instance: `{session.instance_id or (result.instance_id if result else None) or 'none yet'}`",
+        f"- Attached VM instance: `{session.instance_id or (result.instance_id if result else None) or (progress_result.instance_id if progress_result else None) or 'none yet'}`",
         f"- Evidence timestamp: `{_utc_now()}`",
         "",
         _format_desired_state(session.desired_state or {}),
@@ -1270,6 +1413,22 @@ def _format_evidence_response(session, runner: dict[str, Any] | None = None) -> 
         operation_lines = _format_latest_server_operation_lines(runner)
         if operation_lines:
             evidence.extend(["", *operation_lines])
+    elif progress_result and progress_result.instance_id:
+        evidence.extend(
+            [
+                "",
+                "Runner progress evidence:",
+                f"- Stage: `{getattr(runner.get('progress'), 'stage', 'unknown')}`",
+                f"- VM: `{progress_result.instance_name or progress_result.instance_id}`",
+                f"- SSH host/IP: `{progress_result.ssh_host or 'pending'}`",
+                f"- SSH port: `{progress_result.ssh_port or 'pending'}`",
+                f"- HTTP port: `{progress_result.http_port or 'pending'}`",
+                f"- Updated: `{getattr(runner.get('progress'), 'updated_at', 'unknown')}`",
+                "",
+                "Important: this is in-progress VM evidence, not final web-server completion evidence. "
+                "Final evidence appears only after bootstrap, hardening, and HTTP verification pass.",
+            ]
+        )
     elif not session.instance_id:
         evidence.extend(
             [

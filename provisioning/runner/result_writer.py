@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from .job_queue import ProvisioningJobQueue, ProvisioningJobResult
+from .job_queue import ProvisioningJobProgress, ProvisioningJobQueue, ProvisioningJobResult
 
 
 def _utc_now() -> str:
@@ -21,10 +21,47 @@ class ProvisioningResultWriter:
     def status(self, job_id: str, status: str) -> None:
         self.queue.write_status(job_id, status)
 
+    def progress(
+        self,
+        *,
+        job_id: str,
+        session_id: str,
+        status: str,
+        stage: str,
+        instance_id: str | None = None,
+        instance_name: str | None = None,
+        ssh_host: str | None = None,
+        ssh_port: int | None = None,
+        http_port: int | None = None,
+        runner_key_path: str | None = None,
+        message: str | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> ProvisioningJobProgress:
+        self.queue.write_status(job_id, status)
+        progress = ProvisioningJobProgress(
+            job_id=job_id,
+            session_id=session_id,
+            status=status,
+            stage=stage,
+            instance_id=instance_id,
+            instance_name=instance_name,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            http_port=http_port,
+            runner_key_path=runner_key_path,
+            message=message,
+            error=_redact_error(error) if error else None,
+        )
+        write_progress = getattr(self.queue, "write_progress", None)
+        if write_progress is not None:
+            write_progress(progress)
+        return progress
+
     def completed(
         self,
         *,
         job_id: str,
+        session_id: str = "",
         instance_id: str,
         instance_name: str,
         ssh_host: str,
@@ -32,7 +69,18 @@ class ProvisioningResultWriter:
         http_port: int | None,
         verification_evidence: dict[str, Any],
     ) -> ProvisioningJobResult:
-        self.queue.write_status(job_id, "completed")
+        self.progress(
+            job_id=job_id,
+            session_id=session_id,
+            status="completed",
+            stage="completed",
+            instance_id=instance_id,
+            instance_name=instance_name,
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            http_port=http_port,
+            message="VM created, bootstrapped, hardened, and verified.",
+        )
         result = ProvisioningJobResult(
             job_id=job_id,
             instance_id=instance_id,
@@ -51,12 +99,22 @@ class ProvisioningResultWriter:
         self,
         *,
         job_id: str,
+        session_id: str = "",
         instance_id: str | None,
         instance_name: str | None,
         error: dict[str, Any],
         verification_evidence: dict[str, Any] | None = None,
     ) -> ProvisioningJobResult:
-        self.queue.write_status(job_id, "failed")
+        self.progress(
+            job_id=job_id,
+            session_id=session_id,
+            status="failed",
+            stage="failed",
+            instance_id=instance_id,
+            instance_name=instance_name,
+            message="Provisioning failed before AVA received a terminal success result.",
+            error=error,
+        )
         result = ProvisioningJobResult(
             job_id=job_id,
             instance_id=instance_id,

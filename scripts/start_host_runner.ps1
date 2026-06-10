@@ -33,6 +33,8 @@ $env:AVA_HOST_RUNNER_LOG_PATH = Join-Path $WorkDir "host_runner.log"
 $env:AVA_HOST_RUNNER_RETAIN_DEBUG = if ($RetainDebug) { "true" } else { "false" }
 if ($MaxJobs -gt 0) {
     $env:AVA_HOST_RUNNER_MAX_JOBS = [string]$MaxJobs
+} else {
+    Remove-Item Env:\AVA_HOST_RUNNER_MAX_JOBS -ErrorAction SilentlyContinue
 }
 
 Write-Host "Starting AVA host runner"

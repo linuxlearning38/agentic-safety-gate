@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 from provisioning.runner import (  # noqa: E402
     DAY2_OPERATION_QUEUE_KEY,
     JOB_QUEUE_KEY,
+    PROGRESS_KEY_PREFIX,
     RUNNER_HEARTBEAT_KEY,
     ConsoleSessionRequest,
     Day2OperationResult,
@@ -831,6 +832,7 @@ def test_web_console_subprocess_uses_utf8_and_disables_pagers() -> list[bool]:
         check("web console subprocess replaces undecodable bytes", popen_kwargs.get("errors") == "replace"),
         check("web console starts quiet non-login shell", "bash --noprofile --norc -i" in command_text),
         check("web console starts xterm-compatible shell", "TERM=xterm-256color" in command_text),
+        check("web console suppresses known-host warning noise", "LogLevel=ERROR" in command_text),
         check("web console disables systemd pager", "SYSTEMD_PAGER=cat" in command_text),
         check("web console disables generic pager", "PAGER=cat" in command_text),
         check("web console does not echo bootstrap commands through stdin", fake_proc.stdin.writes == []),
@@ -842,9 +844,9 @@ def test_web_console_ui_normalizes_duplicate_prompts() -> list[bool]:
 
     return [
         check("web console normalizes adjacent duplicate prompts", "normalizeConsolePrompts" in source),
-        check("web console normalizes after appending output", "output.textContent = normalizeConsolePrompts(output.textContent)" in source),
+        check("web console normalizes rendered terminal output", "output.textContent = normalizeConsolePrompts(avaConsoleState.terminalLines.join('\\n'))" in source),
         check("web console prompt normalizer matches user and host", "[A-Za-z0-9._-]+@[A-Za-z0-9._-]+" in source),
-        check("web console labels interactive key mode", "Interactive key mode" in source),
+        check("web console labels xterm-lite mode", "xterm-lite mode" in source),
         check("web console exposes status badge", "avaConsoleStatus" in source),
         check("web console updates status through helper", "setAvaConsoleStatus" in source),
         check("web console resets stale transport state", "resetAvaConsoleTransportState" in source),
@@ -853,18 +855,38 @@ def test_web_console_ui_normalizes_duplicate_prompts() -> list[bool]:
         check("web console reconnect closes previous session", "previousConsoleId" in source and "/close`" in source),
         check("web console handles clear-screen sequences", "isConsoleClearSequence" in source and "clearRequested" in source),
         check("web console handles form-feed clear command output", "'\\x0c'" in source and "avaConsoleState.clearRequested = true" in source),
-        check("web console clears output before appending post-clear text", "output.textContent = ''" in source),
+        check("web console resets terminal screen before post-clear text", "resetAvaTerminalScreen" in source and "avaConsoleState.clearRequested = false" in source),
         check("web console terminal pane captures keyboard focus", 'tabindex="0"' in source and "handleAvaConsoleTerminalKey" in source),
         check("web console maps terminal control keys", "'\\u001b[A'" in source and "'\\u007f'" in source and "'\\u0003'" in source),
         check("web console buffers typed keys before sending", "queueAvaConsoleInput" in source and "inputFlushTimer" in source),
         check("web console allows terminal typing rate", '@limiter.limit("1200 per minute")' in source),
+        check("web console allows low-latency output polling rate", '@limiter.limit("900 per minute")' in source),
         check("web console renders remote backspace echo", "backspaceCount" in source and "cleaned = cleaned.slice(0, -1)" in source),
+        check("web console uses remote terminal echo as source of truth", "Printable keys are shell-owned" in source and "suppressLocalConsoleEcho" not in source),
+        check("web console sends backspace to shell for real deletion", "Backspace is shell-owned" in source and "input === '\\u007f'" in source),
+        check("web console sends tab to shell for completion", "Tab completion is shell-owned" in source and "input === '\\t'" in source),
+        check("web console flushes terminal control keys immediately", "shouldFlushAvaConsoleInputImmediately" in source and "input === '\\u007f'" in source),
+        check("web console uses low-latency polling", "pollDelayMs: 200" in source and "resetAvaConsolePollTimer(200)" in source),
+        check("web console polls right after input", "setTimeout(pollAvaConsole, 20)" in source),
+        check("web console prevents overlapping output polls", "pollInFlight" in source and "pollAgain" in source),
+        check("web console ignores stale output poll echoes", "requestedOffset === avaConsoleState.offset" in source and "nextOffset > avaConsoleState.offset" in source),
+        check("web console uses short input flush", "setTimeout(flushAvaConsoleInput, 10)" in source),
+        check("web console suppresses browser repeat printable keys", "shouldSuppressDuplicateAvaConsoleKey" in source and "event.repeat" in source),
+        check("web console suppresses accidental duplicate printable keys", "lastKeySignature" in source and "lastKeyAt" in source and "duplicateWindowMs" in source),
+        check("web console suppresses duplicate control keys", "event.ctrlKey ? 'C'" in source and "350" in source),
+        check("web console stops handled key events from leaking", "event.stopPropagation()" in source and "shouldSuppressDuplicateAvaConsoleKey(event, input)" in source),
+        check("web console avoids fake local printable echo", "appendConsoleLocalText(input)" not in source and "localEchoPending" not in source),
+        check("web console uses xterm-lite screen buffer", "terminalRenderer: 'ava_xterm_lite'" in source and "terminalLines" in source),
+        check("web console renders terminal cursor", 'data-cursor="on"' in source and "avaConsoleCursorBlink" in source),
+        check("web console handles carriage-return screen updates", "terminalCursorCol = 0" in source and "ch === '\\r'" in source),
+        check("web console handles erase-line terminal sequences", "isConsoleEraseLineSequence" in source and "eraseAvaTerminalLineFromCursor" in source),
+        check("web console reports xterm-lite renderer", '"renderer": "ava_xterm_lite"' in source),
         check("web console exposes readiness endpoint", "@app.route('/console/status'" in source),
         check("web console has manual readiness check", "checkAvaConsoleReadiness" in source and "formatConsoleReadiness" in source),
         check("web console reports runner offline actionably", "The Windows host runner is offline" in source),
         check("web console times out stale queued sessions", "Console session timed out before the host runner connected" in source),
         check("web console tells user to reconnect closed sessions", "Click Reconnect to start a fresh session" in source),
-        check("web console throttles rate-limit noise", "lastBusyNoticeAt" in source and "8000" in source),
+        check("web console rate-limit backoff stays quiet", "Catching up" in source and "Console is slowing polling" not in source),
     ]
 
 
@@ -1104,8 +1126,32 @@ def main() -> int:
     )
 
     writer.status(job.job_id, "provisioning")
+    progress = writer.progress(
+        job_id=job.job_id,
+        session_id=job.session_id,
+        status="bootstrapping",
+        stage="web_bootstrap",
+        instance_id="ava-web-01",
+        instance_name="ava-web-01",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+        http_port=8080,
+        runner_key_path=".ava-runner/keys/job-0001_ava_runner_ed25519",
+        message="Installing nginx.",
+    )
+    loaded_progress = queue.get_progress(job.job_id)
+    failures.extend(
+        [
+            check("writer records in-progress VM state", loaded_progress is not None),
+            check("progress key survives short Redis status expiry", fake.expirations.get(f"{PROGRESS_KEY_PREFIX}{job.job_id}") >= 86400),
+            check("progress preserves session id", loaded_progress is not None and loaded_progress.session_id == job.session_id),
+            check("progress exposes ssh details", loaded_progress is not None and loaded_progress.ssh_host == "127.0.0.1" and loaded_progress.ssh_port == 2222),
+            check("progress hides no secret material", "DoNotLogThis123!" not in str(progress.to_dict())),
+        ]
+    )
     result = writer.completed(
         job_id=job.job_id,
+        session_id=job.session_id,
         instance_id="ava-web-01",
         instance_name="ava-web-01",
         ssh_host="127.0.0.1",
@@ -1125,6 +1171,7 @@ def main() -> int:
 
     failed = writer.failed(
         job_id="failed-job",
+        session_id="failed-session",
         instance_id=None,
         instance_name=None,
         error={"message": "bad password DoNotLogThis123!", "temporary_password": "DoNotLogThis123!"},

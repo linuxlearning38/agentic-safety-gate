@@ -19,8 +19,16 @@ WEB_SERVER_ROLE = RoleDefinition(
     bootstrap_steps=(
         BootstrapCommand(
             name="preflight",
-            command="whoami && sudo -n true && systemctl is-active ssh >/dev/null 2>&1",
-            timeout_seconds=30,
+            command=(
+                "for i in $(seq 1 24); do "
+                "whoami >/dev/null 2>&1 && "
+                "sudo -n true >/dev/null 2>&1 && "
+                "systemctl is-active ssh >/dev/null 2>&1 && exit 0; "
+                "sleep 5; "
+                "done; "
+                "whoami; sudo -n true; systemctl is-active ssh"
+            ),
+            timeout_seconds=150,
             failure_class="ssh_auth_failed",
         ),
         BootstrapCommand(

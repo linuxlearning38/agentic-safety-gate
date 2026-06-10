@@ -29,7 +29,7 @@ from control.tool_registry import registry as tool_registry
 
 logger = logging.getLogger(__name__)
 
-LLM_MODEL   = "qwen2.5:14b"
+LLM_MODEL   = os.getenv("AVA_LLM_MODEL", "qwen2.5:14b")
 MAX_ITERS   = 5
 LLM_TIMEOUT = 120  # seconds
 
