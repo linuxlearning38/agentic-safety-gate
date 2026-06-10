@@ -1,0 +1,85 @@
+[PASS] job is enqueued
+[PASS] queue key has ttl
+[PASS] job status is queued
+[PASS] job contains short-lived seed secret
+[PASS] redacted job view hides seed secret
+[PASS] runner can claim job
+[PASS] claim updates status
+[PASS] claimed job preserves desired hostname
+[PASS] runner heartbeat is written
+[PASS] runner heartbeat has ttl
+[PASS] runner health reads heartbeat
+[PASS] writer marks completed
+[PASS] result includes ssh host
+[PASS] result includes ssh port
+[PASS] result excludes temporary password
+[PASS] failed result redacts password field
+[PASS] failed result redacts message secret
+
+--- cleanup ordering (Phase 9 fix: closemedium before unlink) ---
+[PASS] storageattach --medium none was issued
+[PASS] storageattach uses forceunmount
+[PASS] closemedium dvd was issued
+[PASS] storageattach precedes closemedium in call order
+[PASS] seed ISO still existed when closemedium was called
+[PASS] seed ISO deleted after cleanup
+[PASS] failed path close triggers dvd list fallback
+[PASS] uuid closemedium fallback is issued
+[PASS] cloud-init hostname is quoted
+[PASS] cloud-init username is quoted
+[PASS] cloud-init password is quoted
+[PASS] cloud-init forces password change
+[PASS] cloud-init public key is quoted
+
+--- runner verification key auth (Phase 9 fix: ava-runner user, no PAM expiry) ---
+[PASS] ava-runner user is present in user-data
+[PASS] runner public key is seeded for ava-runner (not avaadmin)
+[PASS] avaadmin does not hold the runner public key
+[PASS] ava-runner has sudo in user-data
+[PASS] ava-runner is not in chpasswd expire list
+[PASS] avaadmin password expiry is still enforced
+
+--- seed.iso cleanup retry (Phase 9 fix: WinError 32 race with VBoxSVC) ---
+[PASS] no exception raised after retries succeeded
+[PASS] unlink retried until success (3 fails + 1 success)
+[PASS] seed ISO deleted after retries
+[PASS] RuntimeError raised after all retries exhausted
+[PASS] unlink attempted exactly 20 times
+
+--- cleanup race must not destroy verified VM (Phase 9 critical fix) ---
+[PASS] VM not destroyed by Phase 7 rollback
+[PASS] job status is completed (not failed)
+[PASS] result includes ssh_host
+[PASS] cleanup_warning recorded in verification_evidence
+[PASS] warning was logged about manual cleanup
+
+--- server-management operation queue (v2.1 snapshot execution) ---
+[PASS] day-2 operation is enqueued
+[PASS] day-2 claim marks picked_up before execution
+[PASS] snapshot uses VBoxManage snapshot take
+[PASS] running VM snapshot uses live flag
+[PASS] day-2 operation status is completed
+[PASS] day-2 result is stored
+[PASS] day-2 result includes snapshot evidence
+[PASS] live verify operation status is completed
+[PASS] live verify result is stored
+[PASS] live verify checks VM existence
+[PASS] live verify checks SSH TCP reachability
+[PASS] live verify checks host HTTP 200
+[PASS] nginx logs operation status is completed
+[PASS] nginx logs result is stored
+[PASS] nginx logs include service journal
+[PASS] nginx logs include access tail
+[PASS] nginx logs include error tail
+[PASS] private key ACL command uses PowerShell
+[PASS] private key ACL command disables inherited access
+[PASS] private key ACL command removes broad existing rules
+[PASS] private key ACL command grants only current runner identity
+[PASS] private key ACL command protects paths with spaces
+[PASS] retained key lookup finds private key
+[PASS] retained key lookup locks down private key before use
+[PASS] missing-key nginx logs status is failed
+[PASS] missing-key nginx logs result is stored
+[PASS] missing-key nginx logs explains runner key
+
+Phase 9 runner bridge regression passed.

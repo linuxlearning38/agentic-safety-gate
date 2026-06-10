@@ -144,6 +144,45 @@ function Ensure-AvaDataVolume {
     Invoke-Native docker "volume" "create" $volumeName
 }
 
+function Get-RunnerHeartbeat {
+    try {
+        $heartbeat = & docker exec agent_redis redis-cli GET ava:provisioning:runner:heartbeat 2>$null
+        if ($LASTEXITCODE -eq 0 -and $heartbeat) {
+            return ($heartbeat | Select-Object -Last 1)
+        }
+    } catch {
+        return $null
+    }
+    return $null
+}
+
+function Clear-RunnerHeartbeat {
+    try {
+        $null = & docker exec agent_redis redis-cli DEL ava:provisioning:runner:heartbeat 2>$null
+    } catch {
+        # Best-effort only. The subsequent wait still catches a missing runner.
+    }
+}
+
+function Get-HostRunnerProcesses {
+    @(Get-CimInstance Win32_Process |
+        Where-Object {
+            $_.Name -match '^python(\.exe|3\.exe)?$' -and
+            $_.CommandLine -match 'provisioning\.runner\.host_runner|host_runner\.py'
+        })
+}
+
+function Wait-RunnerHeartbeat {
+    param([int]$TimeoutSeconds = 15)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $heartbeat = Get-RunnerHeartbeat
+        if ($heartbeat) { return $heartbeat }
+        Start-Sleep -Seconds 1
+    }
+    return $null
+}
+
 # ── Step 1: Docker health ─────────────────────────────────────────────────────
 
 Write-Host "[1/5] Checking Docker..."
@@ -212,9 +251,54 @@ $runnerScript = Join-Path $PSScriptRoot "start_host_runner.ps1"
 if (-not $healthy) {
     Write-Warning "Skipping host runner start because AVA is not healthy yet."
 } elseif (Test-Path $runnerScript) {
-    $runnerArg = '-NoProfile -ExecutionPolicy Bypass -File "' + $runnerScript + '" -MaxJobs 0'
-    Start-Process powershell.exe -ArgumentList $runnerArg -WindowStyle Minimized
-    Write-Host "  Host runner started (minimised window)"
+    $runnerLogDir = Join-Path $repoRoot ".ava-runner"
+    New-Item -ItemType Directory -Path $runnerLogDir -Force | Out-Null
+    $runnerStdout = Join-Path $runnerLogDir "host_runner.startup.out.log"
+    $runnerStderr = Join-Path $runnerLogDir "host_runner.startup.err.log"
+
+    Clear-RunnerHeartbeat
+    $existingRunner = @(Get-HostRunnerProcesses)
+    if ($existingRunner.Count -gt 0) {
+        $heartbeat = Wait-RunnerHeartbeat -TimeoutSeconds 10
+        if ($heartbeat) {
+            Write-Host "  Host runner already healthy: $heartbeat"
+        } else {
+            Write-Warning "Existing host runner process did not refresh heartbeat; starting a fresh runner."
+            $existingRunner = @()
+        }
+    }
+
+    if ($existingRunner.Count -eq 0) {
+        $runnerShell = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+        if (-not $runnerShell) {
+            $runnerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
+        }
+        Remove-Item $runnerStdout, $runnerStderr -Force -ErrorAction SilentlyContinue
+        $runnerCommand = "& '" + ($runnerScript.Replace("'", "''")) + "' -MaxJobs 0"
+        $runnerEncodedCommand = [Convert]::ToBase64String(
+            [System.Text.Encoding]::Unicode.GetBytes($runnerCommand)
+        )
+        $runnerArgs = @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-EncodedCommand", $runnerEncodedCommand
+        )
+        Start-Process `
+            -FilePath $runnerShell `
+            -ArgumentList $runnerArgs `
+            -WorkingDirectory $repoRoot `
+            -WindowStyle Minimized `
+            -RedirectStandardOutput $runnerStdout `
+            -RedirectStandardError $runnerStderr
+
+        $heartbeat = Wait-RunnerHeartbeat -TimeoutSeconds 15
+        if ($heartbeat) {
+            Write-Host "  Host runner healthy: $heartbeat"
+        } else {
+            Write-Warning ("Host runner did not publish a heartbeat within 15s. " +
+                           "Check $runnerStdout and $runnerStderr")
+        }
+    }
 } else {
     Write-Warning "start_host_runner.ps1 not found -- start it manually."
 }

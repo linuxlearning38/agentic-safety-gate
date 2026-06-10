@@ -450,6 +450,8 @@ class HostRunner:
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 "-o",
+                "LogLevel=ERROR",
+                "-o",
                 "UserKnownHostsFile=" + _ssh_config_path_value(self._console_known_hosts_path(request)),
                 "-p",
                 str(request.ssh_port),
@@ -807,10 +809,32 @@ class HostRunner:
 
     def execute_job(self, job: ProvisioningJob) -> None:
         instance_id: str | None = None
+        connection = None
+        retained_key_path: Path | None = None
+        progress_instance_name: str | None = None
         work_dir = self.config.work_root / job.job_id
         secret_patterns = (str(job.credentials_seed_data.get("temporary_password") or ""),)
         self.logger.info("Picked up job %s for session %s", job.job_id, job.session_id)
         heartbeat = lambda: self._write_processing_heartbeat(job)
+
+        def write_progress(status: str, stage: str, message: str) -> None:
+            http_port = None
+            if connection is not None:
+                http_port = connection.metadata.get("http_host_port")
+            self.writer.progress(
+                job_id=job.job_id,
+                session_id=job.session_id,
+                status=status,
+                stage=stage,
+                instance_id=instance_id,
+                instance_name=progress_instance_name or (job.desired_state or {}).get("vm_name"),
+                ssh_host=connection.host if connection is not None else None,
+                ssh_port=connection.port if connection is not None else None,
+                http_port=int(http_port) if http_port else None,
+                runner_key_path=str(retained_key_path) if retained_key_path else None,
+                message=message,
+            )
+
         try:
             self._validate_binaries()
             work_dir.mkdir(parents=True, exist_ok=True)
@@ -825,8 +849,9 @@ class HostRunner:
             if not vm_name:
                 vm_name = f"ava-web-{job.job_id[:8]}"
                 desired_state["vm_name"] = vm_name
+            progress_instance_name = vm_name
 
-            self.writer.status(job.job_id, "provisioning")
+            write_progress("provisioning", "preparing", "Preparing SSH key, cloud-init seed, and VirtualBox plan.")
             key_path = work_dir / "ava_runner_ed25519"
             known_hosts_path = work_dir / "known_hosts"
             seed_dir = work_dir / "seed"
@@ -859,6 +884,7 @@ class HostRunner:
 
             plan = self.adapter.plan_instance(desired_state)
             instance_id = self.adapter.create_instance(plan)
+            write_progress("provisioning", "vm_created", "VirtualBox VM has been created; access seed is being attached.")
             access_result = self.adapter.inject_access(
                 instance_id,
                 {
@@ -872,8 +898,10 @@ class HostRunner:
 
             connection = self.adapter.get_connection_info(instance_id)
             self.adapter.start_instance(instance_id)
+            write_progress("provisioning", "vm_started", "VM has started; waiting for SSH TCP readiness.")
             if not _wait_for_tcp(connection.host, connection.port, self.config.timeout_seconds, heartbeat=heartbeat):
                 raise RuntimeError(f"SSH TCP did not become reachable at {connection.host}:{connection.port}")
+            write_progress("provisioning", "ssh_ready", "SSH TCP is reachable; waiting for cloud-init completion.")
 
             # ava-runner holds the key; avaadmin has chage -d 0 (expired by design)
             # which blocks PAM account validation for all SSH sessions, key auth included.
@@ -904,13 +932,14 @@ class HostRunner:
                 else:
                     detail = "cloud-init first-access marker was not confirmed (no SSH command result)"
                 raise RuntimeError(detail)
+            write_progress("provisioning", "cloud_init_ready", "Cloud-init first-access marker confirmed.")
 
             self._detach_seed_iso(instance_id, seed_iso)
             # seed.iso is detached from the VM; cleanup is deferred to after
             # verification so that a VBoxSVC file-lock race does not destroy
             # a fully working VM.
 
-            self.writer.status(job.job_id, "bootstrapping")
+            write_progress("bootstrapping", "web_bootstrap", "Installing and enabling the web-server role.")
             role = WebServerRole()
             results = role.bootstrap(executor)
             for result in results:
@@ -918,9 +947,9 @@ class HostRunner:
                     raise RuntimeError(result.stderr or f"bootstrap command failed: {result.command}")
 
             if desired_state.get("hardening_profile") != "none":
-                self.writer.status(job.job_id, "hardening")
+                write_progress("hardening", "baseline_hardening", "Baseline Linux and web role hardening is being applied.")
 
-            self.writer.status(job.job_id, "verifying")
+            write_progress("verifying", "http_verification", "Verifying host HTTP and guest web-server health.")
             http_port = connection.metadata.get("http_host_port")
             if not http_port:
                 raise RuntimeError("HTTP host port was not configured")
@@ -960,6 +989,7 @@ class HostRunner:
 
             self.writer.completed(
                 job_id=job.job_id,
+                session_id=job.session_id,
                 instance_id=instance_id,
                 instance_name=vm_name,
                 ssh_host=connection.host,
@@ -981,6 +1011,7 @@ class HostRunner:
             )
             self.writer.failed(
                 job_id=job.job_id,
+                session_id=job.session_id,
                 instance_id=instance_id,
                 instance_name=(job.desired_state or {}).get("vm_name"),
                 error=rollback_report.to_dict(),

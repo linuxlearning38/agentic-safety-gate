@@ -4,13 +4,14 @@
     Registers Windows startup hooks for AVA startup and seed cleanup.
 
 .DESCRIPTION
-    Run this script ONCE as the user who will operate AVA. It avoids admin-only
-    scheduler behavior by installing the host runner through the current user's
-    Startup folder.
+    Run this script ONCE as the user who will operate AVA. It installs two
+    non-admin startup hooks so AVA has a reliable user-logon recovery path:
+    a current-user scheduled task and a Startup-folder fallback.
 
-      "AVA Host Runner.cmd"      starts start-ava.ps1 at user login.
+      "AVA Startup"              starts start-ava.ps1 at user logon.
                                  start-ava.ps1 waits for Docker, starts AVA,
                                  then starts the host runner.
+      "AVA Host Runner.cmd"      Startup-folder fallback for the same flow.
       "AVA Cleanup Stale Seeds"  runs cleanup-stale-seeds.ps1 daily at 03:00
                                  when Windows permits task registration.
 
@@ -77,6 +78,22 @@ start "AVA Startup" /min "$startAvaWrapper"
 "@ | Set-Content -Path $startupRunner -Encoding ASCII
 
 Write-Host "Registered: 'AVA Host Runner' (starts AVA + runner at user login via Startup folder)"
+
+try {
+    Register-AvaTask `
+        -TaskName "AVA Startup" `
+        -Arguments @(
+            "/Create",
+            "/TN", "AVA Startup",
+            "/SC", "ONLOGON",
+            "/TR", $startAvaWrapper,
+            "/F"
+        )
+    Write-Host "Registered: 'AVA Startup' (starts AVA + runner at user logon via Task Scheduler)"
+} catch {
+    Write-Warning "Could not register AVA Startup scheduled task. Startup-folder fallback is still installed."
+    Write-Warning $_
+}
 
 # ── AVA Cleanup Stale Seeds task ─────────────────────────────────────────────
 
