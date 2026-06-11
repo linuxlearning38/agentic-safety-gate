@@ -32,9 +32,11 @@ from provisioning.runner.host_runner import (  # noqa: E402
     HostRunnerConfig,
     _ISO_UNLINK_ATTEMPTS,
     _ssh_config_path_value,
+    _wait_for_executor_command,
     _windows_private_key_acl_command,
     _write_cloud_init_seed,
 )
+from provisioning.bootstrap.ssh_executor import SSHCommandResult  # noqa: E402
 from provisioning.runner.result_writer import ProvisioningResultWriter as _ResultWriter  # noqa: E402
 
 
@@ -215,6 +217,47 @@ def test_runner_verification_uses_key_auth() -> list[bool]:
         check("ava-runner is not in chpasswd expire list",
               "ava-runner" not in user_data[user_data.find("chpasswd"):]),
         check("avaadmin password expiry is still enforced", "expire: true" in user_data),
+    ]
+
+
+def test_cloud_init_marker_stdout_wins_over_ssh_close_timeout() -> list[bool]:
+    """The runner must not destroy a VM after the ready marker was printed.
+
+    Windows OpenSSH can occasionally leave the command process open long enough
+    for subprocess.run to report a timeout, even though stdout already contains
+    the cloud-init marker.  In that case the VM is ready enough to continue.
+    """
+
+    marker = "AVA_CLOUD_INIT_READY ava-web-timeout"
+    calls = [0]
+
+    class MarkerThenTimeoutExecutor:
+        def run(self, command, *, timeout_seconds=30, redact_patterns=()):
+            calls[0] += 1
+            return SSHCommandResult(
+                command=command,
+                exit_code=124,
+                stdout=f"{marker}\n",
+                stderr="",
+                duration_seconds=30.0,
+                started_at="2026-06-11T08:29:00+00:00",
+                finished_at="2026-06-11T08:29:30+00:00",
+                timed_out=True,
+                failure_class="command_timeout",
+            )
+
+    result = _wait_for_executor_command(
+        MarkerThenTimeoutExecutor(),
+        "cloud-init status --wait; cat /var/tmp/ava-cloud-init-ready",
+        timeout_seconds=120,
+        redact=(),
+        success_stdout_contains=marker,
+    )
+
+    return [
+        check("cloud-init marker result is returned", result is not None),
+        check("cloud-init marker stdout is preserved", result is not None and marker in result.stdout),
+        check("cloud-init marker stops retry loop immediately", calls[0] == 1),
     ]
 
 
@@ -1190,6 +1233,7 @@ def main() -> int:
 
     print("\n--- runner verification key auth (Phase 9 fix: ava-runner user, no PAM expiry) ---")
     failures.extend(test_runner_verification_uses_key_auth())
+    failures.extend(test_cloud_init_marker_stdout_wins_over_ssh_close_timeout())
 
     print("\n--- seed.iso cleanup retry (Phase 9 fix: WinError 32 race with VBoxSVC) ---")
     failures.extend(test_seed_iso_cleanup_retries_on_permission_error())

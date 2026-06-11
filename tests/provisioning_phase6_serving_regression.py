@@ -330,13 +330,14 @@ def main() -> int:
         failures.extend(
             [
                 check("offline runner approval is handled", offline_approval.handled),
-                check("offline runner blocks VM queue", "runner is not reporting healthy" in offline_approval.response.lower()),
+                check("offline runner approval records consent", "approval recorded" in offline_approval.response.lower()),
+                check("offline runner approval asks to continue later", "continue provisioning" in offline_approval.response.lower()),
                 check(
-                    "offline runner does not print credential block",
+                    "offline runner approval does not print credential block",
                     "username:" not in offline_approval.response.lower()
                     and "temporary password:" not in offline_approval.response.lower(),
                 ),
-                check("offline runner leaves approval pending", approval.get_by_id(offline_approval_id).get("status") == "pending"),
+                check("offline runner marks approval approved", approval.get_by_id(offline_approval_id).get("status") == "approved"),
                 check("offline runner leaves session awaiting approval", offline_session.phase == SessionPhase.AWAITING_APPROVAL, offline_session.phase.value),
                 check("offline runner queue stays empty", len(offline_queue.jobs) == 0),
             ]
@@ -368,12 +369,25 @@ def main() -> int:
             [
                 check("chat approval with separator is handled", approved.handled),
                 check("chat approval updates queue", approval.get_by_id(approval_id).get("status") == "approved"),
-                check("chat approval issues one-time credential", "temporary password" in approved.response.lower()),
-                check("chat approval queues runner job", "runner job queued" in approved.response.lower()),
-                check("chat approval clarifies runner boundary", "host-side" in approved.response.lower()),
-                check("chat approval explains putty endpoint later", "putty ssh host/ip" in approved.response.lower()),
+                check("chat approval records consent only", "approval recorded" in approved.response.lower()),
+                check("chat approval asks for explicit continuation", "continue provisioning" in approved.response.lower()),
+                check("chat approval does not issue credential yet", "temporary password:" not in approved.response.lower()),
+                check("chat approval does not queue runner yet", len(job_queue.jobs) == 0),
+                check("approved phase remains awaiting approval until continuation", approved_session.phase == SessionPhase.AWAITING_APPROVAL, approved_session.phase.value),
+            ]
+        )
+
+        continued = service.handle("user-1", "continue provisioning", route_intent=None)
+        continued_session = service.sessions.list_active("user-1")[0]
+        failures.extend(
+            [
+                check("approved continuation is handled", continued.handled),
+                check("approved continuation issues one-time credential", "temporary password" in continued.response.lower()),
+                check("approved continuation queues runner job", "runner job queued" in continued.response.lower()),
+                check("approved continuation clarifies runner boundary", "host-side" in continued.response.lower()),
+                check("approved continuation explains putty endpoint later", "putty ssh host/ip" in continued.response.lower()),
                 check("runner job contains temporary seed secret", bool(job_queue.jobs["job-0001"].credentials_seed_data.get("temporary_password"))),
-                check("approved phase awaits first login", approved_session.phase == SessionPhase.AWAITING_FIRST_LOGIN, approved_session.phase.value),
+                check("continued phase awaits first login", continued_session.phase == SessionPhase.AWAITING_FIRST_LOGIN, continued_session.phase.value),
             ]
         )
 
@@ -570,6 +584,7 @@ def main() -> int:
         late_specs = service.handle("user-late", "2 CPU, 4 GB RAM, 30 GB disk, hostname ava-web-late", route_intent=None)
         late_approval_id = late_specs.metadata["provisioning"]["approval_id"]
         late_approved = service.handle("user-late", f"approve {late_approval_id}", route_intent=None)
+        late_continued = service.handle("user-late", "continue provisioning", route_intent=None)
         job_queue.write_status("job-0002", "completed")
         job_queue.write_result(
             ProvisioningJobResult(
@@ -590,6 +605,7 @@ def main() -> int:
             [
                 check("late completed start is handled", late_start.handled),
                 check("late completed approval is handled", late_approved.handled),
+                check("late completed continuation is handled", late_continued.handled),
                 check("late login does not ask for hardening again", "reply `yes harden it`" not in late_login.response.lower()),
                 check("late login reports runner already completed", "already completed" in late_login.response.lower()),
                 check("late hardening does not claim next execution step", "next execution step" not in late_hardening.response.lower()),
@@ -629,6 +645,7 @@ def main() -> int:
         missing_live_specs = missing_live_service.handle("user-missing-live", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
         missing_live_approval_id = missing_live_specs.metadata["provisioning"]["approval_id"]
         missing_live_service.handle("user-missing-live", f"approve {missing_live_approval_id}", route_intent=None)
+        missing_live_service.handle("user-missing-live", "continue provisioning", route_intent=None)
         missing_live_queue.write_status("job-0001", "completed")
         missing_live_queue.write_result(
             ProvisioningJobResult(
@@ -668,6 +685,7 @@ def main() -> int:
         offline_existing_approval_id = offline_existing_specs.metadata["provisioning"]["approval_id"]
         offline_existing_queue.runner_healthy = True
         offline_existing_service.handle("user-offline-existing", f"approve {offline_existing_approval_id}", route_intent=None)
+        offline_existing_service.handle("user-offline-existing", "continue provisioning", route_intent=None)
         offline_existing_queue.write_status("job-0001", "completed")
         offline_existing_queue.write_result(
             ProvisioningJobResult(
@@ -698,6 +716,7 @@ def main() -> int:
         pending_live_specs = pending_live_service.handle("user-pending-live", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
         pending_live_approval_id = pending_live_specs.metadata["provisioning"]["approval_id"]
         pending_live_service.handle("user-pending-live", f"approve {pending_live_approval_id}", route_intent=None)
+        pending_live_service.handle("user-pending-live", "continue provisioning", route_intent=None)
         pending_live_queue.write_status("job-0001", "completed")
         pending_live_queue.write_result(
             ProvisioningJobResult(
@@ -726,6 +745,7 @@ def main() -> int:
         failed_specs = failed_service.handle("user-failed", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
         failed_approval_id = failed_specs.metadata["provisioning"]["approval_id"]
         failed_service.handle("user-failed", f"approve {failed_approval_id}", route_intent=None)
+        failed_service.handle("user-failed", "continue provisioning", route_intent=None)
         failed_session = failed_service.sessions.list_active("user-failed")[0]
         failed_job_id = failed_session.collected_answers["runner_job_id"]
         job_queue.write_status(failed_job_id, "failed")
@@ -766,6 +786,7 @@ def main() -> int:
         stale_specs = stale_service.handle("user-stale", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
         stale_approval_id = stale_specs.metadata["provisioning"]["approval_id"]
         stale_service.handle("user-stale", f"approve {stale_approval_id}", route_intent=None)
+        stale_service.handle("user-stale", "continue provisioning", route_intent=None)
         stale_session = stale_service.sessions.list_active("user-stale")[0]
         stale_job_id = stale_session.collected_answers["runner_job_id"]
         stale_queue.statuses.pop(stale_job_id, None)
@@ -794,6 +815,7 @@ def main() -> int:
         stale_attached_specs = stale_attached_service.handle("user-stale-attached", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
         stale_attached_approval_id = stale_attached_specs.metadata["provisioning"]["approval_id"]
         stale_attached_service.handle("user-stale-attached", f"approve {stale_attached_approval_id}", route_intent=None)
+        stale_attached_service.handle("user-stale-attached", "continue provisioning", route_intent=None)
         stale_attached_session = stale_attached_service.sessions.list_active("user-stale-attached")[0]
         stale_attached_job_id = stale_attached_session.collected_answers["runner_job_id"]
         stale_attached_queue.statuses.pop(stale_attached_job_id, None)
@@ -827,6 +849,7 @@ def main() -> int:
         orphaned_specs = orphaned_service.handle("user-orphaned", "2 CPU, 4 GB RAM, 30 GB disk", route_intent=None)
         orphaned_approval_id = orphaned_specs.metadata["provisioning"]["approval_id"]
         orphaned_service.handle("user-orphaned", f"approve {orphaned_approval_id}", route_intent=None)
+        orphaned_service.handle("user-orphaned", "continue provisioning", route_intent=None)
         orphaned_session = orphaned_service.sessions.list_active("user-orphaned")[0]
         orphaned_job_id = orphaned_session.collected_answers["runner_job_id"]
         orphaned_queue.write_status(orphaned_job_id, "bootstrapping")

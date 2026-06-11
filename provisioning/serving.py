@@ -176,18 +176,16 @@ class ProvisioningChatService:
                         active,
                     )
                 queue_entry = approval.get_by_id(approval_id)
+                if queue_entry and queue_entry.get("status") == "approved":
+                    return self._result(_format_approval_recorded_response(active), active, approval_id=approval_id)
                 if not queue_entry or queue_entry.get("status") != "pending":
                     status = queue_entry.get("status") if queue_entry else "not_found"
                     return self._result(
                         f"Approval `{approval_id}` is not pending; current status is `{status}`.",
                         active,
                     )
-                if not _runner_is_healthy(self.job_queue):
-                    return self._result(_format_runner_unavailable_response(), active)
                 approval.update_status(approval_id, "approved")
-                response = self.flow.continue_after_approval(active.session_id)
-                message = self._format_approval_and_enqueue(response)
-                return self._result(message, response.session, approval_id=response.approval_id)
+                return self._result(_format_approval_recorded_response(active), active, approval_id=approval_id)
             if not _is_approval_continuation(normalized):
                 return ProvisioningServingResult(handled=False)
             if not _runner_is_healthy(self.job_queue):
@@ -351,9 +349,13 @@ class ProvisioningChatService:
             response.session = session
             return (
                 message
-                + "\n\nRunner job queued for host-side VirtualBox execution.\n"
+                + "\n\nVM provisioning is now in process.\n"
+                + "AVA has queued the Windows host runner and will track each stage in `provisioning status`.\n\n"
+                + "Runner job queued for host-side VirtualBox execution.\n"
                 + f"Job ID: `{job.job_id}`\n"
-                + "AVA will report the PuTTY SSH host/IP and port after the host runner creates the VM."
+                + "Expected time: usually 3-8 minutes, depending on VirtualBox boot and Ubuntu cloud-init.\n"
+                + "AVA will report the hostname, SSH/PuTTY port, and web URL after bootstrap, hardening, "
+                + "and HTTP verification complete. After that, type `open web console` to connect."
             )
         except Exception as exc:
             session = self.sessions.record_answers(
@@ -767,6 +769,36 @@ def _runner_progress_lines(runner: dict[str, Any] | None) -> list[str]:
     ]
 
 
+def _runner_progress_guidance_lines(runner: dict[str, Any] | None) -> list[str]:
+    runner = runner or {}
+    progress = runner.get("progress")
+    status = runner.get("status") or "queued"
+    stage = getattr(progress, "stage", None) or status
+    stage_key = str(stage or "queued").lower()
+    guidance = {
+        "queued": ("Waiting for the Windows host runner to pick up the job.", "usually under 1 minute after the runner is healthy"),
+        "picked_up": ("Runner picked up the request and is preparing VirtualBox.", "usually 3-8 minutes total"),
+        "provisioning": ("Creating and booting the VM.", "usually 3-8 minutes total"),
+        "vm_started": ("VM has started; waiting for SSH to become reachable.", "usually 1-3 minutes"),
+        "ssh_ready": ("SSH is reachable; waiting for cloud-init and first boot setup to finish.", "usually 2-6 minutes"),
+        "cloud_init": ("Cloud-init is finishing OS setup.", "usually 2-6 minutes"),
+        "bootstrapping": ("Installing and configuring the web-server role.", "usually 1-4 minutes"),
+        "hardening": ("Applying baseline Linux and web-server hardening.", "usually 1-3 minutes"),
+        "verifying": ("Verifying SSH, nginx, and HTTP access.", "usually under 1 minute"),
+    }
+    current_step, estimate = guidance.get(
+        stage_key,
+        ("Runner is still working on this provisioning job.", "usually 3-8 minutes total"),
+    )
+    return [
+        "Provisioning guidance:",
+        f"- Current step: `{current_step}`",
+        f"- Estimated remaining time: `{estimate}`",
+        "- Web Console: `available after Phase is completed and live verification has passed`",
+        "- Next check: ask `provisioning status` again; when complete, type `open web console`.",
+    ]
+
+
 def _runner_failed(runner: dict[str, Any] | None) -> bool:
     if not runner:
         return False
@@ -855,6 +887,7 @@ def _format_active_provisioning_guard(session, runner: dict[str, Any]) -> str:
         progress_block = "\n\n" + "\n".join(progress_lines)
         if progress_result and progress_result.ssh_host and progress_result.ssh_port:
             progress_block += f"\n- SSH / PuTTY: `{progress_result.ssh_host}:{progress_result.ssh_port}`"
+        progress_block += "\n\n" + "\n".join(_runner_progress_guidance_lines(runner))
     return (
         "A provisioning request is already active, so I will not start another one on top of it.\n\n"
         f"- Current session: `{session.session_id}`\n"
@@ -897,6 +930,20 @@ def _format_runner_unavailable_response() -> str:
         "reporting healthy.\n\n"
         "No VM was created and no temporary password was issued. Start AVA with "
         "`scripts/start-ava.ps1` or wait for the runner to come online, then approve again."
+    )
+
+
+def _format_approval_recorded_response(session) -> str:
+    return (
+        "Approval recorded.\n\n"
+        f"- Approval ID: `{session.approval_id}`\n"
+        "- Status: `approved`\n"
+        "- VM created: `no`\n\n"
+        "To start provisioning now, reply: `continue provisioning`.\n\n"
+        "After that, AVA will queue the Windows host runner and show the live provisioning step. "
+        "Provisioning usually takes 3-8 minutes. AVA will report the hostname, SSH/PuTTY port, "
+        "and web URL only after bootstrap, hardening, and HTTP verification are complete. "
+        "When it is complete, type `open web console` to access the server."
     )
 
 
@@ -1287,20 +1334,26 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
                 "",
                 *_runner_progress_lines(runner),
                 "",
+                *_runner_progress_guidance_lines(runner),
+                "",
                 *_connection_lines(session, progress_result, heading="Current runner progress connection details:"),
                 "",
                 "Completion boundary: the VM is visible to AVA, but final provisioning is still waiting "
-                "for bootstrap, hardening, and HTTP verification evidence.",
+                "for bootstrap, hardening, and HTTP verification evidence. Web Console access is intentionally "
+                "held back until this session reaches `completed`.",
             ]
         )
     elif runner.get("job_id"):
         lines.extend(
             [
                 "",
+                *_runner_progress_guidance_lines(runner),
+                "",
                 *_connection_lines(session, None),
                 "",
                 "Runner boundary: the approved job is queued or running. AVA will show PuTTY "
-                "connection details after the host runner writes the result.",
+                "connection details after the host runner writes the result. Web Console access becomes "
+                "available after the completed verification result is stored.",
             ]
         )
     else:
@@ -1551,7 +1604,9 @@ def _format_flow_response(response) -> str:
             f"Network: `{desired.get('network_mode', 'nat')}`\n"
             f"Hardening: `{desired.get('hardening_profile', 'baseline_linux')}`\n\n"
             f"Approval ID: `{response.approval_id}`\n"
-            "No VM is created until this approval is accepted. After approval, reply: `continue provisioning`."
+            f"To approve this plan, reply: `approve {response.approval_id}`.\n"
+            "No VM is created until this approval is accepted.\n"
+            "After approval is recorded, reply: `continue provisioning` to start VM provisioning."
         )
     if response.missing_fields:
         readable = ", ".join(f"`{field}`" for field in response.missing_fields)

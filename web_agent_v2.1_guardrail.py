@@ -3805,13 +3805,11 @@ def _resolve_active_console_target(user_id: str):
     service = _get_provisioning_chat_service()
     for session in service.sessions.list_recent(user_id, limit=10):
         runner = service._runner_snapshot(session)
+        if str(runner.get("status") or "").lower() != "completed":
+            continue
         result = runner.get("result")
         if result and result.instance_id and result.ssh_host and result.ssh_port and not result.error:
             return service, session, runner, result
-        progress_result = _console_result_from_progress(runner)
-        if progress_result and not progress_result.error:
-            runner["target_scope"] = "ava_managed_vm_progress"
-            return service, session, runner, progress_result
     return service, None, None, None
 
 
@@ -3877,11 +3875,9 @@ def console_status():
     user_id = str(get_jwt_identity() or "admin")
     payload = _console_target_payload(user_id)
     if not payload["target_available"]:
-        payload["message"] = "No AVA-managed VM with SSH details is available for Web Console yet."
+        payload["message"] = "No completed AVA-managed VM is ready for Web Console yet. Wait for provisioning to complete, then type open web console."
     elif not payload["runner_healthy"]:
         payload["message"] = "The Windows host runner is offline. Start AVA with scripts/start-ava.ps1, then retry Web Console."
-    elif payload.get("target", {}).get("scope") == "ava_managed_vm_progress":
-        payload["message"] = "AVA Web Console is ready from live runner progress; provisioning may still be finishing."
     else:
         payload["message"] = "AVA Web Console is ready for the latest AVA-managed VM."
     return jsonify(payload)
@@ -3898,7 +3894,7 @@ def console_open():
     if not session or not result:
         return jsonify({
             "error": "no_ava_managed_vm",
-            "message": "No AVA-managed VM with SSH details is attached to this account yet.",
+            "message": "No completed AVA-managed VM is ready for Web Console yet. Wait for provisioning to complete, then type open web console.",
             "runner_healthy": bool(heartbeat),
             "target_available": False,
         }), 404
@@ -9234,6 +9230,79 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             chatArea.appendChild(messageDiv); setTimeout(renderMermaidPlaceholders, 100); setTimeout(renderMermaidPlaceholders, 500);
             chatArea.scrollTop = chatArea.scrollHeight;
         }
+
+        let provisioningStatusPoll = null;
+        let provisioningStatusPollCount = 0;
+
+        function shouldStartProvisioningPoll(data) {
+            const response = safeString(data && data.response).toLowerCase();
+            return response.includes('vm provisioning is now in process')
+                || response.includes('runner job queued for host-side virtualbox execution');
+        }
+
+        function provisioningReachedTerminalState(response) {
+            const text = safeString(response).toLowerCase();
+            if (text.includes('- phase: `completed`') || text.includes('runner status: `completed`')) return 'completed';
+            if (text.includes('- phase: `failed`') || text.includes('runner status: `failed`')) return 'failed';
+            return '';
+        }
+
+        function startProvisioningStatusPoll() {
+            if (provisioningStatusPoll) clearTimeout(provisioningStatusPoll);
+            provisioningStatusPollCount = 0;
+            addAVAMessage({
+                type: 'knowledge',
+                response: 'Provisioning is running in the background. I will keep checking and post the final status here when the VM is ready or if it fails.',
+                time_taken: '',
+                sources_used: 0,
+            });
+            const poll = () => {
+                provisioningStatusPollCount += 1;
+                fetch('/ask', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({query: 'provisioning status'})
+                })
+                .then(r => r.json())
+                .then(data => {
+                    const normalized = normalizeChatData(data);
+                    const state = provisioningReachedTerminalState(normalized.response);
+                    if (state) {
+                        provisioningStatusPoll = null;
+                        addAVAMessage(normalized);
+                        if (state === 'completed') {
+                            addAVAMessage({
+                                type: 'knowledge',
+                                response: 'Provisioning is complete. You can now type `open web console` to access the server.',
+                                time_taken: '',
+                                sources_used: 0,
+                            });
+                        }
+                        loadRecentChats();
+                        return;
+                    }
+                    if (provisioningStatusPollCount >= 20) {
+                        provisioningStatusPoll = null;
+                        addAVAMessage({
+                            type: 'knowledge',
+                            response: 'Provisioning is still running. Ask `provisioning status` for the latest stage, or wait a little longer if VirtualBox/cloud-init is still finishing.',
+                            time_taken: '',
+                            sources_used: 0,
+                        });
+                        return;
+                    }
+                    provisioningStatusPoll = setTimeout(poll, 30000);
+                })
+                .catch(() => {
+                    if (provisioningStatusPollCount < 20) {
+                        provisioningStatusPoll = setTimeout(poll, 30000);
+                    } else {
+                        provisioningStatusPoll = null;
+                    }
+                });
+            };
+            provisioningStatusPoll = setTimeout(poll, 30000);
+        }
         
         function sendQuery() {
             const input = document.getElementById('queryInput');
@@ -9283,6 +9352,9 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             .then(r => r.json())
             .then(data => {
                 addAVAMessage(data);
+                if (shouldStartProvisioningPoll(data)) {
+                    startProvisioningStatusPoll();
+                }
                 loadRecentChats();
             })
             .catch(err => {
