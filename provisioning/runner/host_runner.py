@@ -163,6 +163,7 @@ def _wait_for_executor_command(
     *,
     redact: tuple[str, ...],
     heartbeat: Callable[[], None] | None = None,
+    success_stdout_contains: str | None = None,
 ):
     deadline = time.monotonic() + timeout_seconds
     last_result = None
@@ -170,6 +171,8 @@ def _wait_for_executor_command(
         if heartbeat:
             heartbeat()
         last_result = executor.run(command, timeout_seconds=30, redact_patterns=redact)
+        if success_stdout_contains and success_stdout_contains in (last_result.stdout or ""):
+            return last_result
         if last_result.exit_code == 0:
             return last_result
         time.sleep(8)
@@ -921,8 +924,9 @@ class HostRunner:
                 self.config.timeout_seconds,
                 redact=secret_patterns,
                 heartbeat=heartbeat,
+                success_stdout_contains=f"AVA_CLOUD_INIT_READY {vm_name}",
             )
-            if not cloud_init or cloud_init.exit_code != 0 or f"AVA_CLOUD_INIT_READY {vm_name}" not in cloud_init.stdout:
+            if not cloud_init or f"AVA_CLOUD_INIT_READY {vm_name}" not in cloud_init.stdout:
                 if cloud_init:
                     detail = (
                         f"cloud-init first-access marker was not confirmed "

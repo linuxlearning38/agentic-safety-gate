@@ -41,7 +41,7 @@ curl -k https://localhost:5443/health   # {"status":"ok",...}
 
 ---
 
-## Current Product Behavior (Validated 2026-05-06)
+## Current Product Behavior (Validated 2026-06-11)
 
 AVA now supports the full user-facing chat-to-VM loop for a VirtualBox Ubuntu
 web server:
@@ -49,16 +49,25 @@ web server:
 1. User asks for a web server.
 2. AVA asks for missing VM specs (`cpu`, `ram_gb`, `disk_gb`) and accepts an
    optional hostname.
-3. AVA prepares a plan and requires approval.
-4. Before accepting approval, AVA checks that the Windows host runner heartbeat
+3. AVA prepares a plan and tells the user exactly how to approve it:
+   `approve <approval_id>`.
+4. Approval records consent only. AVA does not create a VM, issue a temporary
+   password, or queue the runner job at this step.
+5. After approval is recorded, AVA instructs the user to reply
+   `continue provisioning` to start execution.
+6. On `continue provisioning`, AVA checks that the Windows host runner heartbeat
    is healthy. If not, AVA refuses to issue credentials or queue the VM.
-5. After approval, AVA issues the temporary password once, queues the runner
-   job, and the Windows runner creates the VM through `VBoxManage`.
-6. Runner bootstraps nginx, applies `baseline_linux`, verifies guest and host
-   HTTP 200, and writes result evidence to Redis.
-7. AVA status, evidence, PuTTY, and verification prompts read the runner result
-   and report the real VM name, SSH host/port, username, web URL, hardening
-   summary, and verification evidence.
+7. If the runner is healthy, AVA issues the temporary password once, queues the
+   runner job, and tells the user that VM provisioning is in process.
+8. Runner creates the VM through `VBoxManage`, waits for cloud-init, bootstraps
+   nginx, applies `baseline_linux`, verifies guest and host HTTP 200, and writes
+   result evidence to Redis.
+9. AVA status and evidence prompts show the current runner stage, expected time
+   guidance, and the connection details as soon as the runner exposes them.
+10. AVA Web Console is intentionally held until provisioning has completed and
+    live verification evidence is available.
+11. After completion, AVA tells the user that Web Console access is available
+    and the user can type `open web console`.
 
 Validated live result:
 
@@ -76,6 +85,8 @@ Validated live result:
 Validated chat prompts:
 
 - `show me the provisioning status`
+- `continue provisioning`
+- `open web console`
 - `how do I connect with PuTTY?`
 - `verify the web server`
 - `what did you do and what evidence do you have?`
@@ -99,7 +110,8 @@ User browser
      v
 AVA chat (/ask)             [Docker container ava-agent]
 provisioning/serving.py
-     |  enqueue job after approval
+     |  approve consent, then continue provisioning
+     |  enqueue job only after runner heartbeat is healthy
      v
 Redis queue                 [Docker container agent_redis]
 ava:provisioning:jobs:approved
@@ -118,23 +130,60 @@ AVA chat (/ask)             -- session shows real instance_id and evidence
 
 ## Runner Readiness Preflight
 
-AVA must not accept a provisioning approval if the Windows host-side runner is
-not alive. Otherwise the user sees a password and a queued job, but no VM is
-created.
+AVA may record approval as user consent even if the Windows host-side runner is
+not alive. It must not start provisioning, issue a password, or queue a VM job
+until the runner is healthy. Otherwise the user sees a password and a queued
+job, but no VM is created.
 
-Phase 9 now treats the runner as a required dependency before approval:
+Phase 9 now treats the runner as a required dependency before execution:
 
 1. `host_runner.py` writes a Redis heartbeat to
    `ava:provisioning:runner:heartbeat`.
 2. The heartbeat has a 90-second TTL, so stale runners expire automatically.
-3. `provisioning/serving.py` checks the heartbeat before accepting approval.
-4. If the heartbeat is missing or stale, AVA refuses to start provisioning,
-   leaves the approval pending, does not queue a VM job, and does not print a
-   temporary password.
-5. The user can start AVA with `.\scripts\start-ava.ps1`, wait for the runner
-   to report healthy, then approve the same request again.
+3. `provisioning/serving.py` records approval as consent and waits for the user
+   to say `continue provisioning`.
+4. On `continue provisioning`, AVA checks the heartbeat before creating any
+   credentials or queueing the runner job.
+5. If the heartbeat is missing or stale, AVA refuses to start provisioning,
+   keeps the approved plan available, does not queue a VM job, and does not
+   print a temporary password.
+6. The user can start AVA with `.\scripts\start-ava.ps1`, wait for the runner
+   to report healthy, then say `continue provisioning` again.
 
 This is intentional product behavior: runner first, VM creation second.
+
+---
+
+## Provisioning Progress UX
+
+While provisioning is running, AVA should explain exactly what is happening
+instead of leaving the user guessing. Status responses include runner progress
+when available:
+
+| Stage | User-facing meaning | Typical guidance |
+|-------|---------------------|------------------|
+| `queued` | Job is waiting for the host runner | usually picked up in under 1 minute |
+| `picked_up` / `provisioning` | Runner is preparing the VM | usually 3-8 minutes total |
+| `vm_started` | VirtualBox VM has started | SSH usually becomes ready in 1-3 minutes |
+| `ssh_ready` / `cloud_init` | SSH is reachable; cloud-init is finishing | usually 2-6 minutes |
+| `bootstrapping` | nginx and role setup are running | usually 1-4 minutes |
+| `hardening` | baseline hardening is being applied | usually 1-3 minutes |
+| `verifying` | AVA is checking SSH and HTTP evidence | usually under 1 minute |
+| `completed` | VM is ready | Web Console can be opened |
+| `failed` | Provisioning failed | AVA reports the failure class and cleanup state |
+
+The browser also starts a lightweight background watcher after provisioning is
+queued. It checks status periodically and posts the final completed or failed
+state into chat, so the user does not need to keep asking manually.
+
+Web Console gating is strict:
+
+- Progress-only connection details are shown as early visibility, not as final
+  access proof.
+- AVA Web Console opens only when a completed runner result exists with VM name,
+  SSH host, SSH port, and no runner error.
+- If provisioning is still running, Web Console explains that the VM is not
+  ready yet and tells the user to wait for completion.
 
 ---
 
@@ -312,14 +361,15 @@ Fixes:
 - Added `start-ava.ps1` as the one-command startup orchestrator.
 - Added WSL Ollama IP sync into `.env`.
 - Added startup-folder runner installation and daily stale seed cleanup support.
-- Added runner heartbeat preflight so AVA refuses approval when the host runner
-  is not healthy.
+- Added runner heartbeat preflight so AVA refuses provisioning start when the
+  host runner is not healthy.
 
 Product outcome:
 
 - After reboot, the intended user workflow is to run `.\scripts\start-ava.ps1`
   or rely on the login startup hook installed by `install-runner-task.ps1`.
-- AVA should not issue a temporary password if the runner is offline.
+- AVA should record approval as consent, but should not issue a temporary
+  password or queue a VM if the runner is offline.
 
 ### 2026-05-05 — Connection Reporting And Repeatability Polish
 
@@ -442,15 +492,20 @@ Modified files: `Dockerfile`, `docker-compose.yml`, `web_agent_v2.1_guardrail.py
 
 ## Exit Criteria (Phase 9 — live product validation)
 
-- Approving a provisioning request from chat triggers VM creation on Windows
-  when the host runner heartbeat is healthy
-- AVA refuses approval safely when the host runner is not healthy
+- Approving a provisioning request from chat records user consent without
+  creating a VM yet
+- `continue provisioning` triggers VM creation on Windows when the host runner
+  heartbeat is healthy
+- AVA refuses provisioning start safely when the host runner is not healthy
 - AVA chat session attaches the real `instance_id` after VM creation
 - AVA provides SSH/PuTTY connection details: host, port, username, VM name
+- AVA shows live runner progress, expected-time guidance, and clear next steps
+  while the VM is being created
 - nginx is bootstrapped on the created VM
 - `baseline_linux` hardening is applied by the runner by default
 - HTTP 200 is verified from both guest and host perspectives
 - Status/evidence/verify/PuTTY prompts report real runner evidence
+- AVA Web Console remains blocked until completed runner evidence exists
 - Late first-login and hardening follow-ups after completion do not fall through
   to the generic scope response
 - UI remains usable when long verification evidence is displayed
@@ -458,7 +513,8 @@ Modified files: `Dockerfile`, `docker-compose.yml`, `web_agent_v2.1_guardrail.py
 Phase 9.5 adds: startup and recovery are product-safe. The preferred path is
 `.\scripts\start-ava.ps1` or the login startup hook installed by
 `.\scripts\install-runner-task.ps1`; if the runner is not alive, AVA blocks
-approval rather than issuing credentials for a job that cannot execute.
+provisioning start rather than issuing credentials for a job that cannot
+execute.
 
 ---
 
