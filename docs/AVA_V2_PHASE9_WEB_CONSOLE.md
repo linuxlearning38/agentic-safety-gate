@@ -46,7 +46,9 @@ Implemented:
 
 - `Web Console` button in the AVA sidebar.
 - Chat shortcut for `open console`, `open web console`, and `open ssh console`.
-- `/console/open` creates a console request for the latest AVA-managed VM.
+- `/console/open` creates a console request for the latest AVA-managed VM, or
+  for a named completed VM when the chat command includes a target such as
+  `open web console for ava-web-03`.
 - `/console/<id>/output` streams console output to the browser by polling.
 - `/console/<id>/input` sends browser input to the runner.
 - `/console/<id>/close` requests session shutdown.
@@ -94,6 +96,8 @@ Phase 9.7 is considered complete when:
 - AVA can provision an Ubuntu web server VM through the existing approval flow.
 - `verify the web server` returns live host-runner evidence.
 - `open web console` opens the in-browser console for the latest AVA-managed VM.
+- `open web console for ava-web-03` opens the in-browser console for the named
+  completed AVA-managed VM when multiple servers exist.
 - The console connects as `ava-runner` without requiring PuTTY on the browser
   machine.
 - Basic commands work from the browser console:
@@ -120,9 +124,12 @@ These are accepted limits for Phase 9.7 and are intentionally deferred:
   programs such as `vim`, `top`, `less`, or interactive installers.
 - Arrow-key history, tab completion rendering, terminal resize, cursor-perfect
   editing, and full ANSI handling require the WebSocket/xterm phase.
-- The first slice targets the latest AVA-managed VM only. A VM picker is a
-  future slice.
+- The first named-target slice supports AVA-managed VM names from chat, not a
+  full visual VM picker yet.
 - Manual public SSH targets are not enabled in this phase.
+- The console intentionally does not ask for or store VM passwords in chat
+  history. Manual host/IP/username/password entry belongs in a later explicit
+  connector flow with separate security controls.
 
 ## Security Boundary
 
@@ -176,3 +183,91 @@ talk to AVA, and AVA should broker the console through the host runner.
 3. Add session audit records for open/close and duration.
 4. Add an explicit VM picker for multiple AVA-managed VMs.
 5. Add optional approved external SSH targets with allowlist and audit.
+
+## Phase 9.12 Server Inventory And Targeted Operations
+
+Phase 9.12 makes AVA safer when more than one AVA-managed VM exists. The chat
+layer now resolves the target VM by name before choosing a server-management
+operation.
+
+Supported user flows:
+
+- `list my servers`
+- `verify ava-web-03`
+- `show nginx logs for ava-web-03`
+- `open web console for ava-web-03`
+- `restart nginx on ava-web-03`
+- `stop ava-web-03`
+- `start ava-web-03`
+- `delete ava-web-03`
+
+Product behavior:
+
+- AVA lists only completed AVA-managed servers from durable provisioning
+  evidence.
+- Read-only operations can use live runner checks against the named VM.
+- Mutating operations require chat approval before the Windows host runner
+  executes them.
+- VM delete is high risk and removes the VirtualBox VM and disk files through
+  the runner path.
+- AVA does not hardcode VM names. Target names are resolved from provisioning
+  session state and runner evidence.
+
+Operational guidance:
+
+- Prefer deleting AVA-created VMs through AVA once the delete flow is fully
+  available in the UI. This keeps chat state and VirtualBox state aligned.
+- Manual VirtualBox deletion is still possible for emergency cleanup, but AVA
+  may need a fresh live verification before stale history is reconciled.
+- If provisioning is still in progress, AVA may show the VM as visible but will
+  block restart, stop, snapshot, rollback, and delete until bootstrap,
+  hardening, and HTTP verification are complete.
+
+## Phase 9.13 Addendum: Console Readiness And Demo Safety
+
+Date: 2026-06-15
+
+The Web Console is now tied to AVA's runtime truth instead of only stored chat
+history. This matters during demos because a VM may exist in VirtualBox while
+the runner is still waiting for cloud-init, bootstrap, hardening, or HTTP
+verification.
+
+Current behavior:
+
+- `open web console` opens the latest completed AVA-managed VM when the target
+  is unambiguous.
+- `open web console for <vm-name>` opens a named completed AVA-managed VM.
+- If provisioning is still running, Web Console reports that the target is not
+  ready instead of trying to connect too early.
+- If the runner is offline, Web Console reports the runner dependency instead
+  of showing a generic failure.
+- If no completed AVA-managed VM exists, Web Console says that no target is
+  available yet.
+- When multiple completed servers exist, named targeting is the recommended
+  operator path.
+
+Console readiness now depends on:
+
+- runner heartbeat is online
+- completed provisioning evidence exists
+- VM target can be resolved
+- SSH host and port are available
+- the target was created by AVA or is otherwise approved by a future allowlist
+
+### Current web terminal boundary
+
+The current browser console is an AVA-managed VM console. It is not yet the
+manual PuTTY replacement where a user types any IP, port, username, and
+password.
+
+That future manual connector must be designed as a separate guarded feature:
+
+- allowlisted targets only
+- explicit approval for public IP targets
+- host-key warning handling
+- no password persistence
+- session audit records
+- clear separation between AVA-managed VMs and external SSH targets
+
+This boundary is intentional. AVA should be the authenticated broker, not a
+blind public SSH proxy.

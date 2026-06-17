@@ -22,6 +22,11 @@
     .\scripts\install-runner-task.ps1
 #>
 
+param(
+    [ValidateRange(0, 30)]
+    [int]$StartupDelayMinutes = 1
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
@@ -31,10 +36,13 @@ $runnerScript  = Join-Path $repoRoot "scripts\start_host_runner.ps1"
 $cleanupScript = Join-Path $repoRoot "scripts\cleanup-stale-seeds.ps1"
 $wrapperDir    = Join-Path $env:LOCALAPPDATA "AVA"
 $startAvaWrapper = Join-Path $wrapperDir "start-ava.cmd"
+$startAvaDelayedWrapper = Join-Path $wrapperDir "start-ava-delayed.cmd"
 $runnerWrapper = Join-Path $wrapperDir "start-host-runner.cmd"
 $cleanupWrapper = Join-Path $wrapperDir "cleanup-stale-seeds.cmd"
 $startupDir = [Environment]::GetFolderPath("Startup")
 $startupRunner = Join-Path $startupDir "AVA Host Runner.cmd"
+$startupDelaySeconds = [Math]::Max(0, $StartupDelayMinutes * 60)
+$startupDelayForTask = "{0:D4}:00" -f $StartupDelayMinutes
 
 New-Item -ItemType Directory -Path $wrapperDir -Force | Out-Null
 
@@ -43,6 +51,12 @@ New-Item -ItemType Directory -Path $wrapperDir -Force | Out-Null
 cd /d "$repoRoot"
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$startAvaScript"
 "@ | Set-Content -Path $startAvaWrapper -Encoding ASCII
+
+@"
+@echo off
+timeout /t $startupDelaySeconds /nobreak >nul
+call "$startAvaWrapper"
+"@ | Set-Content -Path $startAvaDelayedWrapper -Encoding ASCII
 
 @"
 @echo off
@@ -74,22 +88,28 @@ function Register-AvaTask {
 
 @"
 @echo off
-start "AVA Startup" /min "$startAvaWrapper"
+start "AVA Startup" /min "$startAvaDelayedWrapper"
 "@ | Set-Content -Path $startupRunner -Encoding ASCII
 
-Write-Host "Registered: 'AVA Host Runner' (starts AVA + runner at user login via Startup folder)"
+Write-Host "Registered: 'AVA Host Runner' (delayed startup-folder fallback for AVA + runner)"
 
 try {
+    $startupTaskArguments = @(
+        "/Create",
+        "/TN", "AVA Startup",
+        "/SC", "ONLOGON",
+        "/TR", $startAvaWrapper,
+        "/F"
+    )
+    if ($StartupDelayMinutes -gt 0) {
+        $startupTaskArguments += @("/DELAY", $startupDelayForTask)
+    }
+
     Register-AvaTask `
         -TaskName "AVA Startup" `
-        -Arguments @(
-            "/Create",
-            "/TN", "AVA Startup",
-            "/SC", "ONLOGON",
-            "/TR", $startAvaWrapper,
-            "/F"
-        )
+        -Arguments $startupTaskArguments
     Write-Host "Registered: 'AVA Startup' (starts AVA + runner at user logon via Task Scheduler)"
+    Write-Host "Startup delay: $StartupDelayMinutes minute(s)"
 } catch {
     Write-Warning "Could not register AVA Startup scheduled task. Startup-folder fallback is still installed."
     Write-Warning $_
@@ -116,9 +136,11 @@ try {
 Write-Host ""
 Write-Host "Generated wrappers:"
 Write-Host "  $startAvaWrapper"
+Write-Host "  $startAvaDelayedWrapper"
 Write-Host "  $runnerWrapper"
 Write-Host "  $cleanupWrapper"
 Write-Host "  $startupRunner"
 Write-Host ""
 Write-Host "One-time setup complete.  From now on, use:"
 Write-Host "  .\scripts\start-ava.ps1   -- brings up Docker + AVA + runner"
+Write-Host "  .\scripts\check-ava-autostart.ps1   -- verifies startup hooks and runner heartbeat"

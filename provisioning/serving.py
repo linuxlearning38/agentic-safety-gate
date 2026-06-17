@@ -49,6 +49,7 @@ class ProvisioningChatService:
         user_id = str(user_id or "default")
         query = (query or "").strip()
         normalized = _normalize(query)
+        is_provisioning_start = route_intent == "provisioning" or _is_provisioning_start_query(normalized)
         active = self._active_session(user_id)
 
         if active and _is_cancel(normalized):
@@ -61,10 +62,19 @@ class ProvisioningChatService:
             response = self.flow.cancel(active.session_id)
             return self._result(response.message, response.session)
 
-        if route_intent == "provisioning":
+        if _is_server_inventory_query(normalized):
+            return ProvisioningServingResult(handled=True, response=self._server_inventory_response(user_id))
+
+        if is_provisioning_start:
             if active:
                 active_runner = self._runner_snapshot(active)
-                if _runner_failed(active_runner):
+                if active.phase == SessionPhase.AWAITING_APPROVAL and (
+                    self._known_vm_name_conflict(user_id, active)
+                    or self._runner_vm_name_conflict(active)
+                ):
+                    self._mark_conflict_session_failed(active)
+                    active = None
+                elif _runner_failed(active_runner):
                     active = None
                 elif _runner_completed(active_runner):
                     if active.phase != SessionPhase.COMPLETED:
@@ -76,9 +86,29 @@ class ProvisioningChatService:
             if existing and not _is_explicit_additional_provisioning(normalized):
                 return self._result(_format_existing_vm_guard(existing, self._runner_snapshot(existing)), existing)
             response = self.flow.start(user_id, query)
-            if response.requires_approval and response.desired_state_ready:
-                response = self.flow.request_approval(response.session.session_id)
-            return self._result(_format_flow_response(response), response.session, approval_id=response.approval_id)
+            return self._maybe_queue_approval(response)
+
+        target_session = self._find_named_server_session(user_id, normalized)
+        if target_session and _looks_like_server_management_query(normalized):
+            active = target_session
+        elif _mentions_ava_server_name(normalized) and _looks_like_server_management_query(normalized):
+            return ProvisioningServingResult(
+                handled=True,
+                response=(
+                    "I could not find that AVA-managed server in my current inventory.\n\n"
+                    "Ask `list my servers` to see the server names I can manage, then retry with one of those names."
+                ),
+            )
+
+        lifecycle_operation = classify_day2_operation(normalized)
+        if lifecycle_operation and lifecycle_operation.operation in {"start_vm", "stop_vm", "delete_vm"} and not target_session:
+            return ProvisioningServingResult(
+                handled=True,
+                response=_format_lifecycle_hostname_required(
+                    lifecycle_operation.operation,
+                    self._server_inventory_rows(user_id),
+                ),
+            )
 
         if not active:
             active = self._recent_session_for_followup(user_id, normalized)
@@ -190,6 +220,13 @@ class ProvisioningChatService:
                 return ProvisioningServingResult(handled=False)
             if not _runner_is_healthy(self.job_queue):
                 return self._result(_format_runner_unavailable_response(), active)
+            runner_conflict = self._runner_vm_name_conflict(active)
+            if runner_conflict:
+                active = self._mark_conflict_session_failed(active)
+                return self._result(
+                    _format_runner_vm_name_conflict(active, runner_conflict, approval_recorded=True),
+                    active,
+                )
             response = self.flow.continue_after_approval(active.session_id)
             message = self._format_approval_and_enqueue(response)
             return self._result(message, response.session, approval_id=response.approval_id)
@@ -266,6 +303,195 @@ class ProvisioningChatService:
                 return session
         return None
 
+    def _server_inventory_rows(self, user_id: str) -> list[dict[str, Any]]:
+        recent_sessions = getattr(self.sessions, "list_recent", lambda *_args, **_kwargs: [])(user_id, limit=25)
+        inventory_snapshot = self._runner_inventory_snapshot()
+        live_inventory = inventory_snapshot["entries"]
+        managed_by_name: dict[str, dict[str, Any]] = {}
+        for session in recent_sessions:
+            runner = self._runner_snapshot(session)
+            if not _runner_completed(runner):
+                continue
+            result = runner.get("result")
+            if not (result and result.instance_id):
+                continue
+            vm_name = result.instance_name or result.instance_id
+            if not vm_name:
+                continue
+            managed_by_name.setdefault(
+                _normalize(vm_name),
+                {
+                    "session": session,
+                    "runner": runner,
+                    "result": result,
+                    "phase": _effective_phase(session, runner),
+                    "runner_status": runner.get("status") or "not available yet",
+                },
+            )
+
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for normalized_name, live_entry in sorted(live_inventory.items(), key=lambda item: str(item[1].get("name") or item[0])):
+            vm_name = str(live_entry.get("name") or normalized_name).strip()
+            if not vm_name or normalized_name in seen:
+                continue
+            seen.add(normalized_name)
+            managed = managed_by_name.get(normalized_name, {})
+            rows.append(
+                {
+                    "session": managed.get("session"),
+                    "runner": managed.get("runner") or {},
+                    "result": managed.get("result"),
+                    "vm_name": vm_name,
+                    "phase": managed.get("phase") or "external",
+                    "runner_status": managed.get("runner_status") or "not tracked by AVA",
+                    "inventory_present": bool(live_entry),
+                    "ava_managed": bool(managed),
+                    "runner_inventory_available": inventory_snapshot["available"],
+                    "runner_inventory_stale": inventory_snapshot["stale"],
+                    "runner_inventory_updated_at": inventory_snapshot["updated_at"],
+                    "power_state": str(live_entry.get("power_state") or "not checked"),
+                    "provider_status": str(live_entry.get("provider_status") or "not checked"),
+                }
+            )
+        return rows
+
+    def _runner_inventory_snapshot(self) -> dict[str, Any]:
+        heartbeat_getter = getattr(self.job_queue, "get_runner_heartbeat", None)
+        if heartbeat_getter is None:
+            return {"available": False, "stale": True, "updated_at": None, "entries": {}}
+        try:
+            heartbeat = heartbeat_getter() or {}
+        except Exception:
+            return {"available": False, "stale": True, "updated_at": None, "entries": {}}
+        metadata = heartbeat.get("metadata") if isinstance(heartbeat, dict) else {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        updated_at = heartbeat.get("updated_at") if isinstance(heartbeat, dict) else None
+        stale = False
+        if updated_at:
+            try:
+                updated = datetime.fromisoformat(str(updated_at))
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                stale = (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds() > 120
+            except ValueError:
+                stale = True
+
+        inventory: dict[str, dict[str, Any]] = {}
+        entries = metadata.get("registered_vm_inventory")
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name") or "").strip()
+                if not name:
+                    continue
+                inventory[_normalize(name)] = dict(entry)
+        registered = metadata.get("registered_vms")
+        if isinstance(registered, list):
+            for vm_name in registered:
+                name = str(vm_name or "").strip()
+                if not name:
+                    continue
+                inventory.setdefault(
+                    _normalize(name),
+                    {
+                        "name": name,
+                        "power_state": "not checked",
+                        "provider_status": "not checked",
+                    },
+                )
+        return {
+            "available": bool(heartbeat),
+            "stale": stale,
+            "updated_at": updated_at,
+            "entries": inventory,
+        }
+
+    def _runner_virtualbox_inventory(self) -> dict[str, dict[str, Any]]:
+        return self._runner_inventory_snapshot()["entries"]
+
+    def _server_inventory_response(self, user_id: str) -> str:
+        inventory_snapshot = self._runner_inventory_snapshot()
+        rows = self._server_inventory_rows(user_id)
+        if not rows:
+            if not inventory_snapshot["available"]:
+                return (
+                    "I cannot confirm the current VirtualBox server inventory because the AVA host runner "
+                    "is not reporting inventory yet.\n\n"
+                    "Start AVA normally with `scripts/start-ava.ps1`, then ask `list my servers` again."
+                )
+            return (
+                "The AVA host runner is online, but VirtualBox is not reporting any servers right now.\n\n"
+                "Create a web server first, then ask `list my servers` again."
+            )
+        lines = ["VirtualBox servers reported by the AVA host runner:\n"]
+        if inventory_snapshot.get("updated_at"):
+            freshness = "stale" if inventory_snapshot.get("stale") else "fresh"
+            lines.extend([f"- Inventory updated: `{inventory_snapshot['updated_at']}` (`{freshness}`)", ""])
+        for index, row in enumerate(rows, start=1):
+            result = row.get("result")
+            web_url = f"http://127.0.0.1:{result.http_port}/" if result and result.http_port else "not known to AVA"
+            ssh = f"{result.ssh_host}:{result.ssh_port}" if result and result.ssh_host and result.ssh_port else "not known to AVA"
+            managed_text = "yes" if row.get("ava_managed") else "no - visible in VirtualBox only"
+            lines.extend(
+                [
+                    f"{index}. `{row['vm_name']}`",
+                    f"- Managed by AVA: `{managed_text}`",
+                    f"- Phase: `{row['phase']}`",
+                    f"- Runner status: `{row['runner_status']}`",
+                    f"- Power state: `{row['power_state']}`",
+                    f"- Provider status: `{row['provider_status']}`",
+                    f"- SSH / PuTTY: `{ssh}`",
+                    f"- Web URL: `{web_url}`",
+                    "",
+                ]
+            )
+            if not row.get("ava_managed"):
+                lines.extend(
+                    [
+                        "  AVA can see this VM in VirtualBox, but it does not have provisioning credentials or web evidence for it yet.",
+                        "",
+                    ]
+                )
+            if _power_state_needs_operator_choice(row["power_state"]):
+                lines.extend(
+                    [
+                        f"  `{row['vm_name']}` is not running. Say `start {row['vm_name']}` to power it on, "
+                        f"or `delete {row['vm_name']}` to remove it after approval.",
+                        "",
+                    ]
+                )
+        lines.extend(
+            [
+                "Target examples:",
+                "- `verify ava-web-03`",
+                "- `show nginx logs for ava-web-03`",
+                "- `open web console for ava-web-03`",
+                "- `restart nginx on ava-web-03`",
+                "- `stop ava-web-03`",
+                "- `start ava-web-03`",
+                "- `delete ava-web-03`",
+            ]
+        )
+        return "\n".join(lines).strip()
+
+    def _find_named_server_session(self, user_id: str, normalized: str):
+        if not normalized:
+            return None
+        rows = self._server_inventory_rows(user_id)
+        # Prefer the longest VM name first so ava-web-03 wins before ava-web.
+        rows.sort(key=lambda row: len(str(row["vm_name"])), reverse=True)
+        for row in rows:
+            if not (row.get("session") and row.get("result")):
+                continue
+            names = _server_name_candidates(row["session"], row["runner"], row["result"])
+            if any(name and name in normalized for name in names):
+                return row["session"]
+        return None
+
     def _existing_managed_vm_session(self, user_id: str):
         recent_sessions = getattr(self.sessions, "list_recent", lambda *_args, **_kwargs: [])(user_id, limit=10)
         for session in recent_sessions:
@@ -273,6 +499,67 @@ class ProvisioningChatService:
             result = runner.get("result")
             if result and result.instance_id and not result.error and self._existing_vm_still_live(session, runner, result):
                 return session
+        return None
+
+    def _known_vm_name_conflict(self, user_id: str, session) -> dict[str, Any] | None:
+        desired_state = session.desired_state or {}
+        requested_name = _normalize(str(desired_state.get("vm_name") or desired_state.get("hostname") or ""))
+        if not requested_name:
+            return None
+        inventory_snapshot = self._runner_inventory_snapshot()
+        for row in self._server_inventory_rows(user_id):
+            row_session = row.get("session")
+            if row_session and row_session.session_id == session.session_id:
+                continue
+            names = {_normalize(str(row.get("vm_name") or ""))}
+            if row_session and row.get("result"):
+                names.update(_server_name_candidates(row_session, row.get("runner") or {}, row.get("result")))
+            if requested_name in names:
+                return row
+        if inventory_snapshot["available"]:
+            return None
+        recent_sessions = getattr(self.sessions, "list_recent", lambda *_args, **_kwargs: [])(user_id, limit=25)
+        for known_session in recent_sessions:
+            if known_session.session_id == session.session_id:
+                continue
+            runner = self._runner_snapshot(known_session)
+            if not _runner_completed(runner):
+                continue
+            result = runner.get("result")
+            if not (result and result.instance_id):
+                continue
+            names = _server_name_candidates(known_session, runner, result)
+            if requested_name in names:
+                vm_name = result.instance_name or result.instance_id
+                return {
+                    "session": known_session,
+                    "runner": runner,
+                    "result": result,
+                    "vm_name": vm_name,
+                    "phase": _effective_phase(known_session, runner),
+                    "runner_status": runner.get("status") or "not available yet",
+                    "inventory_present": False,
+                    "ava_managed": True,
+                    "power_state": "not checked",
+                    "provider_status": "not checked",
+                }
+        return None
+
+    def _runner_vm_name_conflict(self, session) -> dict[str, Any] | None:
+        desired_state = session.desired_state or {}
+        requested_raw = str(desired_state.get("vm_name") or desired_state.get("hostname") or "").strip()
+        requested_name = _normalize(requested_raw)
+        if not requested_name:
+            return None
+        for normalized_name, entry in self._runner_virtualbox_inventory().items():
+            if normalized_name == requested_name:
+                return {
+                    "vm_name": str(entry.get("name") or requested_raw),
+                    "requested_name": requested_raw or str(entry.get("name") or requested_name),
+                    "source": "virtualbox_runner_inventory",
+                    "power_state": str(entry.get("power_state") or "not checked"),
+                    "provider_status": str(entry.get("provider_status") or "not checked"),
+                }
         return None
 
     def _existing_vm_still_live(self, session, runner: dict[str, Any], result: ProvisioningJobResult) -> bool:
@@ -322,8 +609,21 @@ class ProvisioningChatService:
 
     def _maybe_queue_approval(self, response):
         if response.requires_approval and response.desired_state_ready:
+            conflict = self._known_vm_name_conflict(response.session.user_id, response.session)
+            if conflict:
+                session = self._mark_conflict_session_failed(response.session)
+                return self._result(_format_known_vm_name_conflict(session, conflict), session)
+            runner_conflict = self._runner_vm_name_conflict(response.session)
+            if runner_conflict:
+                session = self._mark_conflict_session_failed(response.session)
+                return self._result(_format_runner_vm_name_conflict(session, runner_conflict), session)
             response = self.flow.request_approval(response.session.session_id)
         return self._result(_format_flow_response(response), response.session, approval_id=response.approval_id)
+
+    def _mark_conflict_session_failed(self, session):
+        if session.phase == SessionPhase.FAILED:
+            return session
+        return self.sessions.update_phase(session.session_id, SessionPhase.FAILED)
 
     def _format_approval_and_enqueue(self, response) -> str:
         message = _format_flow_response(response)
@@ -497,7 +797,8 @@ class ProvisioningChatService:
             return None
         if operation.operation == "status":
             return None
-        result = runner.get("result")
+        completed_result = runner.get("result")
+        result = completed_result or _runner_connection_result(runner)
         if not result or not result.instance_id:
             if operation.operation in {"status", "verify"}:
                 return None
@@ -513,6 +814,14 @@ class ProvisioningChatService:
                 if live_operation:
                     return live_operation
             return self._result(format_read_only_response(operation, session=session, result=result), session)
+
+        if not completed_result:
+            return self._result(
+                "This VM is visible to AVA, but final provisioning has not completed yet.\n\n"
+                "Mutating operations like restart, stop, start, snapshot, rollback, or delete are enabled only "
+                "after AVA has completed bootstrap, hardening, and HTTP verification.",
+                session,
+            )
 
         approval_id = approval.add_request(
             f"day2:{operation.operation}:{result.instance_name or result.instance_id}",
@@ -558,12 +867,14 @@ class ProvisioningChatService:
                 session,
                 approval_id=approval_id,
             )
-        result = runner.get("result")
+        target_session = self.sessions.get(str(metadata.get("session_id") or "")) or session
+        target_runner = self._runner_snapshot(target_session)
+        result = target_runner.get("result")
         if not result or not result.instance_id:
             return self._result(
                 "This approval belongs to an AVA-managed VM, but the completed runner result is not "
                 "attached to the active chat session right now. No action was executed.",
-                session,
+                target_session,
                 approval_id=approval_id,
             )
         operation = classify_day2_operation(str(entry.get("query") or entry.get("command") or ""))
@@ -571,7 +882,7 @@ class ProvisioningChatService:
             return self._result(
                 f"Approval `{approval_id}` could not be matched to a supported VM operation. "
                 "No action was executed.",
-                session,
+                target_session,
                 approval_id=approval_id,
             )
         approval.update_status(approval_id, "approved")
@@ -579,7 +890,7 @@ class ProvisioningChatService:
         if enqueue_operation is not None:
             try:
                 day2_job = enqueue_operation(
-                    session_id=session.session_id,
+                    session_id=target_session.session_id,
                     operation=operation.operation,
                     target=operation.target,
                     instance_id=result.instance_id,
@@ -587,12 +898,12 @@ class ProvisioningChatService:
                     ssh_host=result.ssh_host,
                     ssh_port=result.ssh_port,
                     http_port=result.http_port,
-                    metadata={"approval_id": approval_id, "runner_job_id": runner.get("job_id")},
+                    metadata={"approval_id": approval_id, "runner_job_id": target_runner.get("job_id")},
                 )
-                existing_operations = list((session.collected_answers or {}).get("day2_operation_ids") or [])
+                existing_operations = list((target_session.collected_answers or {}).get("day2_operation_ids") or [])
                 existing_operations.append(day2_job.operation_id)
                 session = self.sessions.record_answers(
-                    session.session_id,
+                    target_session.session_id,
                     {
                         "last_day2_operation_id": day2_job.operation_id,
                         "day2_operation_ids": existing_operations[-10:],
@@ -615,12 +926,12 @@ class ProvisioningChatService:
                     f"- VM: `{result.instance_name or result.instance_id}`\n"
                     f"- Queue error: `{exc}`\n\n"
                     "No VM or service change was executed.",
-                    session,
+                    target_session,
                     approval_id=approval_id,
                 )
         return self._result(
-            format_approved_pending_response(operation, session=session, result=result),
-            session,
+            format_approved_pending_response(operation, session=target_session, result=result),
+            target_session,
             approval_id=approval_id,
         )
 
@@ -806,6 +1117,14 @@ def _runner_failed(runner: dict[str, Any] | None) -> bool:
     return runner.get("status") == "failed" or bool(result and result.error)
 
 
+def _is_vm_name_conflict_error(error: dict[str, Any] | None) -> bool:
+    if not isinstance(error, dict):
+        return False
+    failure_class = str(error.get("failure_class") or "").lower()
+    message = str(error.get("message") or "").lower()
+    return failure_class == "vm_name_conflict" or ("virtualbox vm" in message and "already exists" in message)
+
+
 def _runner_job_state_expired(session) -> bool:
     if session.phase in {SessionPhase.COMPLETED, SessionPhase.FAILED, SessionPhase.CANCELLED}:
         return False
@@ -864,6 +1183,80 @@ def _is_provisioning_followup_query(query: str) -> bool:
     return classify_day2_operation(query) is not None
 
 
+def _is_server_inventory_query(query: str) -> bool:
+    return any(
+        marker in query
+        for marker in (
+            "list my servers",
+            "show my servers",
+            "list servers",
+            "show servers",
+            "server inventory",
+            "vm inventory",
+            "virtualbox inventory",
+            "managed servers",
+            "ava managed servers",
+            "what servers do i have",
+            "which servers do i have",
+            "offline servers",
+            "which servers are offline",
+            "show offline servers",
+            "what is offline",
+            "powered off servers",
+            "saved servers",
+        )
+    )
+
+
+def _looks_like_server_management_query(query: str) -> bool:
+    if classify_day2_operation(query) is not None:
+        return True
+    return (
+        _is_status_query(query)
+        or _is_connection_query(query)
+        or _is_evidence_query(query)
+        or _is_web_verification_query(query)
+    )
+
+
+def _mentions_ava_server_name(query: str) -> bool:
+    return bool(re.search(r"\bava-[a-z0-9][a-z0-9-]{1,60}\b", query or ""))
+
+
+def _server_name_candidates(session, runner: dict[str, Any] | None, result: ProvisioningJobResult | None = None) -> list[str]:
+    runner = runner or {}
+    result = result or _runner_connection_result(runner)
+    candidates: list[str] = []
+    if result:
+        candidates.extend([result.instance_name or "", result.instance_id or ""])
+    progress = runner.get("progress")
+    if progress:
+        candidates.extend(
+            [
+                str(getattr(progress, "instance_name", "") or ""),
+                str(getattr(progress, "instance_id", "") or ""),
+            ]
+        )
+    desired_state = session.desired_state or {}
+    answers = session.collected_answers or {}
+    candidates.extend(
+        [
+            session.instance_id or "",
+            str(desired_state.get("vm_name") or ""),
+            str(desired_state.get("hostname") or ""),
+            str(answers.get("hostname") or ""),
+        ]
+    )
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        value = _normalize(str(candidate))
+        if value and value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return normalized
+
+
 def _is_explicit_additional_provisioning(query: str) -> bool:
     additional_markers = (
         "another web server",
@@ -877,6 +1270,28 @@ def _is_explicit_additional_provisioning(query: str) -> bool:
         "provision new",
     )
     return any(marker in query for marker in additional_markers)
+
+
+def _is_provisioning_start_query(query: str) -> bool:
+    if not query:
+        return False
+    if _is_explicit_additional_provisioning(query):
+        return True
+    role_markers = ("web server", "nginx server", "ubuntu web")
+    action_markers = (
+        "i want",
+        "i need",
+        "create",
+        "provision",
+        "build",
+        "deploy",
+        "make",
+        "spin up",
+        "set up",
+        "setup",
+        "launch",
+    )
+    return any(role in query for role in role_markers) and any(action in query for action in action_markers)
 
 
 def _format_active_provisioning_guard(session, runner: dict[str, Any]) -> str:
@@ -921,6 +1336,109 @@ def _format_existing_vm_guard(session, runner: dict[str, Any]) -> str:
         f"{web}\n\n"
         "Ask `show status of my web server`, `verify the web server`, or `show nginx logs` for this server.\n"
         "If you intentionally want a second server, say `create another web server` and include the specs."
+    )
+
+
+def _power_state_needs_operator_choice(power_state: str | None) -> bool:
+    normalized = _normalize(str(power_state or ""))
+    return normalized in {
+        "aborted",
+        "paused",
+        "poweroff",
+        "powered off",
+        "saved",
+        "stopped",
+    }
+
+
+def _format_lifecycle_hostname_required(operation: str, rows: list[dict[str, Any]]) -> str:
+    verb = {
+        "start_vm": "start",
+        "stop_vm": "stop",
+        "delete_vm": "delete",
+    }.get(operation, "manage")
+    if not rows:
+        return (
+            f"Which server should I {verb}?\n\n"
+            "I do not have a completed AVA-managed server attached to this account yet. "
+            "Ask `list my servers` after provisioning completes."
+        )
+    lines = [
+        f"Which server should I {verb}?",
+        "",
+        "Please include the exact hostname so AVA does not guess.",
+        "",
+        "Available AVA-managed servers:",
+    ]
+    for row in rows:
+        lines.append(
+            f"- `{row['vm_name']}` - power state `{row.get('power_state', 'not checked')}`, "
+            f"provider status `{row.get('provider_status', 'not checked')}`"
+        )
+    lines.extend(
+        [
+            "",
+            f"Example: `{verb} {rows[0]['vm_name']}`",
+        ]
+    )
+    if operation == "delete_vm":
+        lines.append("Delete is high risk and will still require approval before anything is removed.")
+    elif operation in {"start_vm", "stop_vm"}:
+        lines.append("Power changes still require approval before AVA touches the VM.")
+    return "\n".join(lines)
+
+
+def _format_known_vm_name_conflict(session, row: dict[str, Any]) -> str:
+    desired = session.desired_state or {}
+    requested_name = desired.get("vm_name") or desired.get("hostname") or "that hostname"
+    result = row.get("result")
+    vm_name = row.get("vm_name") or requested_name
+    if not row.get("ava_managed", True):
+        power_state = row.get("power_state") or "unknown"
+        provider_status = row.get("provider_status") or "unknown"
+        return (
+            f"I cannot create `{requested_name}` because a VM with that name already exists in the local infrastructure.\n\n"
+            f"- Existing VM: `{vm_name}`\n"
+            f"- Requested hostname: `{requested_name}`\n"
+            "- Source: `VirtualBox inventory reported by the AVA host runner`\n"
+            f"- Power state: `{power_state}`\n"
+            f"- Provider status: `{provider_status}`\n\n"
+            "Please choose a different hostname, for example `ava-web-04`, or ask `list my servers` if you want to manage an existing server.\n"
+            "No approval was created and no runner job was queued."
+        )
+    ssh = "unknown"
+    web_url = "unknown"
+    if result and result.ssh_host and result.ssh_port:
+        ssh = f"{result.ssh_host}:{result.ssh_port}"
+    if result and result.http_port:
+        web_url = f"http://127.0.0.1:{result.http_port}/"
+    return (
+        f"I cannot use hostname `{requested_name}` because AVA already has a completed managed server with that name.\n\n"
+        f"- Existing VM: `{vm_name}`\n"
+        f"- SSH / PuTTY: `{ssh}`\n"
+        f"- Web URL: `{web_url}`\n\n"
+        "Choose a different hostname, for example `ava-web-04`, or ask `list my servers` to see current servers.\n"
+        "No approval was created and no runner job was queued."
+    )
+
+
+def _format_runner_vm_name_conflict(session, conflict: dict[str, Any], *, approval_recorded: bool = False) -> str:
+    desired = session.desired_state or {}
+    requested_name = conflict.get("requested_name") or desired.get("vm_name") or desired.get("hostname") or "that hostname"
+    vm_name = conflict.get("vm_name") or requested_name
+    final_line = (
+        "No runner job was queued and no temporary password was issued."
+        if approval_recorded
+        else "No approval was created and no runner job was queued."
+    )
+    return (
+        f"I cannot create `{requested_name}` because a VM with that name already exists in the local infrastructure.\n\n"
+        f"- Existing VM: `{vm_name}`\n"
+        f"- Requested hostname: `{requested_name}`\n"
+        "- Source: `VirtualBox inventory reported by the AVA host runner`\n\n"
+        "Please choose a different hostname, for example `ava-web-04`, or ask `list my servers` "
+        "if you want to manage an existing server.\n"
+        f"{final_line}"
     )
 
 
@@ -1300,13 +1818,21 @@ def _format_status_response(session, runner: dict[str, Any] | None = None) -> st
     if result and result.error:
         error = result.error or {}
         rollback = error.get("rollback") if isinstance(error, dict) else None
+        display_failure_class = error.get("failure_class") or "runner_failed"
+        display_error = error.get("message") or "unknown error"
+        if _is_vm_name_conflict_error(error):
+            display_failure_class = "vm_name_conflict"
+            display_error = (
+                "A VM with the requested hostname already exists in VirtualBox. "
+                "Choose a different hostname, or manage/delete the existing VM before retrying."
+            )
         lines.extend(
             [
                 "",
                 "Failure details:",
                 f"- Failed step: `{error.get('failed_step') or 'host_runner'}`",
-                f"- Failure class: `{error.get('failure_class') or 'runner_failed'}`",
-                f"- Error: `{error.get('message') or 'unknown error'}`",
+                f"- Failure class: `{display_failure_class}`",
+                f"- Error: `{display_error}`",
                 f"- Partial VM cleanup: `{(rollback or {}).get('status') or 'not reported'}`",
                 "",
                 "No active VM is attached to this session, and no PuTTY or web URL is available because "

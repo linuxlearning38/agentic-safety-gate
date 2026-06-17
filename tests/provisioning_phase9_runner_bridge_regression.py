@@ -31,12 +31,16 @@ from provisioning.runner.host_runner import (  # noqa: E402
     HostRunner,
     HostRunnerConfig,
     _ISO_UNLINK_ATTEMPTS,
+    _is_recoverable_guest_failure,
+    _runner_code_fingerprint,
+    _runner_failure_class,
     _ssh_config_path_value,
     _wait_for_executor_command,
     _windows_private_key_acl_command,
     _write_cloud_init_seed,
 )
 from provisioning.bootstrap.ssh_executor import SSHCommandResult  # noqa: E402
+from provisioning.roles.web_server import WEB_SERVER_ROLE, WebServerRole  # noqa: E402
 from provisioning.runner.result_writer import ProvisioningResultWriter as _ResultWriter  # noqa: E402
 
 
@@ -220,6 +224,37 @@ def test_runner_verification_uses_key_auth() -> list[bool]:
     ]
 
 
+def test_runner_heartbeat_advertises_code_fingerprint() -> list[bool]:
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        runner = HostRunner.__new__(HostRunner)
+        runner.config = HostRunnerConfig(
+            vboxmanage="VBoxManage",
+            ssh_binary="ssh",
+            ssh_keygen="ssh-keygen",
+            template_name="ubuntu-cloud-image",
+            work_root=tmp,
+            log_path=tmp / "runner.log",
+            retain_debug=False,
+            timeout_seconds=30,
+            max_jobs=1,
+        )
+        metadata = runner._base_heartbeat_metadata()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    fingerprint = metadata.get("runner_code_fingerprint")
+    source = str(metadata.get("runner_source", ""))
+
+    return [
+        check(
+            "runner heartbeat includes current code fingerprint",
+            isinstance(fingerprint, str) and fingerprint == _runner_code_fingerprint() and len(fingerprint) == 12,
+        ),
+        check("runner heartbeat includes source path", source.endswith("host_runner.py")),
+    ]
+
+
 def test_cloud_init_marker_stdout_wins_over_ssh_close_timeout() -> list[bool]:
     """The runner must not destroy a VM after the ready marker was printed.
 
@@ -257,7 +292,80 @@ def test_cloud_init_marker_stdout_wins_over_ssh_close_timeout() -> list[bool]:
     return [
         check("cloud-init marker result is returned", result is not None),
         check("cloud-init marker stdout is preserved", result is not None and marker in result.stdout),
+        check("cloud-init marker normalizes timeout exit code", result is not None and result.exit_code == 0),
+        check("cloud-init marker clears timeout flag", result is not None and not result.timed_out),
+        check("cloud-init marker clears timeout failure class", result is not None and result.failure_class is None),
         check("cloud-init marker stops retry loop immediately", calls[0] == 1),
+    ]
+
+
+def test_web_server_preflight_waits_for_guest_readiness() -> list[bool]:
+    preflight = WEB_SERVER_ROLE.bootstrap_steps[0]
+
+    return [
+        check("preflight is the first web bootstrap step", preflight.name == "preflight"),
+        check("preflight trusts the explicit guest-ready marker", "AVA_GUEST_READY" in preflight.command),
+        check("preflight does not repeat the long first-boot wait", "seq 1 72" not in preflight.command),
+        check("preflight has a bounded short timeout", preflight.timeout_seconds <= 90),
+        check("preflight records guest readiness failure class", preflight.failure_class == "guest_readiness_timeout"),
+        check("preflight reports cloud-init status on failure", "cloud-init status --long" in preflight.command),
+    ]
+
+
+def test_web_server_preflight_marker_survives_ssh_close_timeout() -> list[bool]:
+    """A printed guest-ready marker must win over a late SSH close timeout."""
+
+    class MarkerTimeoutThenSuccessExecutor:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, command, *, timeout_seconds=120, redact_patterns=()):
+            self.calls.append((command, timeout_seconds))
+            if len(self.calls) == 1:
+                return SSHCommandResult(
+                    command=command,
+                    exit_code=124,
+                    stdout="AVA_GUEST_READY\n",
+                    stderr="",
+                    duration_seconds=float(timeout_seconds),
+                    started_at="2026-06-16T13:20:00+00:00",
+                    finished_at="2026-06-16T13:21:30+00:00",
+                    timed_out=True,
+                    failure_class="command_timeout",
+                )
+            return SSHCommandResult(
+                command=command,
+                exit_code=0,
+                stdout="ok\n",
+                stderr="",
+                duration_seconds=1.0,
+                started_at="2026-06-16T13:21:31+00:00",
+                finished_at="2026-06-16T13:21:32+00:00",
+                timed_out=False,
+                failure_class=None,
+            )
+
+    executor = MarkerTimeoutThenSuccessExecutor()
+    results = WebServerRole().bootstrap(executor)
+
+    return [
+        check("preflight marker timeout is normalized to success", results[0].exit_code == 0),
+        check("preflight timeout flag is cleared", not results[0].timed_out),
+        check("preflight failure class is cleared", results[0].failure_class is None),
+        check("bootstrap continues after marker timeout", len(results) > 1),
+    ]
+
+
+def test_guest_readiness_failure_is_recoverable() -> list[bool]:
+    exc = RuntimeError(
+        "guest_readiness_timeout: Guest readiness was not confirmed before web bootstrap "
+        "(exit_code=1, command=whoami && sudo -n true && systemctl is-active ssh)"
+    )
+    failure_class = _runner_failure_class(exc)
+
+    return [
+        check("runner classifies slow guest bootstrap distinctly", failure_class == "guest_readiness_timeout"),
+        check("guest readiness timeout is recoverable", _is_recoverable_guest_failure(failure_class)),
     ]
 
 
@@ -432,6 +540,11 @@ def test_cleanup_failure_after_verification_does_not_rollback() -> list[bool]:
         stdout="AVA_CLOUD_INIT_READY ava-web-cleanup-test\n",
         stderr="", failure_class="none",
     )
+    ssh_ready_result = SimpleNamespace(
+        exit_code=0,
+        stdout="AVA_SSH_READY",
+        stderr="", failure_class="none",
+    )
     mock_report = SimpleNamespace(
         passed=True,
         to_dict=lambda: {"checks": [{"name": "host_http_200", "passed": True}]},
@@ -465,7 +578,10 @@ def test_cleanup_failure_after_verification_does_not_rollback() -> list[bool]:
         HostRunner._validate_binaries = lambda self: None
         hr_mod._run = lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr="")
         hr_mod._wait_for_tcp = lambda host, port, timeout, **kw: True
-        hr_mod._wait_for_executor_command = lambda executor, cmd, timeout, *, redact, **kw: cloud_init_result
+        hr_mod._wait_for_executor_command = (
+            lambda executor, cmd, timeout, *, redact, **kw:
+            ssh_ready_result if "AVA_SSH_READY" in cmd else cloud_init_result
+        )
         hr_mod._wait_for_http_200 = lambda url, timeout_seconds, **kw: (True, "HTTP 200")
         hr_mod.SSHExecutor = lambda conn: SimpleNamespace(run=lambda cmd, **kw: cloud_init_result)
         hr_mod.WebServerRole = _MockWebServerRole
@@ -926,6 +1042,9 @@ def test_web_console_ui_normalizes_duplicate_prompts() -> list[bool]:
         check("web console reports xterm-lite renderer", '"renderer": "ava_xterm_lite"' in source),
         check("web console exposes readiness endpoint", "@app.route('/console/status'" in source),
         check("web console has manual readiness check", "checkAvaConsoleReadiness" in source and "formatConsoleReadiness" in source),
+        check("web console supports named VM targets", "extractAvaConsoleTarget" in source and "{target: targetName}" in source),
+        check("web console routes named target to backend", "requested_target" in source and "_resolve_active_console_target(user_id, requested_target)" in source),
+        check("web console explains target-specific command", "open web console for ava-web-03" in source),
         check("web console reports runner offline actionably", "The Windows host runner is offline" in source),
         check("web console times out stale queued sessions", "Console session timed out before the host runner connected" in source),
         check("web console tells user to reconnect closed sessions", "Click Reconnect to start a fresh session" in source),
@@ -1008,6 +1127,171 @@ def test_day2_nginx_logs_uses_retained_runner_key() -> list[bool]:
         check("nginx logs include service journal", "nginx.service active" in str(evidence.get("journalctl_tail"))),
         check("nginx logs include access tail", "GET / HTTP/1.1 200" in str(evidence.get("access_log_tail"))),
         check("nginx logs include error tail", "no errors" in str(evidence.get("error_log_tail"))),
+    ]
+
+
+def test_day2_restart_nginx_uses_retained_runner_key() -> list[bool]:
+    tmp = Path(tempfile.mkdtemp())
+    fake = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
+    key_path = tmp / "keys" / "ava-web-restart_ava_runner_ed25519"
+    key_path.parent.mkdir(parents=True)
+    key_path.write_text("fake-private-key", encoding="utf-8")
+    operation = queue.enqueue_day2_operation(
+        session_id="session-day2-restart",
+        operation="restart_nginx",
+        target="nginx",
+        instance_id="ava-web-restart",
+        instance_name="ava-web-restart",
+        ssh_host="127.0.0.1",
+        ssh_port=2222,
+        http_port=8080,
+        metadata={"approval_id": "approve-restart"},
+    )
+    claimed = queue.claim_next_day2_operation(timeout_seconds=1)
+    commands: list[str] = []
+
+    class MockAdapter:
+        def get_connection_info(self, iid):
+            return SimpleNamespace(host="127.0.0.1", port=2222, metadata={"http_host_port": 8080})
+
+    class MockSSHExecutor:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def run(self, command, **kwargs):
+            commands.append(command)
+            return SimpleNamespace(exit_code=0, stdout="active\n", stderr="", failure_class=None)
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.queue = queue
+    runner.config = HostRunnerConfig(
+        vboxmanage="VBoxManage",
+        ssh_binary="ssh",
+        ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image",
+        work_root=tmp,
+        log_path=tmp / "ava-day2-restart-test.log",
+        retain_debug=False,
+        timeout_seconds=30,
+        max_jobs=1,
+    )
+    runner.adapter = MockAdapter()
+    runner.logger = logging.getLogger("ava.test.day2_restart")
+
+    import provisioning.runner.host_runner as hr_mod
+
+    original_validate = HostRunner._validate_binaries
+    original_ssh_executor = hr_mod.SSHExecutor
+    try:
+        HostRunner._validate_binaries = lambda self: None
+        hr_mod.SSHExecutor = MockSSHExecutor
+        runner.execute_day2_operation(claimed)
+    finally:
+        HostRunner._validate_binaries = original_validate
+        hr_mod.SSHExecutor = original_ssh_executor
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    loaded = queue.get_day2_result(operation.operation_id)
+    evidence = loaded.evidence if loaded else {}
+    return [
+        check("nginx restart operation status is completed", queue.get_day2_status(operation.operation_id) == "completed"),
+        check("nginx restart result is stored", loaded is not None and loaded.status == "completed"),
+        check("nginx restart uses retained runner key", loaded is not None and evidence.get("action") == "service_restarted"),
+        check("nginx restart command restarts service", any("systemctl restart nginx" in command for command in commands)),
+        check("nginx restart verifies local HTTP", any("curl -fsS -o /dev/null http://127.0.0.1" in command for command in commands)),
+    ]
+
+
+def test_day2_vm_lifecycle_operations_use_virtualbox() -> list[bool]:
+    fake = FakeRedis()
+    queue = RedisProvisioningJobQueue(client=fake, ttl_seconds=1800)
+    operations = [
+        queue.enqueue_day2_operation(
+            session_id="session-day2-lifecycle",
+            operation=operation_name,
+            target="virtualbox_vm",
+            instance_id="ava-web-lifecycle",
+            instance_name="ava-web-lifecycle",
+            ssh_host="127.0.0.1",
+            ssh_port=2222,
+            http_port=8080,
+            metadata={"approval_id": f"approve-{operation_name}"},
+        )
+        for operation_name in ("stop_vm", "start_vm", "delete_vm")
+    ]
+
+    class MockAdapter:
+        def __init__(self):
+            self.exists = True
+            self.power_state = "running"
+            self.calls: list[str] = []
+
+        def get_instance_state(self, iid):
+            return SimpleNamespace(
+                instance_id=iid,
+                exists=self.exists,
+                power_state=self.power_state,
+                provider_status="running" if self.exists else "missing",
+                raw={"source": "mock"},
+            )
+
+        def stop_instance(self, iid):
+            self.calls.append("stop")
+            self.power_state = "poweroff"
+
+        def start_instance(self, iid):
+            self.calls.append("start")
+            self.exists = True
+            self.power_state = "running"
+
+        def destroy_instance(self, iid):
+            self.calls.append("destroy")
+            self.exists = False
+            self.power_state = "missing"
+
+    runner = HostRunner.__new__(HostRunner)
+    runner.queue = queue
+    runner.config = HostRunnerConfig(
+        vboxmanage="VBoxManage",
+        ssh_binary="ssh",
+        ssh_keygen="ssh-keygen",
+        template_name="ubuntu-cloud-image",
+        work_root=Path(tempfile.gettempdir()) / "ava-day2-lifecycle-test",
+        log_path=Path(tempfile.gettempdir()) / "ava-day2-lifecycle-test.log",
+        retain_debug=False,
+        timeout_seconds=30,
+        max_jobs=1,
+    )
+    adapter = MockAdapter()
+    runner.adapter = adapter
+    runner.logger = logging.getLogger("ava.test.day2_lifecycle")
+
+    import provisioning.runner.host_runner as hr_mod
+
+    original_validate = HostRunner._validate_vboxmanage
+    original_sleep = hr_mod.time.sleep
+    try:
+        HostRunner._validate_vboxmanage = lambda self: None
+        hr_mod.time.sleep = lambda seconds: None
+        for _operation in operations:
+            claimed = queue.claim_next_day2_operation(timeout_seconds=1)
+            runner.execute_day2_operation(claimed)
+    finally:
+        HostRunner._validate_vboxmanage = original_validate
+        hr_mod.time.sleep = original_sleep
+
+    stop_result = queue.get_day2_result(operations[0].operation_id)
+    start_result = queue.get_day2_result(operations[1].operation_id)
+    delete_result = queue.get_day2_result(operations[2].operation_id)
+    return [
+        check("VM stop operation completes", queue.get_day2_status(operations[0].operation_id) == "completed"),
+        check("VM start operation completes", queue.get_day2_status(operations[1].operation_id) == "completed"),
+        check("VM delete operation completes", queue.get_day2_status(operations[2].operation_id) == "completed"),
+        check("VM lifecycle calls VirtualBox adapter in order", adapter.calls == ["stop", "start", "destroy"], str(adapter.calls)),
+        check("VM stop evidence records stopped state", stop_result is not None and stop_result.evidence["after"]["power_state"] == "poweroff"),
+        check("VM start evidence records running state", start_result is not None and start_result.evidence["after"]["power_state"] == "running"),
+        check("VM delete evidence records absent state", delete_result is not None and delete_result.evidence["after"]["exists"] is False),
     ]
 
 
@@ -1234,6 +1518,12 @@ def main() -> int:
     print("\n--- runner verification key auth (Phase 9 fix: ava-runner user, no PAM expiry) ---")
     failures.extend(test_runner_verification_uses_key_auth())
     failures.extend(test_cloud_init_marker_stdout_wins_over_ssh_close_timeout())
+    failures.extend(test_web_server_preflight_waits_for_guest_readiness())
+    failures.extend(test_web_server_preflight_marker_survives_ssh_close_timeout())
+    failures.extend(test_guest_readiness_failure_is_recoverable())
+
+    print("\n--- stale runner protection (Phase 9 fix: heartbeat code fingerprint) ---")
+    failures.extend(test_runner_heartbeat_advertises_code_fingerprint())
 
     print("\n--- seed.iso cleanup retry (Phase 9 fix: WinError 32 race with VBoxSVC) ---")
     failures.extend(test_seed_iso_cleanup_retries_on_permission_error())
@@ -1251,6 +1541,8 @@ def main() -> int:
     failures.extend(test_web_console_subprocess_uses_utf8_and_disables_pagers())
     failures.extend(test_web_console_ui_normalizes_duplicate_prompts())
     failures.extend(test_day2_nginx_logs_uses_retained_runner_key())
+    failures.extend(test_day2_restart_nginx_uses_retained_runner_key())
+    failures.extend(test_day2_vm_lifecycle_operations_use_virtualbox())
     failures.extend(test_windows_runner_key_acl_command_restricts_private_key())
     failures.extend(test_day2_key_lookup_self_heals_private_key_permissions())
     failures.extend(test_day2_nginx_logs_fail_without_runner_key())

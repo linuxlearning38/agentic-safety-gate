@@ -3,10 +3,36 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from provisioning.bootstrap import SSHCommandResult, SSHExecutor
 
 from .base import BootstrapCommand, RoleDefinition
+
+
+GUEST_PREFLIGHT_COMMAND = (
+    "current_user=$(id -un 2>/dev/null || true); "
+    "if [ \"$current_user\" != 'ava-runner' ]; then "
+    "echo \"Guest readiness short check failed: unexpected_user:$current_user\" >&2; exit 1; "
+    "fi; "
+    "if ! timeout 5s sudo -n true >/dev/null 2>&1; then "
+    "echo 'Guest readiness short check failed: passwordless_sudo_not_ready' >&2; exit 1; "
+    "fi; "
+    "if systemctl is-active --quiet ssh 2>/dev/null || "
+    "systemctl is-active --quiet sshd 2>/dev/null || "
+    "pgrep -x sshd >/dev/null 2>&1; then "
+    "echo AVA_GUEST_READY; exit 0; "
+    "fi; "
+    "echo 'Guest readiness short check failed: ssh_service_not_active' >&2; "
+    "echo \"user=$(id -un 2>/dev/null || true)\" >&2; "
+    "timeout 5s sudo -n true >/dev/null 2>&1 && "
+    "echo 'sudo_nopasswd=ok' >&2 || echo 'sudo_nopasswd=failed' >&2; "
+    "echo \"ssh_active=$(systemctl is-active ssh 2>/dev/null || true)\" >&2; "
+    "echo \"sshd_active=$(systemctl is-active sshd 2>/dev/null || true)\" >&2; "
+    "pgrep -a sshd >&2 || true; "
+    "cloud-init status --long >&2 || true; "
+    "exit 1"
+)
 
 
 WEB_SERVER_ROLE = RoleDefinition(
@@ -19,17 +45,9 @@ WEB_SERVER_ROLE = RoleDefinition(
     bootstrap_steps=(
         BootstrapCommand(
             name="preflight",
-            command=(
-                "for i in $(seq 1 24); do "
-                "whoami >/dev/null 2>&1 && "
-                "sudo -n true >/dev/null 2>&1 && "
-                "systemctl is-active ssh >/dev/null 2>&1 && exit 0; "
-                "sleep 5; "
-                "done; "
-                "whoami; sudo -n true; systemctl is-active ssh"
-            ),
-            timeout_seconds=150,
-            failure_class="ssh_auth_failed",
+            command=GUEST_PREFLIGHT_COMMAND,
+            timeout_seconds=90,
+            failure_class="guest_readiness_timeout",
         ),
         BootstrapCommand(
             name="network_ready",
@@ -124,12 +142,24 @@ class WebServerRole:
 
     definition: RoleDefinition = WEB_SERVER_ROLE
 
-    def bootstrap(self, executor: SSHExecutor) -> list[SSHCommandResult]:
+    def bootstrap(
+        self,
+        executor: SSHExecutor,
+        heartbeat: Callable[[], None] | None = None,
+    ) -> list[SSHCommandResult]:
         """Run bootstrap and role-local verification steps in locked order."""
 
         results: list[SSHCommandResult] = []
         for step in (*self.definition.bootstrap_steps, *self.definition.verification_checks):
+            if heartbeat is not None:
+                heartbeat()
             result = executor.run(step.command, timeout_seconds=step.timeout_seconds)
+            if heartbeat is not None:
+                heartbeat()
+            if step.name == "preflight" and "AVA_GUEST_READY" in (result.stdout or ""):
+                result.exit_code = 0
+                result.timed_out = False
+                result.failure_class = None
             if result.exit_code != 0 and result.failure_class is None:
                 result.failure_class = step.failure_class
             results.append(result)

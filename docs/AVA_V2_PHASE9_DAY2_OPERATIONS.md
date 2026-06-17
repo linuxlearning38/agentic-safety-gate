@@ -378,3 +378,57 @@ After Phase 9 Day-2 Operations, the next recommended product sequence is:
 3. Reverse proxy role.
 4. Multi-VM web + DB orchestration.
 5. Day-2 operations generalized across all roles.
+
+---
+
+## Current Addendum: Server Inventory And Named Targets (2026-06-15)
+
+Day-2 Operations now includes the first local server inventory behavior for
+AVA-created VirtualBox VMs. This is still scoped to AVA-managed servers, not an
+arbitrary fleet agent.
+
+Implemented or validated behavior:
+
+- AVA can list completed AVA-managed web servers from durable provisioning
+  evidence.
+- The Windows host runner heartbeat now includes a live VirtualBox inventory
+  snapshot for AVA-managed VM names, including provider status and power state
+  when available.
+- `list my servers`, `show offline servers`, and related inventory prompts can
+  show whether an AVA-managed VM is running, powered off, saved, or otherwise
+  unavailable.
+- AVA can resolve named targets such as `ava-web-03` before running Day-2
+  operations.
+- Read-only operations such as status, verify, logs, and Web Console can target
+  a named VM.
+- Mutating operations such as restart, stop, start, snapshot, rollback, and
+  delete remain approval-gated.
+- Delete is treated as a high-risk operation because it removes the VirtualBox
+  VM and disk files.
+- If the user asks to start, stop, or delete a server without naming the VM, AVA
+  asks for the exact hostname instead of guessing.
+- Manual deletion in VirtualBox is treated as an out-of-band change; AVA must
+  reconcile through live runner truth before relying on stored evidence.
+
+Recommended operator prompts:
+
+- `list my servers`
+- `show offline servers`
+- `show status of ava-web-03`
+- `verify ava-web-03`
+- `show nginx logs for ava-web-03`
+- `open web console for ava-web-03`
+- `restart nginx on ava-web-03`
+- `stop ava-web-03`
+- `start ava-web-03`
+- `delete ava-web-03`
+
+If AVA asks for a hostname, use an exact command such as:
+
+- `start ava-web-03`
+- `stop encorawebserver`
+- `delete ava-web-03`
+
+This inventory layer is the bridge between Phase 9 web-server provisioning and
+the future multi-server product plan. The next product step is to generalize the
+same inventory contract beyond local VirtualBox web servers.

@@ -596,3 +596,47 @@ This document does not authorize:
 One provider, one role, full lifecycle.
 
 That is the rule.
+
+---
+
+## Architecture Addendum: Current Serving Contract (2026-06-15)
+
+AVA now has a stricter product contract than the first architecture slice:
+AVA must choose the answer mode before producing an answer.
+
+AVA owns:
+
+- exact self/runtime answers
+- grounded DevOps knowledge answers
+- Qwen reasoning delegation
+- provisioning conversation state
+- approval and policy boundaries
+- guarded operational actions
+- Web Console and server-management routing
+- runtime truth reconciliation
+
+Qwen remains a reasoning engine. It is not the owner of runtime truth, policy,
+routing, or approval decisions.
+
+Runtime truth now comes from layered evidence:
+
+- durable provisioning sessions and stored runner results
+- Redis runner status, progress, heartbeat, and operation signals
+- live host-runner checks
+- VirtualBox VM state
+- guest SSH and HTTP verification
+
+Product rule:
+
+- old chat history and stored evidence may explain what happened before
+- live checks decide what is true now when AVA is about to block, operate on, or
+  open a console to a server
+- if live truth is unavailable, AVA must say what dependency is missing instead
+  of pretending the state is certain
+
+This is the current separation:
+
+- AVA is the decision-maker and safety boundary.
+- Qwen is the reasoning helper.
+- The host runner is the execution bridge.
+- VirtualBox and the guest VM are managed targets.

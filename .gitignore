@@ -13,10 +13,19 @@ venv/
 
 # Environment & secrets
 .env
+*.env
 *.key
 *.pem
 *.crt
 certs/
+
+# VM disk images and seed ISOs (never commit these)
+*.vdi
+*.vmdk
+*.vhd
+*.iso
+seed/
+cloud-init-seed/
 
 # Runtime data files
 query_history.json

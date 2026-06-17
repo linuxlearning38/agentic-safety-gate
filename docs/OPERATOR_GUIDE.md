@@ -37,6 +37,14 @@ confirmation.
 ```powershell
 .\scripts\install-runner-task.ps1
 ```
+This installs a delayed Windows logon startup path for AVA. The delay is
+intentional: after reboot, Docker Desktop and WSL2 can need a short warm-up
+before Redis is stable enough for the host runner heartbeat.
+
+Verify the startup hooks anytime:
+```powershell
+.\scripts\check-ava-autostart.ps1
+```
 
 **5. Start AVA for the first time:**
 ```powershell
@@ -61,6 +69,13 @@ This handles everything:
 - Waits for the health check to pass
 - Starts the VM provisioning runner in the background
 - Lets AVA verify the runner heartbeat before accepting VM approvals
+
+If you installed the startup hooks, Windows should run this automatically after
+login. If AVA opens but provisioning says the runner is unhealthy, run the
+read-only checker first:
+```powershell
+.\scripts\check-ava-autostart.ps1
+```
 
 ---
 
@@ -170,8 +185,119 @@ run the migration script instead of silently starting with empty state.
 |--------|-------------|
 | `start-ava.ps1` | Every startup / after reboot |
 | `install-runner-task.ps1` | Once, on first setup |
+| `check-ava-autostart.ps1` | Read-only check for startup task, AVA health, and runner heartbeat |
 | `check-ava-storage.ps1` | Read-only storage and volume diagnostic |
 | `migrate-ava-data-to-volume.ps1` | Optional legacy data migration; dry-run by default |
 | `sync-ollama-host.ps1` | If Ollama is unreachable after WSL restart |
 | `cleanup-stale-seeds.ps1` | If `.ava-runner/` has stale seed.iso files |
 | `start_host_runner.ps1` | If runner is not running (normally automatic) |
+
+---
+
+## Current Provisioning Flow (2026-06-15)
+
+The current AVA flow separates approval from execution so the product does not
+create VMs before the user is ready.
+
+1. Ask AVA for a server:
+   ```
+   i want a web server
+   ```
+2. Provide specs:
+   ```
+   2 CPU, 4 GB RAM, 30 GB disk, hostname ava-web-03
+   ```
+3. AVA prints an approval ID and the exact approval phrase:
+   ```
+   approve <approval_id>
+   ```
+4. After approval, AVA records consent only and asks for:
+   ```
+   continue provisioning
+   ```
+5. AVA checks the Windows host runner, issues the one-time temporary password,
+   queues the VirtualBox job, and starts showing progress.
+6. Provisioning usually takes 3-8 minutes depending on VirtualBox boot time and
+   Ubuntu cloud-init.
+7. AVA posts a completed or failed result automatically when the runner writes
+   the final status. You can also ask:
+   ```
+   provisioning status
+   ```
+8. When complete, AVA shows the VM name, SSH/PuTTY port, username, and web URL.
+9. To access the server from the browser, type:
+   ```
+   open web console
+   ```
+   If more than one AVA-managed server exists, name the target:
+   ```
+   open web console for ava-web-03
+   ```
+
+### Demo-safe behavior
+
+- If a completed AVA-managed web server already exists, AVA will not create a
+  second one from a generic `i want a web server` prompt.
+- To intentionally create another server, say `create another web server` and
+  include specs.
+- Do not reuse an existing AVA-managed hostname. AVA should block duplicate
+  hostnames before credentials are issued.
+- To review existing AVA-managed servers, ask:
+  ```
+  list my servers
+  ```
+- To find servers that are powered off, saved, or otherwise not ready, ask:
+  ```
+  show offline servers
+  ```
+- AVA reports live VirtualBox power state when the host runner is online. If a
+  server is offline, AVA should guide the operator to use exact hostname
+  commands such as:
+  ```
+  start ava-web-03
+  stop ava-web-03
+  delete ava-web-03
+  ```
+- If the operator asks `start server`, `stop server`, or `delete server`
+  without a hostname, AVA should ask which VM to target. AVA should not guess.
+- Prefer deleting AVA-created VMs through AVA when that flow is available. If
+  you manually delete a VM in VirtualBox, ask AVA to verify or start a fresh
+  provisioning request so stale stored history can be reconciled.
+
+### Runner startup warning
+
+If startup prints:
+
+```
+WARNING: Host runner did not publish a heartbeat within 15s.
+```
+
+AVA may still load in the browser, but provisioning and Web Console operations
+will not work until the Windows host runner is online. First run the read-only
+startup checker:
+
+```powershell
+.\scripts\check-ava-autostart.ps1
+```
+
+If the scheduled task or Startup-folder fallback is missing, reinstall the
+startup hooks:
+
+```powershell
+.\scripts\install-runner-task.ps1
+```
+
+If the hooks exist but the heartbeat is still missing, check the startup log
+files shown by the script, then run:
+
+```powershell
+.\scripts\start-ava.ps1
+```
+
+If needed, start the runner directly:
+
+```powershell
+.\scripts\start_host_runner.ps1
+```
+
+The safe product behavior is: no runner heartbeat means no VM provisioning.
