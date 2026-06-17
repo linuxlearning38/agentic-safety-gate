@@ -1156,6 +1156,8 @@ def main() -> int:
         diagram_route = route_query("ava linux provisioning diagram")
         failures.append(check("provisioning diagram stays architecture/diagram", diagram_route.intent == "architecture", diagram_route.intent or "none"))
 
+        failures.extend(test_template_protection(temp_dir))
+
         failed = len([item for item in failures if not item])
         if failed:
             print(f"\nProvisioning Phase 6 serving regression failed: {failed} issue(s)")
@@ -1168,6 +1170,94 @@ def main() -> int:
         else:
             os.environ["APPROVAL_QUEUE_PATH"] = old_queue
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def test_template_protection(temp_dir: Path) -> list[bool]:
+    template_vm = os.getenv("AVA_VBOX_TEMPLATE_NAME", "ubuntu-cloud-image").strip() or "ubuntu-cloud-image"
+    normal_vm = "ava-web-06"
+
+    # Heartbeat starts WITHOUT the VMs in live inventory so the provisioning
+    # flow's _runner_vm_name_conflict check doesn't block provisioning them.
+    tpl_queue = FakeProvisioningJobQueue(
+        runner_heartbeat={
+            "status": "idle",
+            "updated_at": "2026-06-17T00:00:00+00:00",
+            "metadata": {
+                "template_name": template_vm,
+                "registered_vm_inventory": [],
+            },
+        }
+    )
+    tpl_service = ProvisioningChatService(
+        temp_dir / "template_protection_sessions.sqlite3",
+        job_queue=tpl_queue,
+    )
+
+    def _provision(user_id: str, vm_name: str, job_id: str, ssh_port: int, http_port: int) -> None:
+        tpl_service.handle(user_id, "I want a web server", route_intent="provisioning")
+        specs = tpl_service.handle(user_id, f"2 CPU, 4 GB RAM, 30 GB disk, hostname {vm_name}", route_intent=None)
+        aid = specs.metadata["provisioning"]["approval_id"]
+        tpl_service.handle(user_id, f"approve {aid}", route_intent=None)
+        tpl_service.handle(user_id, "continue provisioning", route_intent=None)
+        tpl_service.handle(user_id, "I logged in and changed the password", route_intent=None)
+        tpl_service.handle(user_id, "yes harden it", route_intent=None)
+        tpl_queue.write_status(job_id, "completed")
+        tpl_queue.write_result(
+            ProvisioningJobResult(
+                job_id=job_id,
+                instance_id=vm_name,
+                instance_name=vm_name,
+                ssh_host="127.0.0.1",
+                ssh_port=ssh_port,
+                http_port=http_port,
+                verification_evidence={"checks": [{"name": "host_http_200", "passed": True, "evidence": "HTTP 200"}]},
+                completion_timestamp="2026-06-17T00:10:00+00:00",
+                error=None,
+            )
+        )
+
+    _provision("user-tpl", template_vm, "job-0001", 2222, 8080)
+    _provision("user-normal", normal_vm, "job-0002", 2223, 8081)
+
+    # Now expose both VMs in the live inventory so the inventory and guard
+    # code can see them.  template_name stays the same.
+    tpl_queue.runner_heartbeat = {
+        "status": "idle",
+        "updated_at": "2026-06-17T01:00:00+00:00",
+        "metadata": {
+            "template_name": template_vm,
+            "registered_vm_inventory": [
+                {"name": template_vm, "exists": True, "power_state": "poweroff", "provider_status": "poweroff"},
+                {"name": normal_vm, "exists": True, "power_state": "running", "provider_status": "running"},
+            ],
+        },
+    }
+
+    # --- delete on template: must be refused, NO approval created ---
+    day2_jobs_before = len(tpl_queue.day2_jobs)
+    tpl_delete = tpl_service.handle("user-tpl", f"delete {template_vm}", route_intent=None)
+    day2_jobs_after = len(tpl_queue.day2_jobs)
+
+    # --- delete on normal VM: must still create an approval ---
+    normal_delete = tpl_service.handle("user-normal", f"delete {normal_vm}", route_intent=None)
+    normal_delete_approval_id = normal_delete.metadata.get("provisioning", {}).get("approval_id")
+
+    # --- inventory: template must be labelled protected, no delete/start suggestion ---
+    tpl_inventory = tpl_service.handle("user-tpl", "list my servers", route_intent=None)
+
+    return [
+        check("template delete is refused fail-closed", "refused" in tpl_delete.response.lower()),
+        check("template delete names the template in refusal", template_vm in tpl_delete.response),
+        check("template delete explains provisioning risk", "provisioning template" in tpl_delete.response.lower()),
+        check("template delete response has no approval-required text", "approval required" not in tpl_delete.response.lower()),
+        check("template delete queues no day2 runner job", day2_jobs_after == day2_jobs_before),
+        check("normal VM delete still requires approval (unaffected)", "approval required" in normal_delete.response.lower()),
+        check("normal VM delete approval id is present (unaffected)", bool(normal_delete_approval_id)),
+        check("inventory labels template as protected clone source", "role: template (protected clone source)" in tpl_inventory.response.lower()),
+        check("inventory shows protected warning for template", "protected: this is the provisioning template" in tpl_inventory.response.lower()),
+        check("inventory contains no delete suggestion for template", f"delete {template_vm}" not in tpl_inventory.response.lower()),
+        check("inventory contains no start suggestion for template", f"start {template_vm}" not in tpl_inventory.response.lower()),
+    ]
 
 
 if __name__ == "__main__":
