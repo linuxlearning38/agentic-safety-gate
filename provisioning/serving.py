@@ -307,6 +307,7 @@ class ProvisioningChatService:
         recent_sessions = getattr(self.sessions, "list_recent", lambda *_args, **_kwargs: [])(user_id, limit=25)
         inventory_snapshot = self._runner_inventory_snapshot()
         live_inventory = inventory_snapshot["entries"]
+        template_name = inventory_snapshot.get("template_name") or ""
         managed_by_name: dict[str, dict[str, Any]] = {}
         for session in recent_sessions:
             runner = self._runner_snapshot(session)
@@ -352,6 +353,7 @@ class ProvisioningChatService:
                     "runner_inventory_updated_at": inventory_snapshot["updated_at"],
                     "power_state": str(live_entry.get("power_state") or "not checked"),
                     "provider_status": str(live_entry.get("provider_status") or "not checked"),
+                    "is_template": bool(template_name and _normalize(vm_name) == _normalize(template_name)),
                 }
             )
         return rows
@@ -408,6 +410,7 @@ class ProvisioningChatService:
             "stale": stale,
             "updated_at": updated_at,
             "entries": inventory,
+            "template_name": str(metadata.get("template_name") or ""),
         }
 
     def _runner_virtualbox_inventory(self) -> dict[str, dict[str, Any]]:
@@ -435,7 +438,12 @@ class ProvisioningChatService:
             result = row.get("result")
             web_url = f"http://127.0.0.1:{result.http_port}/" if result and result.http_port else "not known to AVA"
             ssh = f"{result.ssh_host}:{result.ssh_port}" if result and result.ssh_host and result.ssh_port else "not known to AVA"
-            managed_text = "yes" if row.get("ava_managed") else "no - visible in VirtualBox only"
+            if row.get("is_template"):
+                managed_text = "Role: template (protected clone source)"
+            elif row.get("ava_managed"):
+                managed_text = "yes"
+            else:
+                managed_text = "no - visible in VirtualBox only"
             lines.extend(
                 [
                     f"{index}. `{row['vm_name']}`",
@@ -449,14 +457,21 @@ class ProvisioningChatService:
                     "",
                 ]
             )
-            if not row.get("ava_managed"):
+            if row.get("is_template"):
+                lines.extend(
+                    [
+                        "  Protected: this is the provisioning template — keep it powered off.",
+                        "",
+                    ]
+                )
+            elif not row.get("ava_managed"):
                 lines.extend(
                     [
                         "  AVA can see this VM in VirtualBox, but it does not have provisioning credentials or web evidence for it yet.",
                         "",
                     ]
                 )
-            if _power_state_needs_operator_choice(row["power_state"]):
+            if not row.get("is_template") and _power_state_needs_operator_choice(row["power_state"]):
                 lines.extend(
                     [
                         f"  `{row['vm_name']}` is not running. Say `start {row['vm_name']}` to power it on, "
@@ -823,6 +838,16 @@ class ProvisioningChatService:
                 session,
             )
 
+        _template_name = self._runner_inventory_snapshot().get("template_name") or ""
+        _instance_name = str(result.instance_name or "")
+        if _template_name and _normalize(_instance_name) == _normalize(_template_name):
+            if operation.operation == "delete_vm":
+                return self._result(
+                    f"Refused: `{_instance_name}` is the provisioning template (clone source). "
+                    "Deleting it would break all future VM creation.",
+                    session,
+                )
+
         approval_id = approval.add_request(
             f"day2:{operation.operation}:{result.instance_name or result.instance_id}",
             normalized,
@@ -842,11 +867,13 @@ class ProvisioningChatService:
                 "http_port": result.http_port,
             },
         )
-        return self._result(
-            format_approval_required_response(operation, session=session, result=result, approval_id=approval_id),
-            session,
-            approval_id=approval_id,
-        )
+        response_text = format_approval_required_response(operation, session=session, result=result, approval_id=approval_id)
+        if _template_name and _normalize(_instance_name) == _normalize(_template_name) and operation.operation == "start_vm":
+            response_text += (
+                f"\n\n**Warning:** `{_instance_name}` is the provisioning template. "
+                "Starting it locks the disk and blocks new clones until it is powered off again."
+            )
+        return self._result(response_text, session, approval_id=approval_id)
 
     def _maybe_handle_day2_approval(
         self,
