@@ -539,3 +539,105 @@ Initial v2.1 focus:
 
 This comes before PostgreSQL or multi-VM work because every future server role
 will need the same Day-2 management layer.
+
+---
+
+## Current Product Contract Addendum (2026-06-15)
+
+This addendum records the later Phase 9 reliability and UX work that happened
+after the original v2.0.0/v2.0.1 milestone notes. It is intentionally additive:
+older sections above remain as historical context.
+
+### Provisioning conversation contract
+
+The active provisioning flow is now deliberately two-step:
+
+1. AVA creates a plan and prints the exact approval phrase:
+   `approve <approval_id>`.
+2. Approval records consent only. No VM is created and no password is issued at
+   this point.
+3. AVA then asks the user to reply `continue provisioning`.
+4. `continue provisioning` checks that the Windows host runner heartbeat is
+   healthy.
+5. Only after the runner is healthy does AVA issue the one-time temporary
+   password, queue the runner job, and report that provisioning is in progress.
+6. A lightweight background watcher posts a final completed/failed message when
+   the runner writes the result.
+
+This change prevents the old failure mode where AVA showed credentials and a
+queued job even though no host runner was available to create the VM.
+
+### Live progress and readiness
+
+Status responses now expose the runner's current stage when provisioning is
+still active. Examples include `queued`, `provisioning`, `ssh_ready`,
+`bootstrapping`, `completed`, and `failed`.
+
+While a VM is visible but not fully ready, AVA may show provisional connection
+details from runner progress, but Web Console remains gated until completed
+runner evidence exists. The boundary is:
+
+- visible VM is not enough
+- SSH TCP reachable is not enough
+- completed bootstrap, hardening, and HTTP verification are required before AVA
+  treats the server as ready
+
+### Duplicate and stale server safety
+
+Phase 9 now protects against common demo and operator mistakes:
+
+- `i want a web server` will not create a second AVA-managed web server by
+  accident if a completed web server is already attached.
+- `create another web server` is treated as an intentional provisioning request,
+  not as a generic DevOps question.
+- Requested hostnames are checked before execution. If an AVA-managed completed
+  server already uses the hostname, AVA blocks the duplicate before issuing
+  credentials or queueing the runner.
+- The Windows host runner also publishes registered VirtualBox VM names in its
+  heartbeat, so AVA can block a duplicate hostname even when the VM exists in
+  local infrastructure but is not attached to the current AVA session.
+- The host runner heartbeat now includes VirtualBox inventory details for
+  registered VM names, including power state and provider status when available.
+  This lets AVA distinguish running, powered-off, saved, deleted, and stale
+  server states before presenting Day-2 actions.
+- Manual VirtualBox deletion is reconciled through live runner truth instead of
+  trusting old stored evidence forever.
+- Failed or expired runner state is reflected back into the provisioning
+  session so stale Redis TTL expiry does not permanently block new requests.
+
+### Multi-server operation boundary
+
+AVA can now work with more than one AVA-created server in a local VirtualBox
+environment. The current supported pattern is name-based targeting:
+
+- `list my servers`
+- `show offline servers`
+- `verify ava-web-03`
+- `show nginx logs for ava-web-03`
+- `open web console for ava-web-03`
+- `restart nginx on ava-web-03`
+- `stop ava-web-03`
+- `start ava-web-03`
+- `delete ava-web-03`
+
+The Web Console opens the latest completed VM by default only when that is
+unambiguous. When more than one server exists, the product-safe instruction is
+to name the target server.
+
+For lifecycle commands, AVA should require an exact VM hostname before queuing
+approval. If the user says `start server`, `stop server`, or `delete server`,
+AVA should list available AVA-managed targets with their current power state and
+ask for a precise command such as `start ava-web-03`. This avoids accidental
+power or deletion actions against the wrong VM.
+
+### Current known boundaries
+
+- The current role is still `web_server` on Ubuntu/VirtualBox.
+- The browser Web Console is for AVA-managed VMs, not arbitrary public SSH
+  targets.
+- Manual public-IP SSH console support is a future feature and must include
+  allowlist policy, approval, host-key warnings, no password persistence, and
+  audit records.
+- Full PuTTY-speed terminal behavior needs the future xterm/WebSocket transport.
+  The current console is usable for common commands but remains an intermediate
+  browser terminal.

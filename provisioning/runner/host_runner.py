@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import hashlib
+import inspect
 import json
 import logging
 import os
@@ -28,6 +31,13 @@ from .result_writer import ProvisioningResultWriter
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _runner_code_fingerprint() -> str:
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
 
 
 def _utc_now() -> str:
@@ -118,6 +128,17 @@ def _lock_down_private_key(path: Path) -> None:
         pass
 
 
+def _provider_state_dict(state) -> dict[str, object]:
+    """Return a small, serializable provider state for Day-2 evidence."""
+    return {
+        "instance_id": getattr(state, "instance_id", None),
+        "exists": bool(getattr(state, "exists", False)),
+        "power_state": getattr(state, "power_state", None),
+        "provider_status": getattr(state, "provider_status", None),
+        "raw": getattr(state, "raw", None),
+    }
+
+
 def _wait_for_tcp(host: str, port: int, timeout_seconds: int, *, heartbeat: Callable[[], None] | None = None) -> bool:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -164,19 +185,37 @@ def _wait_for_executor_command(
     redact: tuple[str, ...],
     heartbeat: Callable[[], None] | None = None,
     success_stdout_contains: str | None = None,
+    attempt_timeout_seconds: int = 30,
 ):
     deadline = time.monotonic() + timeout_seconds
     last_result = None
     while time.monotonic() < deadline:
         if heartbeat:
             heartbeat()
-        last_result = executor.run(command, timeout_seconds=30, redact_patterns=redact)
+        last_result = executor.run(command, timeout_seconds=attempt_timeout_seconds, redact_patterns=redact)
         if success_stdout_contains and success_stdout_contains in (last_result.stdout or ""):
-            return last_result
+            # The guest printed the agreed marker, so treat late SSH close
+            # timeouts as successful readiness instead of failing the VM.
+            return replace(last_result, exit_code=0, timed_out=False, failure_class=None)
         if last_result.exit_code == 0:
             return last_result
         time.sleep(8)
     return last_result
+
+
+RECOVERABLE_GUEST_FAILURE_CLASSES = {
+    "guest_readiness_timeout",
+    "guest_network_not_ready",
+    "guest_bootstrap_not_ready",
+}
+
+
+class RecoverableGuestReadinessError(RuntimeError):
+    """A VM exists, but the guest OS did not become safely manageable in time."""
+
+
+def _is_recoverable_guest_failure(failure_class: str) -> bool:
+    return failure_class in RECOVERABLE_GUEST_FAILURE_CLASSES
 
 
 def _write_cloud_init_seed(seed_dir: Path, vm_name: str, username: str, password: str, public_key: str) -> None:
@@ -295,30 +334,34 @@ class HostRunner:
 
     def run_forever(self) -> None:
         processed = 0
-        self.logger.info("AVA host runner started")
+        self.logger.info("AVA host runner started fingerprint=%s", _runner_code_fingerprint())
         while True:
-            self._write_idle_heartbeat()
-            if self.config.max_jobs is not None and processed >= self.config.max_jobs:
-                self.logger.info("Max jobs reached; exiting")
-                return
-            console = self.queue.claim_next_console_session(timeout_seconds=1)
-            if console is not None:
-                self._start_console_session(console)
-                continue
-            operation = self.queue.claim_next_day2_operation(timeout_seconds=1)
-            if operation is not None:
-                self._write_day2_processing_heartbeat(operation)
+            try:
+                self._write_idle_heartbeat()
+                if self.config.max_jobs is not None and processed >= self.config.max_jobs:
+                    self.logger.info("Max jobs reached; exiting")
+                    return
+                console = self.queue.claim_next_console_session(timeout_seconds=1)
+                if console is not None:
+                    self._start_console_session(console)
+                    continue
+                operation = self.queue.claim_next_day2_operation(timeout_seconds=1)
+                if operation is not None:
+                    processed += 1
+                    with self._day2_heartbeat_loop(operation):
+                        self.execute_day2_operation(operation)
+                    continue
+                # Keep post-provisioning operations responsive even when no new
+                # provisioning job is available.
+                job = self.queue.claim_next_job(timeout_seconds=min(self.config.poll_timeout_seconds, 5))
+                if job is None:
+                    continue
                 processed += 1
-                self.execute_day2_operation(operation)
-                continue
-            # Keep post-provisioning operations responsive even when no new
-            # provisioning job is available.
-            job = self.queue.claim_next_job(timeout_seconds=min(self.config.poll_timeout_seconds, 5))
-            if job is None:
-                continue
-            self._write_processing_heartbeat(job)
-            processed += 1
-            self.execute_job(job)
+                with self._job_heartbeat_loop(job):
+                    self.execute_job(job)
+            except Exception as exc:
+                self.logger.warning("Host runner loop recovered after queue/heartbeat error: %s", exc)
+                time.sleep(3)
 
     def run_once(self) -> bool:
         self._write_idle_heartbeat()
@@ -328,46 +371,143 @@ class HostRunner:
             return True
         operation = self.queue.claim_next_day2_operation(timeout_seconds=1)
         if operation is not None:
-            self._write_day2_processing_heartbeat(operation)
-            self.execute_day2_operation(operation)
+            with self._day2_heartbeat_loop(operation):
+                self.execute_day2_operation(operation)
             return True
         job = self.queue.claim_next_job(timeout_seconds=min(self.config.poll_timeout_seconds, 5))
         if job is None:
             return False
-        self._write_processing_heartbeat(job)
-        self.execute_job(job)
+        with self._job_heartbeat_loop(job):
+            self.execute_job(job)
         return True
+
+    def _base_heartbeat_metadata(self, **extra: Any) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "pid": os.getpid(),
+            "runner_code_fingerprint": _runner_code_fingerprint(),
+            "runner_source": str(Path(__file__).resolve()),
+            "template_name": self.config.template_name,
+            "work_root": str(self.config.work_root),
+        }
+        metadata.update(extra)
+        return metadata
+
+    def _heartbeat_metadata(self, **extra: Any) -> dict[str, Any]:
+        metadata = self._base_heartbeat_metadata(**extra)
+        try:
+            registered_vms = self.adapter.list_registered_vm_names()
+            metadata["registered_vms"] = registered_vms
+            inventory: list[dict[str, Any]] = []
+            for vm_name in registered_vms:
+                entry: dict[str, Any] = {"name": vm_name}
+                try:
+                    state = self.adapter.get_instance_state(vm_name)
+                    entry.update(
+                        {
+                            "exists": bool(state.exists),
+                            "power_state": state.power_state,
+                            "provider_status": state.provider_status,
+                        }
+                    )
+                except Exception as exc:
+                    entry.update(
+                        {
+                            "exists": None,
+                            "power_state": "unknown",
+                            "provider_status": "unknown",
+                            "error": str(exc),
+                        }
+                    )
+                inventory.append(entry)
+            metadata["registered_vm_inventory"] = inventory
+        except Exception as exc:
+            metadata["registered_vms_error"] = str(exc)
+        return metadata
 
     def _write_idle_heartbeat(self) -> None:
         self.queue.write_runner_heartbeat(
             "idle",
-            {
-                "pid": os.getpid(),
-                "template_name": self.config.template_name,
-                "work_root": str(self.config.work_root),
-            },
+            self._heartbeat_metadata(),
         )
 
-    def _write_processing_heartbeat(self, job: ProvisioningJob) -> None:
+    def _write_processing_heartbeat(self, job: ProvisioningJob, *, include_inventory: bool = True) -> None:
+        metadata = (
+            self._heartbeat_metadata(job_id=job.job_id, session_id=job.session_id)
+            if include_inventory
+            else self._base_heartbeat_metadata(job_id=job.job_id, session_id=job.session_id)
+        )
         self.queue.write_runner_heartbeat(
             "processing",
-            {
-                "pid": os.getpid(),
-                "job_id": job.job_id,
-                "session_id": job.session_id,
-            },
+            metadata,
         )
 
-    def _write_day2_processing_heartbeat(self, operation: Day2OperationJob) -> None:
+    def _write_day2_processing_heartbeat(
+        self,
+        operation: Day2OperationJob,
+        *,
+        include_inventory: bool = True,
+    ) -> None:
+        metadata_factory = self._heartbeat_metadata if include_inventory else self._base_heartbeat_metadata
         self.queue.write_runner_heartbeat(
             "server_management",
-            {
-                "pid": os.getpid(),
-                "operation_id": operation.operation_id,
-                "operation": operation.operation,
-                "instance_id": operation.instance_id,
-            },
+            metadata_factory(
+                operation_id=operation.operation_id,
+                operation=operation.operation,
+                instance_id=operation.instance_id,
+            ),
         )
+
+    @contextmanager
+    def _job_heartbeat_loop(self, job: ProvisioningJob, *, interval_seconds: float = 10.0):
+        stop = threading.Event()
+
+        def _pump() -> None:
+            while not stop.wait(interval_seconds):
+                try:
+                    self._write_processing_heartbeat(job, include_inventory=False)
+                except Exception as exc:
+                    self.logger.debug("Processing heartbeat refresh failed for job %s: %s", job.job_id, exc)
+
+        self._write_processing_heartbeat(job)
+        thread = threading.Thread(
+            target=_pump,
+            name=f"ava-job-heartbeat-{job.job_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+
+    @contextmanager
+    def _day2_heartbeat_loop(self, operation: Day2OperationJob, *, interval_seconds: float = 10.0):
+        stop = threading.Event()
+
+        def _pump() -> None:
+            while not stop.wait(interval_seconds):
+                try:
+                    self._write_day2_processing_heartbeat(operation, include_inventory=False)
+                except Exception as exc:
+                    self.logger.debug(
+                        "Server-management heartbeat refresh failed for operation %s: %s",
+                        operation.operation_id,
+                        exc,
+                    )
+
+        self._write_day2_processing_heartbeat(operation)
+        thread = threading.Thread(
+            target=_pump,
+            name=f"ava-day2-heartbeat-{operation.operation_id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=2)
 
     def execute_day2_operation(self, operation: Day2OperationJob) -> None:
         self.logger.info(
@@ -386,10 +526,19 @@ class HostRunner:
                 result = self._execute_nginx_logs(operation)
             elif operation.operation == "open_ssh_console":
                 result = self._execute_open_ssh_console(operation)
+            elif operation.operation == "restart_nginx":
+                result = self._execute_restart_nginx(operation)
+            elif operation.operation == "stop_vm":
+                result = self._execute_stop_vm(operation)
+            elif operation.operation == "start_vm":
+                result = self._execute_start_vm(operation)
+            elif operation.operation == "delete_vm":
+                result = self._execute_delete_vm(operation)
             else:
                 raise RuntimeError(
                     f"Operation '{operation.operation}' is approved but not executable yet. "
-                    "Snapshot, live web verification, nginx log retrieval, and SSH console launch are enabled first."
+                    "Snapshot, live web verification, nginx log retrieval, SSH console launch, "
+                    "nginx restart, VM start/stop, and VM deletion are enabled."
                 )
             self.queue.write_day2_status(operation.operation_id, result.status)
             self.queue.write_day2_result(result)
@@ -776,6 +925,204 @@ class HostRunner:
             },
         )
 
+    def _execute_restart_nginx(self, operation: Day2OperationJob) -> Day2OperationResult:
+        self._validate_binaries()
+        key_path = self._find_runner_key_path(operation)
+        if not key_path:
+            return Day2OperationResult(
+                operation_id=operation.operation_id,
+                operation=operation.operation,
+                status="failed",
+                instance_id=operation.instance_id,
+                instance_name=operation.instance_name,
+                evidence={
+                    "action": "service_restart",
+                    "service": "nginx",
+                    "runner_key_available": False,
+                    "runner": "host_runner",
+                },
+                error={
+                    "message": (
+                        "Runner SSH key is not available for this VM. Restarting nginx "
+                        "requires the retained AVA runner key from provisioning."
+                    ),
+                    "failure_class": "ssh_auth_failed",
+                },
+            )
+
+        connection = self.adapter.get_connection_info(operation.instance_id)
+        executor = SSHExecutor(
+            SSHConnection(
+                host=connection.host,
+                port=connection.port,
+                username="ava-runner",
+                private_key_path=str(key_path),
+                known_hosts_path=str(self.config.work_root / "known_hosts_day2"),
+                ssh_binary=self.config.ssh_binary,
+            )
+        )
+        command = (
+            "sudo systemctl restart nginx && "
+            "systemctl is-active nginx && "
+            "curl -fsS -o /dev/null http://127.0.0.1"
+        )
+        restart_result = executor.run(command, timeout_seconds=60)
+        status = "completed" if restart_result.exit_code == 0 else "failed"
+        return Day2OperationResult(
+            operation_id=operation.operation_id,
+            operation=operation.operation,
+            status=status,
+            instance_id=operation.instance_id,
+            instance_name=operation.instance_name,
+            evidence={
+                "action": "service_restarted",
+                "service": "nginx",
+                "stdout": (restart_result.stdout or "").strip()[:1000],
+                "stderr": (restart_result.stderr or "").strip()[:1000],
+                "ssh_host": operation.ssh_host or connection.host,
+                "ssh_port": operation.ssh_port or connection.port,
+                "runner": "host_runner",
+            },
+            error=None if status == "completed" else {
+                "message": (restart_result.stderr or restart_result.stdout or "nginx restart failed").strip()[:500],
+                "failure_class": restart_result.failure_class or "service_restart_failed",
+            },
+        )
+
+    def _execute_stop_vm(self, operation: Day2OperationJob) -> Day2OperationResult:
+        self._validate_vboxmanage()
+        before = self.adapter.get_instance_state(operation.instance_id)
+        if not before.exists:
+            return self._vm_lifecycle_result(
+                operation,
+                status="completed",
+                action="vm_already_absent",
+                before=before,
+                after=before,
+                message="VM was already absent.",
+            )
+        if before.power_state != "running":
+            return self._vm_lifecycle_result(
+                operation,
+                status="completed",
+                action="vm_already_stopped",
+                before=before,
+                after=before,
+                message="VM was already stopped.",
+            )
+
+        self.adapter.stop_instance(operation.instance_id)
+        after = self._wait_for_vm_state(operation.instance_id, lambda state: not state.exists or state.power_state != "running")
+        completed = not after.exists or after.power_state != "running"
+        return self._vm_lifecycle_result(
+            operation,
+            status="completed" if completed else "failed",
+            action="vm_stopped",
+            before=before,
+            after=after,
+            message="VM stopped." if completed else "VM did not stop before timeout.",
+        )
+
+    def _execute_start_vm(self, operation: Day2OperationJob) -> Day2OperationResult:
+        self._validate_vboxmanage()
+        before = self.adapter.get_instance_state(operation.instance_id)
+        if not before.exists:
+            return self._vm_lifecycle_result(
+                operation,
+                status="failed",
+                action="vm_missing",
+                before=before,
+                after=before,
+                message=f"VirtualBox VM '{operation.instance_id}' does not exist.",
+                failure_class="vm_not_found",
+            )
+        if before.power_state == "running":
+            return self._vm_lifecycle_result(
+                operation,
+                status="completed",
+                action="vm_already_running",
+                before=before,
+                after=before,
+                message="VM was already running.",
+            )
+
+        self.adapter.start_instance(operation.instance_id)
+        after = self._wait_for_vm_state(operation.instance_id, lambda state: state.exists and state.power_state == "running")
+        completed = after.exists and after.power_state == "running"
+        return self._vm_lifecycle_result(
+            operation,
+            status="completed" if completed else "failed",
+            action="vm_started",
+            before=before,
+            after=after,
+            message="VM started." if completed else "VM did not reach running state before timeout.",
+        )
+
+    def _execute_delete_vm(self, operation: Day2OperationJob) -> Day2OperationResult:
+        self._validate_vboxmanage()
+        before = self.adapter.get_instance_state(operation.instance_id)
+        if not before.exists:
+            return self._vm_lifecycle_result(
+                operation,
+                status="completed",
+                action="vm_already_deleted",
+                before=before,
+                after=before,
+                message="VM was already absent.",
+            )
+
+        self.adapter.destroy_instance(operation.instance_id)
+        after = self._wait_for_vm_state(operation.instance_id, lambda state: not state.exists)
+        completed = not after.exists
+        return self._vm_lifecycle_result(
+            operation,
+            status="completed" if completed else "failed",
+            action="vm_deleted",
+            before=before,
+            after=after,
+            message="VM deleted." if completed else "VM still exists after delete request.",
+            failure_class=None if completed else "vm_delete_failed",
+        )
+
+    def _wait_for_vm_state(self, instance_id: str, predicate, *, timeout_seconds: int = 60):
+        deadline = time.monotonic() + timeout_seconds
+        state = self.adapter.get_instance_state(instance_id)
+        while time.monotonic() < deadline:
+            if predicate(state):
+                return state
+            time.sleep(2)
+            state = self.adapter.get_instance_state(instance_id)
+        return state
+
+    def _vm_lifecycle_result(
+        self,
+        operation: Day2OperationJob,
+        *,
+        status: str,
+        action: str,
+        before,
+        after,
+        message: str,
+        failure_class: str | None = None,
+    ) -> Day2OperationResult:
+        evidence = {
+            "action": action,
+            "message": message,
+            "provider": "virtualbox",
+            "runner": "host_runner",
+            "before": _provider_state_dict(before),
+            "after": _provider_state_dict(after),
+        }
+        return Day2OperationResult(
+            operation_id=operation.operation_id,
+            operation=operation.operation,
+            status=status,
+            instance_id=operation.instance_id,
+            instance_name=operation.instance_name,
+            evidence=evidence,
+            error=None if status == "completed" else {"message": message, "failure_class": failure_class or action},
+        )
+
     def _find_runner_key_path(self, operation: Day2OperationJob) -> Path | None:
         return self._find_runner_key_path_for(
             instance_id=operation.instance_id,
@@ -904,7 +1251,7 @@ class HostRunner:
             write_progress("provisioning", "vm_started", "VM has started; waiting for SSH TCP readiness.")
             if not _wait_for_tcp(connection.host, connection.port, self.config.timeout_seconds, heartbeat=heartbeat):
                 raise RuntimeError(f"SSH TCP did not become reachable at {connection.host}:{connection.port}")
-            write_progress("provisioning", "ssh_ready", "SSH TCP is reachable; waiting for cloud-init completion.")
+            write_progress("provisioning", "ssh_tcp_ready", "SSH TCP is reachable; waiting for SSH login readiness.")
 
             # ava-runner holds the key; avaadmin has chage -d 0 (expired by design)
             # which blocks PAM account validation for all SSH sessions, key auth included.
@@ -918,13 +1265,35 @@ class HostRunner:
                     ssh_binary=self.config.ssh_binary,
                 )
             )
+            ssh_ready = _wait_for_executor_command(
+                executor,
+                "printf 'AVA_SSH_READY'",
+                self.config.timeout_seconds,
+                redact=secret_patterns,
+                heartbeat=heartbeat,
+                success_stdout_contains="AVA_SSH_READY",
+                attempt_timeout_seconds=15,
+            )
+            if not ssh_ready or "AVA_SSH_READY" not in (ssh_ready.stdout or ""):
+                if ssh_ready:
+                    detail = (
+                        f"SSH login was not ready after TCP became reachable "
+                        f"(exit_code={ssh_ready.exit_code}, failure_class={ssh_ready.failure_class}, "
+                        f"stdout={ssh_ready.stdout[-300:]!r}, stderr={ssh_ready.stderr[-300:]!r})"
+                    )
+                else:
+                    detail = "SSH login was not ready after TCP became reachable (no SSH command result)"
+                raise RuntimeError(detail)
+            write_progress("provisioning", "ssh_ready", "SSH login is ready; waiting for cloud-init first-access marker.")
+
             cloud_init = _wait_for_executor_command(
                 executor,
-                "cloud-init status --wait >/tmp/ava-cloud-init-status.txt 2>&1; test -f /var/tmp/ava-cloud-init-ready; cat /var/tmp/ava-cloud-init-ready",
+                "test -f /var/tmp/ava-cloud-init-ready && cat /var/tmp/ava-cloud-init-ready",
                 self.config.timeout_seconds,
                 redact=secret_patterns,
                 heartbeat=heartbeat,
                 success_stdout_contains=f"AVA_CLOUD_INIT_READY {vm_name}",
+                attempt_timeout_seconds=15,
             )
             if not cloud_init or f"AVA_CLOUD_INIT_READY {vm_name}" not in cloud_init.stdout:
                 if cloud_init:
@@ -945,10 +1314,31 @@ class HostRunner:
 
             write_progress("bootstrapping", "web_bootstrap", "Installing and enabling the web-server role.")
             role = WebServerRole()
-            results = role.bootstrap(executor)
+            bootstrap_heartbeat = lambda: self._write_processing_heartbeat(job, include_inventory=False)
+            try:
+                bootstrap_params = inspect.signature(role.bootstrap).parameters
+            except (TypeError, ValueError):
+                bootstrap_params = {}
+            if "heartbeat" in bootstrap_params:
+                results = role.bootstrap(executor, heartbeat=bootstrap_heartbeat)
+            else:
+                results = role.bootstrap(executor)
             for result in results:
                 if result.exit_code != 0:
-                    raise RuntimeError(result.stderr or f"bootstrap command failed: {result.command}")
+                    failure_class = result.failure_class or "bootstrap_failed"
+                    detail = result.stderr or result.stdout or f"bootstrap command failed: {result.command}"
+                    message = (
+                        f"{failure_class}: {detail} "
+                        f"(exit_code={result.exit_code}, command={result.command})"
+                    )
+                    if _is_recoverable_guest_failure(failure_class):
+                        write_progress(
+                            "provisioning",
+                            failure_class,
+                            "The VM exists, but Ubuntu guest readiness did not complete before the bootstrap timeout.",
+                        )
+                        raise RecoverableGuestReadinessError(message)
+                    raise RuntimeError(message)
 
             if desired_state.get("hardening_profile") != "none":
                 write_progress("hardening", "baseline_hardening", "Baseline Linux and web role hardening is being applied.")
@@ -1004,14 +1394,16 @@ class HostRunner:
             self.logger.info("Completed job %s instance=%s", job.job_id, instance_id)
         except Exception as exc:
             self.logger.exception("Job %s failed: %s", job.job_id, _redact(str(exc), secret_patterns))
+            failure_class = _runner_failure_class(exc)
+            retain_partial_vm = self.config.retain_debug or _is_recoverable_guest_failure(failure_class)
             rollback_report = ProvisioningRollbackManager(self.adapter).handle_failure(
                 session_id=job.session_id,
                 phase=self.queue.get_status(job.job_id) or "unknown",
                 failed_step="host_runner",
-                failure_class="runner_failed",
+                failure_class=failure_class,
                 message=_redact(str(exc), secret_patterns),
                 instance_id=instance_id,
-                retain_for_debug=self.config.retain_debug,
+                retain_for_debug=retain_partial_vm,
             )
             self.writer.failed(
                 job_id=job.job_id,
@@ -1127,6 +1519,25 @@ def _redact(text: str, patterns: tuple[str, ...]) -> str:
         if pattern:
             redacted = redacted.replace(pattern, "[REDACTED]")
     return redacted
+
+
+def _runner_failure_class(exc: Exception) -> str:
+    message = str(exc or "").lower()
+    if "virtualbox vm" in message and "already exists" in message:
+        return "vm_name_conflict"
+    if "dns resolution not ready" in message or "ubuntu package mirrors" in message:
+        return "guest_network_not_ready"
+    if (
+        "guest_readiness_timeout" in message
+        or "guest readiness was not confirmed" in message
+        or "ssh login was not ready" in message
+        or "cloud-init first-access marker" in message
+        or "sudo -n true" in message
+        or "systemctl is-active ssh" in message
+        or "connection timed out during banner exchange" in message
+    ):
+        return "guest_readiness_timeout"
+    return "runner_failed"
 
 
 def main() -> int:

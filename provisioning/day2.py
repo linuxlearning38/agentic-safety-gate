@@ -7,6 +7,7 @@ must go through approval first, then a host-runner implementation.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
@@ -16,8 +17,8 @@ from provisioning.runner import Day2OperationResult, ProvisioningJobResult
 
 
 READ_ONLY_OPERATIONS = {"status", "verify", "nginx_logs", "open_ssh_console"}
-APPROVAL_OPERATIONS = {"restart_nginx", "snapshot", "rollback_snapshot", "stop_vm", "start_vm"}
-HIGH_RISK_OPERATIONS = {"rollback_snapshot"}
+APPROVAL_OPERATIONS = {"restart_nginx", "snapshot", "rollback_snapshot", "stop_vm", "start_vm", "delete_vm"}
+HIGH_RISK_OPERATIONS = {"rollback_snapshot", "delete_vm"}
 
 
 @dataclass(slots=True)
@@ -56,6 +57,8 @@ def classify_day2_operation(query: str) -> Day2Operation | None:
         return Day2Operation("snapshot", "virtualbox_vm", "medium", True, "take a VirtualBox snapshot")
     if _is_rollback(normalized):
         return Day2Operation("rollback_snapshot", "virtualbox_vm", "high", True, "roll back to the latest AVA snapshot")
+    if _is_delete_vm(normalized):
+        return Day2Operation("delete_vm", "virtualbox_vm", "high", True, "delete the VM and its disk files")
     if _is_stop_vm(normalized):
         return Day2Operation("stop_vm", "virtualbox_vm", "medium", True, "stop the VM")
     if _is_start_vm(normalized):
@@ -217,9 +220,14 @@ def format_approval_required_response(
     """Format the user-facing approval prompt for a mutating server-management operation."""
 
     warning = ""
-    if operation.risk == "high":
+    if operation.operation == "rollback_snapshot":
         warning = (
             "\n\nHigh-risk warning: rollback may discard changes made after the latest AVA snapshot. "
+            "AVA will require approval before this can proceed."
+        )
+    elif operation.operation == "delete_vm":
+        warning = (
+            "\n\nHigh-risk warning: delete removes the VirtualBox VM and its virtual disk files. "
             "AVA will require approval before this can proceed."
         )
     return (
@@ -284,7 +292,10 @@ def _is_status(query: str) -> bool:
 
 
 def _is_verify(query: str) -> bool:
-    return "verify" in query and ("web server" in query or "nginx" in query or "server" in query)
+    named_server = re.search(r"\b[a-z0-9][a-z0-9-]*(?:web|server)[a-z0-9-]*\b", query)
+    return "verify" in query and (
+        "web server" in query or "nginx" in query or "server" in query or bool(named_server)
+    )
 
 
 def _is_nginx_logs(query: str) -> bool:
@@ -330,11 +341,63 @@ def _is_rollback(query: str) -> bool:
 
 
 def _is_stop_vm(query: str) -> bool:
-    return any(marker in query for marker in ("stop vm", "stop the vm", "shutdown vm", "power off vm", "poweroff vm"))
+    if re.match(r"^(stop|shutdown|power off|poweroff)\s+[a-z0-9][a-z0-9-]{1,60}$", query):
+        return True
+    return any(
+        marker in query
+        for marker in (
+            "stop vm",
+            "stop the vm",
+            "stop server",
+            "stop the server",
+            "shutdown vm",
+            "shutdown server",
+            "power off vm",
+            "power off server",
+            "poweroff vm",
+            "poweroff server",
+        )
+    )
 
 
 def _is_start_vm(query: str) -> bool:
-    return any(marker in query for marker in ("start vm", "start the vm", "boot vm", "power on vm"))
+    if re.match(r"^(start|boot|power on)\s+[a-z0-9][a-z0-9-]{1,60}$", query):
+        return True
+    return any(
+        marker in query
+        for marker in (
+            "start vm",
+            "start the vm",
+            "start server",
+            "start the server",
+            "boot vm",
+            "boot server",
+            "power on vm",
+            "power on server",
+        )
+    )
+
+
+def _is_delete_vm(query: str) -> bool:
+    if re.match(r"^(delete|remove|destroy)\s+[a-z0-9][a-z0-9-]{1,60}$", query):
+        return True
+    return any(
+        marker in query
+        for marker in (
+            "delete vm",
+            "delete the vm",
+            "delete server",
+            "delete the server",
+            "delete web server",
+            "remove vm",
+            "remove server",
+            "destroy vm",
+            "destroy server",
+            "delete ava-web",
+            "remove ava-web",
+            "destroy ava-web",
+        )
+    )
 
 
 def _format_status(*, session: Any, result: ProvisioningJobResult) -> str:
@@ -401,5 +464,6 @@ def _human_action(operation: Day2Operation) -> str:
         "rollback_snapshot": "roll back the VM to the latest AVA snapshot",
         "stop_vm": "stop the VM",
         "start_vm": "start the VM",
+        "delete_vm": "delete the VM and its disk files",
     }
     return labels.get(operation.operation, operation.description)

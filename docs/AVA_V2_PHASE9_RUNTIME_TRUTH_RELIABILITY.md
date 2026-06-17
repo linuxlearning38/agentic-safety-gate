@@ -194,3 +194,55 @@ Regression coverage should include:
 AVA is the decision-maker. Qwen may reason, but Qwen must never decide runtime
 truth. Runtime truth belongs to AVA's resolver, state stores, host runner, and
 live evidence.
+
+---
+
+## Runtime Truth Addendum (2026-06-15)
+
+Later Phase 9 work tightened several stale-truth cases that showed up during
+real manual testing.
+
+Current behavior expected from AVA:
+
+- expired Redis job/result keys must not leave an old provisioning session
+  blocking the user forever
+- failed runner jobs must become failed sessions, not invisible queued work
+- if a VM is manually deleted from VirtualBox, AVA must treat old successful
+  provisioning evidence as history until live verification proves the VM still
+  exists
+- completed server history may be shown as last-known details, but Web Console
+  and Day-2 operations should prefer live runner evidence before acting
+- if the host runner is offline, AVA should say the runner is offline instead
+  of claiming the VM is ready or stuck forever
+- if a VM is still being built, AVA should show provisioning progress and
+  withhold final SSH/web details until bootstrap, hardening, and verification
+  are complete
+
+Important distinction:
+
+- `Stored provisioning result: available` means AVA has historical evidence.
+- `Latest live verification: completed` means AVA has current runtime evidence.
+- Product behavior should prefer current runtime evidence whenever AVA is about
+  to block a new server request, open a console, or run a server-management
+  action.
+
+### Guest Readiness Recovery Addendum (2026-06-15)
+
+Live testing also showed that VirtualBox can expose SSH TCP before Ubuntu is
+fully ready for AVA bootstrap commands. In that state the VM exists, but guest
+readiness is still settling: cloud-init, sudo, SSH login, or service checks may
+not be safely usable yet.
+
+Expected behavior:
+
+- AVA should classify this as `guest_readiness_timeout`, not a generic runner
+  failure.
+- The web-server bootstrap preflight should wait long enough for slow first
+  boot before failing.
+- On guest-readiness failures, the host runner should retain the partial VM for
+  inspection/recovery instead of destroying it immediately.
+- Status output should make clear that the VM may exist but final provisioning
+  did not complete, so PuTTY/Web Console details are not final until HTTP
+  verification passes.
+- Recovery should be guided by live runner/VirtualBox evidence, not old chat
+  memory.

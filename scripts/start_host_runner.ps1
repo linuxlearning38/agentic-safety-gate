@@ -10,6 +10,39 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+function Ensure-RunnerPythonDependency {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ModuleName,
+        [Parameter(Mandatory = $true)]
+        [string]$PackageSpec
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & python -c "import $ModuleName" *> $null
+        $importExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($importExitCode -eq 0) {
+        return
+    }
+
+    Write-Host "Installing missing Windows runner dependency: $PackageSpec"
+    & python -m pip install --disable-pip-version-check $PackageSpec
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to install required Windows runner dependency '$PackageSpec'. Run: python -m pip install $PackageSpec"
+    }
+
+    & python -c "import $ModuleName"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Windows runner dependency '$ModuleName' is still unavailable after install."
+    }
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $WorkDir) {
     $WorkDir = Join-Path $repoRoot ".ava-runner"
@@ -46,4 +79,5 @@ Write-Host "WorkDir: $WorkDir"
 Write-Host "Log: $env:AVA_HOST_RUNNER_LOG_PATH"
 
 Set-Location $repoRoot
+Ensure-RunnerPythonDependency -ModuleName "redis" -PackageSpec "redis==5.2.1"
 python -m provisioning.runner.host_runner

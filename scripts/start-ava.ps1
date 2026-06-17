@@ -164,12 +164,79 @@ function Clear-RunnerHeartbeat {
     }
 }
 
+function Get-RunnerCodeFingerprint {
+    $runnerPath = Join-Path $repoRoot "provisioning\runner\host_runner.py"
+    if (-not (Test-Path -LiteralPath $runnerPath)) {
+        return ""
+    }
+
+    try {
+        return ((Get-FileHash -LiteralPath $runnerPath -Algorithm SHA256).Hash.Substring(0, 12)).ToLowerInvariant()
+    } catch {
+        return ""
+    }
+}
+
 function Get-HostRunnerProcesses {
     @(Get-CimInstance Win32_Process |
         Where-Object {
             $_.Name -match '^python(\.exe|3\.exe)?$' -and
             $_.CommandLine -match 'provisioning\.runner\.host_runner|host_runner\.py'
         })
+}
+
+function Stop-HostRunnerProcesses {
+    param([object[]]$Processes)
+
+    foreach ($proc in @($Processes)) {
+        try {
+            Write-Host "  Stopping stale AVA host runner PID $($proc.ProcessId)..."
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Warning "Could not stop stale host runner PID $($proc.ProcessId): $($_.Exception.Message)"
+        }
+    }
+}
+
+function Test-RunnerHeartbeatHasInventory {
+    param(
+        [string]$Heartbeat,
+        [string]$ExpectedFingerprint = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Heartbeat)) {
+        return $false
+    }
+
+    try {
+        $parsed = $Heartbeat | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return $false
+    }
+
+    if (-not $parsed.PSObject.Properties.Name.Contains("metadata")) {
+        return $false
+    }
+
+    $metadata = $parsed.metadata
+    if ($null -eq $metadata) {
+        return $false
+    }
+
+    if (-not $metadata.PSObject.Properties.Name.Contains("registered_vms")) {
+        return $false
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedFingerprint)) {
+        if (-not $metadata.PSObject.Properties.Name.Contains("runner_code_fingerprint")) {
+            return $false
+        }
+
+        $actualFingerprint = [string]$metadata.runner_code_fingerprint
+        return $actualFingerprint.ToLowerInvariant() -eq $ExpectedFingerprint.ToLowerInvariant()
+    }
+
+    return $true
 }
 
 function Wait-RunnerHeartbeat {
@@ -255,15 +322,19 @@ if (-not $healthy) {
     New-Item -ItemType Directory -Path $runnerLogDir -Force | Out-Null
     $runnerStdout = Join-Path $runnerLogDir "host_runner.startup.out.log"
     $runnerStderr = Join-Path $runnerLogDir "host_runner.startup.err.log"
+    $expectedRunnerFingerprint = Get-RunnerCodeFingerprint
 
     Clear-RunnerHeartbeat
     $existingRunner = @(Get-HostRunnerProcesses)
     if ($existingRunner.Count -gt 0) {
         $heartbeat = Wait-RunnerHeartbeat -TimeoutSeconds 10
-        if ($heartbeat) {
+        if ($heartbeat -and (Test-RunnerHeartbeatHasInventory -Heartbeat $heartbeat -ExpectedFingerprint $expectedRunnerFingerprint)) {
             Write-Host "  Host runner already healthy: $heartbeat"
         } else {
-            Write-Warning "Existing host runner process did not refresh heartbeat; starting a fresh runner."
+            Write-Warning "Existing host runner is stale, missing VirtualBox inventory, or running older code; starting a fresh runner."
+            Stop-HostRunnerProcesses -Processes $existingRunner
+            Clear-RunnerHeartbeat
+            Start-Sleep -Seconds 1
             $existingRunner = @()
         }
     }
@@ -293,7 +364,12 @@ if (-not $healthy) {
 
         $heartbeat = Wait-RunnerHeartbeat -TimeoutSeconds 15
         if ($heartbeat) {
-            Write-Host "  Host runner healthy: $heartbeat"
+            if (Test-RunnerHeartbeatHasInventory -Heartbeat $heartbeat -ExpectedFingerprint $expectedRunnerFingerprint) {
+                Write-Host "  Host runner healthy: $heartbeat"
+            } else {
+                Write-Warning ("Host runner heartbeat is present but missing VirtualBox inventory or current code fingerprint. " +
+                               "Duplicate VM hostname checks may be unavailable until the runner is refreshed.")
+            }
         } else {
             Write-Warning ("Host runner did not publish a heartbeat within 15s. " +
                            "Check $runnerStdout and $runnerStderr")

@@ -736,3 +736,40 @@ responses. See `docs/AVA_V2_PHASE9_DAY2_OPERATIONS.md`.
 - do not add second-role work inside first-role phases
 - if a phase expands unexpectedly, stop and review scope before continuing
 - if code does not clearly map to one phase, it probably does not belong in `v2.0.0`
+
+---
+
+## Phase 9 Status Addendum (2026-06-15)
+
+The original plan above said `v2.0.0` could not be tagged until Phase 9 exit
+criteria were met. That was correct at the time. Phase 9 then continued beyond
+the first working engine into reliability and product-polish slices.
+
+Current milestone state:
+
+- `v2.0.0` marks the first proven chat-to-VM provisioning engine milestone.
+- `v2.0.1` marks the operational hardening milestone: startup reliability,
+  named Docker volume, runner heartbeat preflight, state sync, NAT collision
+  handling, and safer restart behavior.
+- Later Phase 9 work extended the product into Day-2 operations, server
+  inventory, named VM targeting, Web Console access, and stale-state recovery.
+
+Completed and validated areas:
+
+- host-side VirtualBox runner bridge
+- two-step approval plus `continue provisioning`
+- background provisioning progress watcher
+- runner stage/progress reporting
+- stale session and stale VM evidence reconciliation
+- duplicate hostname and accidental duplicate server guards
+- Day-2 server management operations
+- browser Web Console and xterm-lite terminal layer
+- server inventory and named target routing
+
+Current boundary:
+
+- Phase 9 remains focused on local VirtualBox and Ubuntu `web_server` VMs.
+- Multi-role, multi-cloud, and fleet-agent operation belong to later product
+  phases.
+- Stored history is never enough for live runtime truth. Live runner/VirtualBox
+  verification wins when available.

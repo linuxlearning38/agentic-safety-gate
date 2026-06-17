@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,8 +36,13 @@ def check(name: str, condition: bool, detail: str = "") -> bool:
     return condition
 
 
+def session_from_result(service: ProvisioningChatService, result):
+    session_id = result.metadata.get("provisioning", {}).get("session_id")
+    return service.sessions.get(session_id) if session_id else None
+
+
 class FakeProvisioningJobQueue:
-    def __init__(self, *, live_verify_status: str = "completed"):
+    def __init__(self, *, live_verify_status: str = "completed", runner_heartbeat=None):
         self.jobs: dict[str, ProvisioningJob] = {}
         self.statuses: dict[str, str] = {}
         self.progress: dict[str, ProvisioningJobProgress] = {}
@@ -48,6 +54,7 @@ class FakeProvisioningJobQueue:
         self.day2_counter = 0
         self.runner_healthy = True
         self.live_verify_status = live_verify_status
+        self.runner_heartbeat = runner_heartbeat
 
     def enqueue_approved_job(self, *, session_id, desired_state, credential_id, username, temporary_password):
         self.counter += 1
@@ -91,6 +98,9 @@ class FakeProvisioningJobQueue:
 
     def is_runner_healthy(self):
         return self.runner_healthy
+
+    def get_runner_heartbeat(self):
+        return self.runner_heartbeat
 
     def enqueue_day2_operation(
         self,
@@ -288,6 +298,215 @@ def main() -> int:
             ]
         )
 
+        direct_routing_service = ProvisioningChatService(
+            temp_dir / "direct_routing_sessions.sqlite3",
+            job_queue=FakeProvisioningJobQueue(),
+        )
+        direct_additional_start = direct_routing_service.handle("user-direct", "create another web server", route_intent=None)
+        failures.extend(
+            [
+                check("serving contract catches explicit additional web server without router", direct_additional_start.handled),
+                check(
+                    "serving contract additional request asks for specs",
+                    "cpu" in direct_additional_start.response.lower() and "ram" in direct_additional_start.response.lower(),
+                ),
+                check(
+                    "serving contract additional request avoids generic boundary",
+                    "focused on devops" not in direct_additional_start.response.lower(),
+                ),
+            ]
+        )
+
+        duplicate_queue = FakeProvisioningJobQueue()
+        duplicate_service = ProvisioningChatService(
+            temp_dir / "duplicate_name_sessions.sqlite3",
+            job_queue=duplicate_queue,
+        )
+        duplicate_service.handle("user-duplicate", "I want a web server", route_intent="provisioning")
+        duplicate_specs = duplicate_service.handle(
+            "user-duplicate",
+            "2 CPU, 4 GB RAM, 30 GB disk, hostname ava-web-known",
+            route_intent=None,
+        )
+        duplicate_approval_id = duplicate_specs.metadata["provisioning"]["approval_id"]
+        duplicate_service.handle("user-duplicate", f"approve {duplicate_approval_id}", route_intent=None)
+        duplicate_service.handle("user-duplicate", "continue provisioning", route_intent=None)
+        duplicate_queue.write_status("job-0001", "completed")
+        duplicate_queue.write_result(
+            ProvisioningJobResult(
+                job_id="job-0001",
+                instance_id="ava-web-known",
+                instance_name="ava-web-known",
+                ssh_host="127.0.0.1",
+                ssh_port=2222,
+                http_port=8080,
+                verification_evidence={"checks": [{"name": "host_http_200", "passed": True, "evidence": "HTTP 200"}]},
+                completion_timestamp="2026-05-02T00:12:00+00:00",
+                error=None,
+            )
+        )
+        duplicate_start = duplicate_service.handle("user-duplicate", "create another web server", route_intent=None)
+        duplicate_conflict = duplicate_service.handle(
+            "user-duplicate",
+            "2 CPU, 4 GB RAM, 30 GB disk, hostname ava-web-known",
+            route_intent=None,
+        )
+        duplicate_conflict_session = session_from_result(duplicate_service, duplicate_conflict)
+        duplicate_retry = duplicate_service.handle("user-duplicate", "I want another web server", route_intent=None)
+        failures.extend(
+            [
+                check("explicit second server bypasses existing VM guard", "already have an ava-managed web server" not in duplicate_start.response.lower()),
+                check("explicit second server asks for specs", "cpu" in duplicate_start.response.lower() and "ram" in duplicate_start.response.lower()),
+                check("known duplicate hostname is blocked before approval", duplicate_conflict.handled),
+                check("known duplicate hostname names the conflict", "cannot use hostname `ava-web-known`" in duplicate_conflict.response.lower()),
+                check("known duplicate hostname does not create approval", "no approval was created" in duplicate_conflict.response.lower()),
+                check(
+                    "known duplicate hostname marks conflict session failed",
+                    duplicate_conflict_session and duplicate_conflict_session.phase == SessionPhase.FAILED,
+                    duplicate_conflict_session.phase.value if duplicate_conflict_session else "missing session",
+                ),
+                check(
+                    "known duplicate hostname allows immediate retry",
+                    "already active" not in duplicate_retry.response.lower()
+                    and "cpu" in duplicate_retry.response.lower()
+                    and "ram" in duplicate_retry.response.lower(),
+                ),
+            ]
+        )
+
+        infra_queue = FakeProvisioningJobQueue(
+            runner_heartbeat={"status": "idle", "metadata": {"registered_vms": ["ava-web-live"]}}
+        )
+        infra_service = ProvisioningChatService(
+            temp_dir / "infra_duplicate_sessions.sqlite3",
+            job_queue=infra_queue,
+        )
+        infra_service.handle("user-infra", "I want a web server", route_intent="provisioning")
+        infra_conflict = infra_service.handle(
+            "user-infra",
+            "2 CPU, 4 GB RAM, 30 GB disk, hostname ava-web-live",
+            route_intent=None,
+        )
+        infra_conflict_session = session_from_result(infra_service, infra_conflict)
+        infra_retry = infra_service.handle("user-infra", "I want a web server", route_intent=None)
+        failures.extend(
+            [
+                check("live VirtualBox duplicate hostname is blocked before approval", infra_conflict.handled),
+                check(
+                    "live VirtualBox duplicate hostname explains infrastructure conflict",
+                    "already exists in the local infrastructure" in infra_conflict.response.lower(),
+                ),
+                check("live VirtualBox duplicate hostname does not create approval", "no approval was created" in infra_conflict.response.lower()),
+                check("live VirtualBox duplicate hostname does not queue job", len(infra_queue.jobs) == 0),
+                check(
+                    "live VirtualBox duplicate hostname marks conflict session failed",
+                    infra_conflict_session and infra_conflict_session.phase == SessionPhase.FAILED,
+                    infra_conflict_session.phase.value if infra_conflict_session else "missing session",
+                ),
+                check(
+                    "live VirtualBox duplicate hostname allows immediate retry",
+                    "already active" not in infra_retry.response.lower()
+                    and "cpu" in infra_retry.response.lower()
+                    and "ram" in infra_retry.response.lower(),
+                ),
+            ]
+        )
+
+        external_vm_name = f"external-vm-{uuid.uuid4().hex[:8]}"
+        inventory_queue = FakeProvisioningJobQueue(
+            runner_heartbeat={
+                "status": "idle",
+                "updated_at": "2026-05-02T00:20:00+00:00",
+                "metadata": {
+                    "registered_vm_inventory": [
+                        {
+                            "name": external_vm_name,
+                            "exists": True,
+                            "power_state": "poweroff",
+                            "provider_status": "poweroff",
+                        }
+                    ]
+                },
+            }
+        )
+        inventory_service = ProvisioningChatService(
+            temp_dir / "external_inventory_sessions.sqlite3",
+            job_queue=inventory_queue,
+        )
+        external_inventory = inventory_service.handle("user-inventory", "list my servers", route_intent=None)
+        inventory_service.handle("user-inventory", "I want a web server", route_intent="provisioning")
+        external_conflict = inventory_service.handle(
+            "user-inventory",
+            f"2 CPU, 4 GB RAM, 30 GB disk, hostname {external_vm_name}",
+            route_intent=None,
+        )
+        external_conflict_session = session_from_result(inventory_service, external_conflict)
+        failures.extend(
+            [
+                check("live inventory query lists VirtualBox-only VM", external_vm_name in external_inventory.response),
+                check(
+                    "live inventory marks external VM as not AVA-managed",
+                    "visible in virtualbox only" in external_inventory.response.lower(),
+                ),
+                check("live inventory reports external VM power state", "power state: `poweroff`" in external_inventory.response.lower()),
+                check("external VirtualBox duplicate hostname is blocked before approval", external_conflict.handled),
+                check(
+                    "external VirtualBox duplicate hostname explains infrastructure conflict",
+                    "already exists in the local infrastructure" in external_conflict.response.lower(),
+                ),
+                check("external VirtualBox duplicate hostname does not create approval", "no approval was created" in external_conflict.response.lower()),
+                check("external VirtualBox duplicate hostname does not queue job", len(inventory_queue.jobs) == 0),
+                check(
+                    "external VirtualBox duplicate hostname marks conflict session failed",
+                    external_conflict_session and external_conflict_session.phase == SessionPhase.FAILED,
+                    external_conflict_session.phase.value if external_conflict_session else "missing session",
+                ),
+            ]
+        )
+
+        after_queue = FakeProvisioningJobQueue()
+        after_service = ProvisioningChatService(
+            temp_dir / "after_approval_duplicate_sessions.sqlite3",
+            job_queue=after_queue,
+        )
+        after_service.handle("user-after-conflict", "I want a web server", route_intent="provisioning")
+        after_specs = after_service.handle(
+            "user-after-conflict",
+            "2 CPU, 4 GB RAM, 30 GB disk, hostname ava-web-after-approval",
+            route_intent=None,
+        )
+        after_approval_id = after_specs.metadata["provisioning"]["approval_id"]
+        after_service.handle("user-after-conflict", f"approve {after_approval_id}", route_intent=None)
+        after_queue.runner_heartbeat = {
+            "status": "idle",
+            "metadata": {"registered_vms": ["ava-web-after-approval"]},
+        }
+        after_conflict = after_service.handle("user-after-conflict", "continue provisioning", route_intent=None)
+        after_conflict_session = session_from_result(after_service, after_conflict)
+        after_retry = after_service.handle("user-after-conflict", "I want a web server", route_intent=None)
+        failures.extend(
+            [
+                check("post-approval VirtualBox duplicate is blocked before runner job", after_conflict.handled),
+                check(
+                    "post-approval VirtualBox duplicate names infrastructure conflict",
+                    "already exists in the local infrastructure" in after_conflict.response.lower(),
+                ),
+                check("post-approval VirtualBox duplicate avoids temporary credential", "temporary password:" not in after_conflict.response.lower()),
+                check("post-approval VirtualBox duplicate does not queue job", len(after_queue.jobs) == 0),
+                check(
+                    "post-approval VirtualBox duplicate marks conflict session failed",
+                    after_conflict_session and after_conflict_session.phase == SessionPhase.FAILED,
+                    after_conflict_session.phase.value if after_conflict_session else "missing session",
+                ),
+                check(
+                    "post-approval VirtualBox duplicate allows immediate retry",
+                    "already active" not in after_retry.response.lower()
+                    and "cpu" in after_retry.response.lower()
+                    and "ram" in after_retry.response.lower(),
+                ),
+            ]
+        )
+
         start_lower = service.handle("user-lower", "I want a web server", route_intent="provisioning")
         lower_specs = service.handle("user-lower", "3 cpu, 8gb ram, 60 gb disk", route_intent=None)
         lower_session = service.sessions.list_active("user-lower")[0]
@@ -440,7 +659,12 @@ def main() -> int:
                 check("progress status shows SSH details", "ssh host/ip: `127.0.0.1`" in progress_status.response.lower()),
                 check("progress connection shows in-progress details", "runner progress details" in progress_connection.response.lower()),
                 check("progress connection includes SSH port", "ssh port: `2222`" in progress_connection.response.lower()),
-                check("progress verification is honest", "verification is not complete" in progress_verify.response.lower()),
+                check(
+                    "progress verification is honest",
+                    "verification is not complete" in progress_verify.response.lower()
+                    or "live verification has been queued" in progress_verify.response.lower()
+                    or "live web-server verification" in progress_verify.response.lower(),
+                ),
                 check("progress verification names visible VM", "ava-web-progress" in progress_verify.response),
             ]
         )
@@ -451,7 +675,12 @@ def main() -> int:
         failures.extend(
             [
                 check("web verification follow-up stays in provisioning session", verify.handled),
-                check("web verification reports queued runner honestly", "runner status" in verify.response.lower()),
+                check(
+                    "web verification reports queued runner honestly",
+                    "runner status" in verify.response.lower()
+                    or "live verification has been queued" in verify.response.lower()
+                    or "live web-server verification" in verify.response.lower(),
+                ),
                 check("status follow-up stays in provisioning session", status.handled),
                 check("status reports current phase", "bootstrapping" in status.response.lower()),
                 check("evidence follow-up stays in provisioning session", evidence.handled),
@@ -483,6 +712,32 @@ def main() -> int:
         completed_evidence = service.handle("user-1", "what did you do and what evidence do you have?", route_intent=None)
         day2_status = service.handle("user-1", "show status of my web server", route_intent=None)
         day2_logs = service.handle("user-1", "show nginx logs", route_intent=None)
+        job_queue.runner_heartbeat = {
+            "status": "idle",
+            "metadata": {
+                "registered_vm_inventory": [
+                    {
+                        "name": "ava-web-01",
+                        "exists": True,
+                        "power_state": "saved",
+                        "provider_status": "saved",
+                    }
+                ]
+            },
+        }
+        server_inventory = service.handle("user-1", "list my servers", route_intent=None)
+        offline_inventory = service.handle("user-1", "show offline servers", route_intent=None)
+        unnamed_start = service.handle("user-1", "start server", route_intent=None)
+        named_start = service.handle("user-1", "start ava-web-01", route_intent=None)
+        named_start_approval_id = named_start.metadata["provisioning"]["approval_id"]
+        named_start_approved = service.handle("user-1", f"approve {named_start_approval_id}", route_intent=None)
+        named_start_operation_id = named_start_approved.response.split("Operation ID: `", 1)[1].split("`", 1)[0]
+        named_verify = service.handle("user-1", "verify ava-web-01", route_intent=None)
+        named_logs = service.handle("user-1", "show nginx logs for ava-web-01", route_intent=None)
+        named_delete = service.handle("user-1", "delete ava-web-01", route_intent=None)
+        named_delete_approval_id = named_delete.metadata["provisioning"]["approval_id"]
+        named_delete_approved = service.handle("user-1", f"approve {named_delete_approval_id}", route_intent=None)
+        named_delete_operation_id = named_delete_approved.response.split("Operation ID: `", 1)[1].split("`", 1)[0]
         day2_job_count_before_connection_help = len(job_queue.day2_jobs)
         day2_connection_help = service.handle("user-1", "how do I connect with PuTTY?", route_intent=None)
         day2_job_count_after_connection_help = len(job_queue.day2_jobs)
@@ -517,6 +772,29 @@ def main() -> int:
                 check("day-2 status is handled", day2_status.handled),
                 check("day-2 status reports active vm", "ava-web-01" in day2_status.response),
                 check("day-2 logs are handled", day2_logs.handled),
+                check("server inventory is handled", server_inventory.handled),
+                check("server inventory lists completed VM", "`ava-web-01`" in server_inventory.response),
+                check("server inventory shows live power state", "power state: `saved`" in server_inventory.response.lower()),
+                check("server inventory shows live provider status", "provider status: `saved`" in server_inventory.response.lower()),
+                check("server inventory guides offline server start", "start ava-web-01" in server_inventory.response.lower()),
+                check("server inventory guides offline server delete", "delete ava-web-01" in server_inventory.response.lower()),
+                check("server inventory shows targeted examples", "open web console for ava-web-03" in server_inventory.response.lower()),
+                check("offline inventory query is handled", offline_inventory.handled),
+                check("unnamed start asks for exact hostname", "which server should i start" in unnamed_start.response.lower()),
+                check("unnamed start does not create approval", "approval required" not in unnamed_start.response.lower()),
+                check("named start requires approval", "approval required" in named_start.response.lower()),
+                check("named start approval is handled", named_start_approved.handled),
+                check("named start queues runner operation", named_start_operation_id in job_queue.day2_jobs),
+                check("named start queues start_vm", job_queue.day2_jobs[named_start_operation_id].operation == "start_vm"),
+                check("named verify is handled", named_verify.handled),
+                check("named verify targets requested VM", "ava-web-01" in named_verify.response),
+                check("named nginx logs is handled", named_logs.handled),
+                check("named nginx logs targets requested VM", "ava-web-01" in named_logs.response),
+                check("named delete requires approval", "approval required" in named_delete.response.lower()),
+                check("named delete is high risk", "risk: `high`" in named_delete.response.lower()),
+                check("named delete approval is handled", named_delete_approved.handled),
+                check("named delete queues runner operation", named_delete_operation_id in job_queue.day2_jobs),
+                check("named delete queues delete_vm", job_queue.day2_jobs[named_delete_operation_id].operation == "delete_vm"),
                 check("putty help stays informational", "putty settings" in day2_connection_help.response.lower()),
                 check("putty help does not queue console launch", day2_job_count_after_connection_help == day2_job_count_before_connection_help),
                 check("open putty is handled", day2_open_console.handled),

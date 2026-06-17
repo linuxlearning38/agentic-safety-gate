@@ -3801,14 +3801,40 @@ def _console_result_from_progress(runner: dict | None):
     )
 
 
-def _resolve_active_console_target(user_id: str):
+def _normalize_console_target_name(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "", str(value).strip())
+    return cleaned.lower() or None
+
+
+def _console_session_target_names(session, result) -> set[str]:
+    names = {
+        getattr(result, "instance_id", None),
+        getattr(result, "instance_name", None),
+        getattr(session, "instance_id", None),
+    }
+    desired_state = getattr(session, "desired_state", None) or {}
+    if isinstance(desired_state, dict):
+        names.add(desired_state.get("hostname"))
+    answers = getattr(session, "collected_answers", None) or {}
+    if isinstance(answers, dict):
+        names.add(answers.get("hostname"))
+    normalized = {_normalize_console_target_name(name) for name in names if name}
+    return {name for name in normalized if name}
+
+
+def _resolve_active_console_target(user_id: str, requested_target: str | None = None):
     service = _get_provisioning_chat_service()
+    requested = _normalize_console_target_name(requested_target)
     for session in service.sessions.list_recent(user_id, limit=10):
         runner = service._runner_snapshot(session)
         if str(runner.get("status") or "").lower() != "completed":
             continue
         result = runner.get("result")
         if result and result.instance_id and result.ssh_host and result.ssh_port and not result.error:
+            if requested and requested not in _console_session_target_names(session, result):
+                continue
             return service, session, runner, result
     return service, None, None, None
 
@@ -3836,8 +3862,8 @@ def _console_session_age_seconds(session: dict) -> float | None:
     return max(0.0, (datetime.now(timezone.utc) - updated.astimezone(timezone.utc)).total_seconds())
 
 
-def _console_target_payload(user_id: str) -> dict:
-    service, session, runner, result = _resolve_active_console_target(user_id)
+def _console_target_payload(user_id: str, requested_target: str | None = None) -> dict:
+    service, session, runner, result = _resolve_active_console_target(user_id, requested_target)
     heartbeat = service.job_queue.get_runner_heartbeat()
     web_url = f"http://127.0.0.1:{result.http_port}/" if result and result.http_port else None
     payload = {
@@ -3873,13 +3899,18 @@ def _console_target_payload(user_id: str) -> dict:
 def console_status():
     """Report browser console readiness without creating a new session."""
     user_id = str(get_jwt_identity() or "admin")
-    payload = _console_target_payload(user_id)
+    requested_target = request.args.get("target")
+    payload = _console_target_payload(user_id, requested_target)
     if not payload["target_available"]:
-        payload["message"] = "No completed AVA-managed VM is ready for Web Console yet. Wait for provisioning to complete, then type open web console."
+        if requested_target:
+            payload["message"] = f"No completed AVA-managed VM named {requested_target} is ready for Web Console yet."
+        else:
+            payload["message"] = "No completed AVA-managed VM is ready for Web Console yet. Wait for provisioning to complete, then type open web console."
     elif not payload["runner_healthy"]:
         payload["message"] = "The Windows host runner is offline. Start AVA with scripts/start-ava.ps1, then retry Web Console."
     else:
-        payload["message"] = "AVA Web Console is ready for the latest AVA-managed VM."
+        target_name = payload.get("target", {}).get("vm") if payload.get("target") else None
+        payload["message"] = f"AVA Web Console is ready for {target_name}." if target_name else "AVA Web Console is ready for the latest AVA-managed VM."
     return jsonify(payload)
 
 
@@ -3887,16 +3918,24 @@ def console_status():
 @limiter.limit("10 per minute")
 @jwt_required()
 def console_open():
-    """Start a browser-based console for the latest AVA-managed VM."""
+    """Start a browser-based console for an AVA-managed VM."""
     user_id = str(get_jwt_identity() or "admin")
-    service, session, runner, result = _resolve_active_console_target(user_id)
+    data = request.get_json(silent=True) or {}
+    requested_target = data.get("target") or data.get("vm") or data.get("hostname")
+    service, session, runner, result = _resolve_active_console_target(user_id, requested_target)
     heartbeat = service.job_queue.get_runner_heartbeat()
     if not session or not result:
+        message = (
+            f"No completed AVA-managed VM named {requested_target} is ready for Web Console yet."
+            if requested_target
+            else "No completed AVA-managed VM is ready for Web Console yet. Wait for provisioning to complete, then type open web console."
+        )
         return jsonify({
             "error": "no_ava_managed_vm",
-            "message": "No completed AVA-managed VM is ready for Web Console yet. Wait for provisioning to complete, then type open web console.",
+            "message": message,
             "runner_healthy": bool(heartbeat),
             "target_available": False,
+            "requested_target": requested_target,
         }), 404
     if not heartbeat:
         return jsonify({
@@ -8524,14 +8563,22 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             avaConsoleState.lastKeyAt = 0;
         }
 
-        async function checkAvaConsoleReadiness() {
+        function extractAvaConsoleTarget(query) {
+            const text = (query || '').trim();
+            const match = text.match(/\b(?:for|to|on)\s+([A-Za-z0-9._-]+)\s*$/i)
+                || text.match(/\b(?:console)\s+([A-Za-z0-9._-]+)\s*$/i);
+            return match ? match[1] : '';
+        }
+
+        async function checkAvaConsoleReadiness(targetName = '') {
             const panel = document.getElementById('avaConsolePanel');
             if (panel) panel.classList.add('open');
             setAvaConsoleStatus('Checking', 'connecting');
             const output = document.getElementById('avaConsoleOutput');
             if (output && !avaConsoleState.id) setAvaTerminalText('Checking AVA Web Console readiness...\n');
             try {
-                const resp = await fetch('/console/status');
+                const suffix = targetName ? `?target=${encodeURIComponent(targetName)}` : '';
+                const resp = await fetch('/console/status' + suffix);
                 const data = await resp.json();
                 appendConsoleText(formatConsoleReadiness(data));
                 if (data.runner_healthy && data.target_available) {
@@ -8545,7 +8592,7 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
             }
         }
 
-        async function openAvaConsole(force = false) {
+        async function openAvaConsole(force = false, targetName = '') {
             const panel = document.getElementById('avaConsolePanel');
             const input = document.getElementById('avaConsoleInput');
             const meta = document.getElementById('avaConsoleMeta');
@@ -8566,12 +8613,12 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                 }
             }
             const output = document.getElementById('avaConsoleOutput');
-            if (output) setAvaTerminalText('Opening AVA Web Console...\n');
+            if (output) setAvaTerminalText(targetName ? `Opening AVA Web Console for ${targetName}...\n` : 'Opening AVA Web Console...\n');
             try {
                 const resp = await fetch('/console/open', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({})
+                    body: JSON.stringify(targetName ? {target: targetName} : {})
                 });
                 const data = await resp.json();
                 if (!resp.ok) {
@@ -9324,11 +9371,14 @@ Click Reconnect or ask AVA to open the console after a VM is provisioned.
                 || queryLower === 'console'
                 || queryLower === 'web console';
             if (isWebConsoleRequest) {
+                const consoleTargetName = extractAvaConsoleTarget(query);
                 addAVAMessage({
                     type: 'command',
-                    response: 'Opening AVA Web Console for the latest AVA-managed VM. This uses AVA auth and the Windows host runner; it does not depend on PuTTY being installed on this browser machine.'
+                    response: consoleTargetName
+                        ? `Opening AVA Web Console for \`${consoleTargetName}\`. This uses AVA auth and the Windows host runner; it does not depend on PuTTY being installed on this browser machine.`
+                        : 'Opening AVA Web Console for the latest AVA-managed VM. This uses AVA auth and the Windows host runner; it does not depend on PuTTY being installed on this browser machine. To choose a server, say `open web console for ava-web-03`.'
                 });
-                openAvaConsole(true);
+                openAvaConsole(true, consoleTargetName);
                 input.disabled = false;
                 sendBtn.disabled = false;
                 input.focus();

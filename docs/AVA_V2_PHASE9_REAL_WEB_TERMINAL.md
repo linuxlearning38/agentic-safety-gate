@@ -293,3 +293,32 @@ Expected behavior:
 - If a previously completed VM was manually deleted from VirtualBox, AVA should
   rely on live runner verification instead of old stored evidence before
   blocking a new server request.
+
+---
+
+## Current Validation Note (2026-06-15)
+
+Phase 9.8 through Phase 9.11 produced a usable browser console for
+AVA-managed VirtualBox VMs.
+
+Validated behavior:
+
+- AVA opens the console from chat with `open web console`.
+- AVA can open a named target, for example `open web console for ava-web-03`.
+- Normal shell commands can be sent from the browser console.
+- Backspace, Tab, Ctrl+C, Ctrl+L, `clear`, and basic cursor rendering are
+  handled by the current xterm-lite layer.
+- The console reports runner-offline, not-ready, and no-target cases inside the
+  panel instead of silently failing.
+- Browser console access does not depend on PuTTY being installed on the client
+  machine.
+
+Current boundary:
+
+- The console is good enough for demos and basic administration, but it is not
+  yet PuTTY-speed or full terminal parity.
+- Full terminal fidelity still needs the future xterm.js/WebSocket transport,
+  terminal resize support, and stronger handling for long-running full-screen
+  programs.
+- AVA remains the authenticated broker. The browser does not receive SSH
+  private keys or VM passwords.

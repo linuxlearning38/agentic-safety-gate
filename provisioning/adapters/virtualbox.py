@@ -196,6 +196,10 @@ class VirtualBoxAdapter(ProviderAdapter):
                 names.append(match.group(1))
         return names
 
+    def list_registered_vm_names(self) -> list[str]:
+        """Return VM names currently registered in VirtualBox."""
+        return self._list_registered_vm_names()
+
     def _used_nat_host_ports(self, *, exclude_instance_id: str | None = None) -> set[int]:
         used: set[int] = set()
         for vm_name in self._list_registered_vm_names():
