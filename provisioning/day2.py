@@ -16,7 +16,7 @@ from typing import Any
 from provisioning.runner import Day2OperationResult, ProvisioningJobResult
 
 
-READ_ONLY_OPERATIONS = {"status", "verify", "nginx_logs", "open_ssh_console"}
+READ_ONLY_OPERATIONS = {"status", "verify", "nginx_logs", "open_ssh_console", "check_updates", "check_services", "list_all_packages"}
 APPROVAL_OPERATIONS = {"restart_nginx", "snapshot", "rollback_snapshot", "stop_vm", "start_vm", "delete_vm"}
 HIGH_RISK_OPERATIONS = {"rollback_snapshot", "delete_vm"}
 
@@ -51,6 +51,12 @@ def classify_day2_operation(query: str) -> Day2Operation | None:
         return Day2Operation("nginx_logs", "nginx", "low", False, "show recent nginx logs")
     if _is_open_ssh_console(normalized):
         return Day2Operation("open_ssh_console", "ssh_console", "low", False, "open an SSH console")
+    if _is_list_all_packages(normalized):
+        return Day2Operation("list_all_packages", "guest_packages", "low", False, "list all upgradable packages grouped by type")
+    if _is_check_updates(normalized):
+        return Day2Operation("check_updates", "guest_packages", "low", False, "list pending package updates")
+    if _is_check_services(normalized):
+        return Day2Operation("check_services", "guest_services", "low", False, "list running and failed services")
     if _is_restart_nginx(normalized):
         return Day2Operation("restart_nginx", "nginx", "medium", True, "restart nginx and verify HTTP")
     if _is_snapshot(normalized):
@@ -77,6 +83,12 @@ def format_read_only_response(operation: Day2Operation, *, session: Any, result:
         return _format_nginx_logs(session=session, result=result)
     if operation.operation == "open_ssh_console":
         return _format_open_ssh_console(session=session, result=result)
+    if operation.operation == "check_updates":
+        return _format_check_updates_stored(session=session, result=result)
+    if operation.operation == "check_services":
+        return _format_check_services_stored(session=session, result=result)
+    if operation.operation == "list_all_packages":
+        return _format_list_all_packages_stored(session=session, result=result)
     raise ValueError(f"Unsupported read-only server-management operation: {operation.operation}")
 
 
@@ -454,6 +466,184 @@ def _format_open_ssh_console(*, session: Any, result: ProvisioningJobResult) -> 
         f"- SSH / PuTTY: `{result.ssh_host}:{result.ssh_port}`\n"
         "- Status: `ready for host-runner launch`\n\n"
         "Ask `open PuTTY` or `open SSH console` to launch it through the Windows host runner."
+    )
+
+
+def _is_list_all_packages(query: str) -> bool:
+    return any(
+        marker in query
+        for marker in (
+            "show all upgradable",
+            "show all updates",
+            "full update list",
+            "list all packages",
+            "list all upgradable",
+            "all upgradable packages",
+        )
+    )
+
+
+def _is_check_updates(query: str) -> bool:
+    return any(
+        marker in query
+        for marker in (
+            "upgradable packages",
+            "upgradeable packages",
+            "packages upgradable",
+            "packages upgradeable",
+            "how many packages",
+            "updates pending",
+            "pending updates",
+            "what updates",
+            "show updates",
+            "list updates",
+            "check updates",
+            "available updates",
+        )
+    ) or ("update" in query and "pending" in query)
+
+
+def _is_check_services(query: str) -> bool:
+    return any(
+        marker in query
+        for marker in (
+            "which services",
+            "services running",
+            "running services",
+            "show services",
+            "list services",
+            "check services",
+            "failed services",
+            "show failed services",
+            "service status",
+            "what services",
+            "systemd services",
+        )
+    )
+
+
+def format_live_check_updates_response(
+    operation_result: Day2OperationResult, *, result: ProvisioningJobResult
+) -> str:
+    evidence = dict(operation_result.evidence or {})
+    hostname = result.instance_name or result.instance_id
+    total = evidence.get("total_upgradable", 0)
+    security = evidence.get("security_updates", 0)
+    if operation_result.status != "completed":
+        error_msg = (operation_result.error or {}).get("message", "unknown error")
+        return (
+            f"`{hostname}` — package update check failed.\n\n"
+            f"- Error: `{error_msg}`\n\n"
+            "Check that the AVA runner SSH key is present and the VM is reachable."
+        )
+    high_impact = list(evidence.get("high_impact") or [])
+    reboot_required = bool(evidence.get("reboot_required", False))
+    priority_line = ""
+    if high_impact:
+        names = ", ".join(f"`{p}`" for p in high_impact)
+        priority_line = f"\n- Priority (high-impact): {names}"
+    reboot_line = f"\n- Reboot required after patching: {'yes' if reboot_required else 'no'}"
+    return (
+        f"`{hostname}` — **{total}** package(s) upgradable "
+        f"(**{security}** security).\n"
+        f"{priority_line}"
+        f"{reboot_line}\n\n"
+        "Applying updates requires a separate approved patch operation (`patch_server`).\n"
+        "No packages were modified by this check."
+    )
+
+
+def format_full_package_list(evidence: dict[str, Any], *, hostname: str) -> str:
+    """Render the complete upgradable package list grouped into security / other."""
+    security_pkgs = list(evidence.get("security_packages") or [])
+    all_pkgs = list(evidence.get("packages") or [])
+    security_set = set(security_pkgs)
+    other_pkgs = [p for p in all_pkgs if p not in security_set]
+    sec_lines = "\n".join(f"  - `{p}`" for p in security_pkgs) if security_pkgs else "  (none)"
+    other_lines = "\n".join(f"  - `{p}`" for p in other_pkgs) if other_pkgs else "  (none)"
+    return (
+        f"`{hostname}` — full upgradable package list ({len(all_pkgs)} total).\n\n"
+        f"**Security updates ({len(security_pkgs)}):**\n{sec_lines}\n\n"
+        f"**Other updates ({len(other_pkgs)}):**\n{other_lines}\n\n"
+        "No packages were modified by this check."
+    )
+
+
+def format_live_check_services_response(
+    operation_result: Day2OperationResult, *, result: ProvisioningJobResult
+) -> str:
+    evidence = dict(operation_result.evidence or {})
+    hostname = result.instance_name or result.instance_id
+    if operation_result.status != "completed":
+        error_msg = (operation_result.error or {}).get("message", "unknown error")
+        return (
+            f"`{hostname}` — service check failed.\n\n"
+            f"- Error: `{error_msg}`\n\n"
+            "Check that the AVA runner SSH key is present and the VM is reachable."
+        )
+    running = list(evidence.get("running") or [])
+    failed = list(evidence.get("failed") or [])
+    running_count = evidence.get("running_count", len(running))
+    failed_count = evidence.get("failed_count", len(failed))
+    running_names = ", ".join(f"`{s}`" for s in running[:12])
+    if len(running) > 12:
+        running_names += f", … (+{len(running) - 12} more)"
+    failed_names = ", ".join(f"`{s}`" for s in failed) if failed else "none"
+    return (
+        f"`{hostname}` — service status (read-only snapshot).\n\n"
+        f"- Running ({running_count}): {running_names or 'none'}\n"
+        f"- Failed ({failed_count}): {failed_names}\n\n"
+        "No service was started or stopped by this check."
+    )
+
+
+def format_live_check_updates_queued_response(
+    operation_id: str, *, result: ProvisioningJobResult
+) -> str:
+    return (
+        "Package update check has been queued for the Windows host runner.\n\n"
+        f"- VM: `{result.instance_name or result.instance_id}`\n"
+        f"- Operation ID: `{operation_id}`\n"
+        "- Status: `queued`\n\n"
+        "Ask `show updates` again in a few seconds to see the results."
+    )
+
+
+def format_live_check_services_queued_response(
+    operation_id: str, *, result: ProvisioningJobResult
+) -> str:
+    return (
+        "Service status check has been queued for the Windows host runner.\n\n"
+        f"- VM: `{result.instance_name or result.instance_id}`\n"
+        f"- Operation ID: `{operation_id}`\n"
+        "- Status: `queued`\n\n"
+        "Ask `check services` again in a few seconds to see the results."
+    )
+
+
+def _format_check_updates_stored(*, session: Any, result: ProvisioningJobResult) -> str:
+    return (
+        f"Package update check for `{result.instance_name or result.instance_id}`.\n\n"
+        "- Live runner check: `not yet executed`\n\n"
+        "AVA will run `apt-get update` and `apt list --upgradable` on the VM via the Windows host runner. "
+        "No stored update evidence exists yet. Ask `show updates` after the runner is online."
+    )
+
+
+def _format_check_services_stored(*, session: Any, result: ProvisioningJobResult) -> str:
+    return (
+        f"Service status check for `{result.instance_name or result.instance_id}`.\n\n"
+        "- Live runner check: `not yet executed`\n\n"
+        "AVA will run `systemctl list-units` on the VM via the Windows host runner. "
+        "No stored service evidence exists yet. Ask `check services` after the runner is online."
+    )
+
+
+def _format_list_all_packages_stored(*, session: Any, result: ProvisioningJobResult) -> str:
+    return (
+        f"Full package list for `{result.instance_name or result.instance_id}`.\n\n"
+        "- Live runner check: `not yet executed`\n\n"
+        "No stored update scan exists yet. Ask `show updates` after the runner is online."
     )
 
 

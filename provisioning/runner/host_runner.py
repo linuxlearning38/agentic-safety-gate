@@ -534,11 +534,15 @@ class HostRunner:
                 result = self._execute_start_vm(operation)
             elif operation.operation == "delete_vm":
                 result = self._execute_delete_vm(operation)
+            elif operation.operation == "check_updates":
+                result = self._execute_check_updates(operation)
+            elif operation.operation == "check_services":
+                result = self._execute_check_services(operation)
             else:
                 raise RuntimeError(
                     f"Operation '{operation.operation}' is approved but not executable yet. "
                     "Snapshot, live web verification, nginx log retrieval, SSH console launch, "
-                    "nginx restart, VM start/stop, and VM deletion are enabled."
+                    "nginx restart, VM start/stop, VM deletion, and guest inspection are enabled."
                 )
             self.queue.write_day2_status(operation.operation_id, result.status)
             self.queue.write_day2_result(result)
@@ -922,6 +926,143 @@ class HostRunner:
             error=None if status == "completed" else {
                 "message": (log_result.stderr or "nginx log command failed").strip()[:500],
                 "failure_class": log_result.failure_class or "unknown",
+            },
+        )
+
+    def _execute_check_updates(self, operation: Day2OperationJob) -> Day2OperationResult:
+        self._validate_binaries()
+        key_path = self._find_runner_key_path(operation)
+        if not key_path:
+            return Day2OperationResult(
+                operation_id=operation.operation_id,
+                operation=operation.operation,
+                status="failed",
+                instance_id=operation.instance_id,
+                instance_name=operation.instance_name,
+                evidence={"action": "check_updates", "runner_key_available": False, "runner": "host_runner"},
+                error={
+                    "message": (
+                        "Runner SSH key is not available for this VM. Package inspection "
+                        "requires a retained AVA runner key from provisioning."
+                    ),
+                    "failure_class": "ssh_auth_failed",
+                },
+            )
+        connection = self.adapter.get_connection_info(operation.instance_id)
+        executor = SSHExecutor(
+            SSHConnection(
+                host=connection.host,
+                port=connection.port,
+                username="ava-runner",
+                private_key_path=str(key_path),
+                known_hosts_path=str(self.config.work_root / "known_hosts_day2"),
+                ssh_binary=self.config.ssh_binary,
+            )
+        )
+        # Refresh the package index then list upgradable packages.
+        # apt list exit code is 0 even when packages are listed; always non-mutating.
+        command = (
+            "sudo apt-get update -q 2>&1 | tail -3; "
+            "echo '---AVA_UPGRADABLE---'; "
+            "apt list --upgradable 2>/dev/null"
+        )
+        cmd_result = executor.run(command, timeout_seconds=120)
+        stdout = cmd_result.stdout or ""
+        upgradable_section = stdout.split("---AVA_UPGRADABLE---", 1)[-1] if "---AVA_UPGRADABLE---" in stdout else stdout
+        total, security, packages, security_pkgs, high_impact, reboot_required = _parse_apt_upgradable(upgradable_section)
+        status = "completed" if cmd_result.exit_code == 0 else "failed"
+        return Day2OperationResult(
+            operation_id=operation.operation_id,
+            operation=operation.operation,
+            status=status,
+            instance_id=operation.instance_id,
+            instance_name=operation.instance_name,
+            evidence={
+                "action": "check_updates",
+                "total_upgradable": total,
+                "security_updates": security,
+                "packages": packages,
+                "security_packages": security_pkgs,
+                "high_impact": high_impact,
+                "reboot_required": reboot_required,
+                "raw_output": stdout[:3000],
+                "ssh_host": operation.ssh_host or connection.host,
+                "ssh_port": operation.ssh_port or connection.port,
+                "runner": "host_runner",
+            },
+            error=None if status == "completed" else {
+                "message": (cmd_result.stderr or "apt-get update failed").strip()[:500],
+                "failure_class": cmd_result.failure_class or "package_manager_failed",
+            },
+        )
+
+    def _execute_check_services(self, operation: Day2OperationJob) -> Day2OperationResult:
+        self._validate_binaries()
+        key_path = self._find_runner_key_path(operation)
+        if not key_path:
+            return Day2OperationResult(
+                operation_id=operation.operation_id,
+                operation=operation.operation,
+                status="failed",
+                instance_id=operation.instance_id,
+                instance_name=operation.instance_name,
+                evidence={"action": "check_services", "runner_key_available": False, "runner": "host_runner"},
+                error={
+                    "message": (
+                        "Runner SSH key is not available for this VM. Service inspection "
+                        "requires a retained AVA runner key from provisioning."
+                    ),
+                    "failure_class": "ssh_auth_failed",
+                },
+            )
+        connection = self.adapter.get_connection_info(operation.instance_id)
+        executor = SSHExecutor(
+            SSHConnection(
+                host=connection.host,
+                port=connection.port,
+                username="ava-runner",
+                private_key_path=str(key_path),
+                known_hosts_path=str(self.config.work_root / "known_hosts_day2"),
+                ssh_binary=self.config.ssh_binary,
+            )
+        )
+        command = (
+            "echo '---AVA_RUNNING---'; "
+            "systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null; "
+            "echo '---AVA_FAILED---'; "
+            "systemctl list-units --type=service --state=failed --no-pager --no-legend 2>/dev/null"
+        )
+        cmd_result = executor.run(command, timeout_seconds=30)
+        stdout = cmd_result.stdout or ""
+        running_section = ""
+        failed_section = ""
+        if "---AVA_RUNNING---" in stdout and "---AVA_FAILED---" in stdout:
+            parts = stdout.split("---AVA_RUNNING---", 1)[1].split("---AVA_FAILED---", 1)
+            running_section = parts[0]
+            failed_section = parts[1] if len(parts) > 1 else ""
+        running = _parse_systemd_units(running_section)
+        failed = _parse_systemd_units(failed_section)
+        status = "completed" if cmd_result.exit_code == 0 else "failed"
+        return Day2OperationResult(
+            operation_id=operation.operation_id,
+            operation=operation.operation,
+            status=status,
+            instance_id=operation.instance_id,
+            instance_name=operation.instance_name,
+            evidence={
+                "action": "check_services",
+                "running": running,
+                "failed": failed,
+                "running_count": len(running),
+                "failed_count": len(failed),
+                "raw_output": stdout[:3000],
+                "ssh_host": operation.ssh_host or connection.host,
+                "ssh_port": operation.ssh_port or connection.port,
+                "runner": "host_runner",
+            },
+            error=None if status == "completed" else {
+                "message": (cmd_result.stderr or "systemctl command failed").strip()[:500],
+                "failure_class": cmd_result.failure_class or "service_failed",
             },
         )
 
@@ -1519,6 +1660,61 @@ def _redact(text: str, patterns: tuple[str, ...]) -> str:
         if pattern:
             redacted = redacted.replace(pattern, "[REDACTED]")
     return redacted
+
+
+_HIGH_IMPACT_PREFIXES: tuple[str, ...] = (
+    "linux-image", "linux-headers", "linux-virtual",
+    "libssl", "openssl", "openssh", "sudo", "bind9",
+    "libc", "glibc", "ca-certificates", "curl",
+)
+_REBOOT_PREFIXES: tuple[str, ...] = ("linux-image", "linux-headers", "linux-virtual")
+
+
+def _parse_apt_upgradable(
+    stdout: str,
+) -> tuple[int, int, list[str], list[str], list[str], bool]:
+    """Parse `apt list --upgradable 2>/dev/null` output.
+
+    Returns (total_upgradable, security_count, packages, security_packages, high_impact, reboot_required).
+    Skips the "Listing..." header line emitted by apt.
+    """
+    packages: list[str] = []
+    security_packages: list[str] = []
+    high_impact: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Listing...") or line.startswith("WARNING"):
+            continue
+        # Format: "package/source version arch [upgradable from: old]"
+        name = line.split("/")[0].strip()
+        if not name:
+            continue
+        packages.append(name)
+        if "-security" in line:
+            security_packages.append(name)
+        if any(name.startswith(p) for p in _HIGH_IMPACT_PREFIXES):
+            high_impact.append(name)
+    reboot_required = any(name.startswith(p) for name in packages for p in _REBOOT_PREFIXES)
+    return len(packages), len(security_packages), packages, security_packages, high_impact, reboot_required
+
+
+def _parse_systemd_units(stdout: str) -> list[str]:
+    """Parse `systemctl list-units --no-legend` output into service names."""
+    names: list[str] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Format: "  unit.service  loaded active running  Description"
+        # Leading bullet (●) or space, then unit name as first token
+        parts = line.lstrip("● ").split()
+        if parts:
+            unit = parts[0]
+            if unit.endswith(".service"):
+                names.append(unit[: -len(".service")])
+            elif "." not in unit:
+                names.append(unit)
+    return names
 
 
 def _runner_failure_class(exc: Exception) -> str:
