@@ -10,12 +10,24 @@ import time
 from typing import Any
 
 from control import approval
-from provisioning.conversation import ProvisioningFlowEngine, SessionManager, SessionPhase
+from provisioning.conversation import (
+    ManagedServerRecord,
+    ManagedServerRegistry,
+    ProvisioningFlowEngine,
+    SessionManager,
+    SessionPhase,
+)
 from provisioning.day2 import (
+    Day2Operation,
     classify_day2_operation,
     format_approved_queued_response,
     format_approval_required_response,
     format_approved_pending_response,
+    format_full_package_list,
+    format_live_check_services_queued_response,
+    format_live_check_services_response,
+    format_live_check_updates_queued_response,
+    format_live_check_updates_response,
     format_live_nginx_logs_queued_response,
     format_live_nginx_logs_response,
     format_live_verify_queued_response,
@@ -42,6 +54,7 @@ class ProvisioningChatService:
 
     def __init__(self, db_path: str | Path, job_queue: ProvisioningJobQueue | None = None):
         self.sessions = SessionManager(db_path)
+        self.managed_servers = ManagedServerRegistry(db_path)
         self.flow = ProvisioningFlowEngine(self.sessions)
         self.job_queue = job_queue or RedisProvisioningJobQueue()
 
@@ -330,6 +343,32 @@ class ProvisioningChatService:
                 },
             )
 
+        # Registry fallback: VMs whose Redis result expired (container rebuild / key TTL)
+        # are not in managed_by_name yet.  Pull them from the durable registry so that
+        # ava_managed and lifecycle/inspection ops keep working.
+        for _reg in self.managed_servers.list_all():
+            _norm = _normalize(_reg.vm_name)
+            if _norm in managed_by_name:
+                continue
+            _session = self.sessions.get(_reg.session_id) if _reg.session_id else None
+            _reg_result = ProvisioningJobResult(
+                job_id="",
+                instance_id=_reg.instance_id,
+                instance_name=_reg.vm_name,
+                ssh_host=_reg.ssh_host,
+                ssh_port=_reg.ssh_port,
+                http_port=_reg.http_port,
+                verification_evidence={},
+                completion_timestamp=_reg.completion_timestamp,
+            )
+            managed_by_name[_norm] = {
+                "session": _session,
+                "runner": {"job_id": None, "status": "completed", "result": _reg_result},
+                "result": _reg_result,
+                "phase": SessionPhase.COMPLETED.value,
+                "runner_status": "completed",
+            }
+
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for normalized_name, live_entry in sorted(live_inventory.items(), key=lambda item: str(item[1].get("name") or item[0])):
@@ -356,6 +395,46 @@ class ProvisioningChatService:
                     "is_template": bool(template_name and _normalize(vm_name) == _normalize(template_name)),
                 }
             )
+
+        # HARD INVARIANT: existence authority is live VirtualBox inventory.
+        # Registry VMs absent from live VirtualBox are reported as gone/missing
+        # so the user knows AVA has a record for them — but inventory_present=False
+        # means they are never treated as present.
+        for _reg in self.managed_servers.list_all():
+            _norm = _normalize(_reg.vm_name)
+            if _norm in seen:
+                continue
+            _session = self.sessions.get(_reg.session_id) if _reg.session_id else None
+            _reg_result = ProvisioningJobResult(
+                job_id="",
+                instance_id=_reg.instance_id,
+                instance_name=_reg.vm_name,
+                ssh_host=_reg.ssh_host,
+                ssh_port=_reg.ssh_port,
+                http_port=_reg.http_port,
+                verification_evidence={},
+                completion_timestamp=_reg.completion_timestamp,
+            )
+            rows.append(
+                {
+                    "session": _session,
+                    "runner": {"job_id": None, "status": "completed", "result": _reg_result},
+                    "result": _reg_result,
+                    "vm_name": _reg.vm_name,
+                    "phase": SessionPhase.COMPLETED.value,
+                    "runner_status": "completed (not in live VirtualBox)",
+                    "inventory_present": False,
+                    "ava_managed": True,
+                    "runner_inventory_available": inventory_snapshot["available"],
+                    "runner_inventory_stale": inventory_snapshot["stale"],
+                    "runner_inventory_updated_at": inventory_snapshot["updated_at"],
+                    "power_state": "not in live inventory",
+                    "provider_status": "not in live inventory",
+                    "is_template": False,
+                }
+            )
+            seen.add(_norm)
+
         return rows
 
     def _runner_inventory_snapshot(self) -> dict[str, Any]:
@@ -720,6 +799,26 @@ class ProvisioningChatService:
             status = getattr(progress, "status", None)
         if progress and getattr(progress, "instance_id", None) and not session.instance_id:
             session = self.sessions.save(session.with_updates(instance_id=progress.instance_id))
+        # Registry fallback: Redis result is gone (container rebuild / key expiry) but the
+        # SQLite session still has instance_id — reconstruct result from the durable registry
+        # so that ava_managed and lifecycle/inspection ops survive across rebuilds.
+        _result_from_registry = False
+        if result is None and session.instance_id:
+            _reg = self.managed_servers.get_by_instance_id(session.instance_id)
+            if _reg:
+                result = ProvisioningJobResult(
+                    job_id=job_id or "",
+                    instance_id=_reg.instance_id,
+                    instance_name=_reg.vm_name,
+                    ssh_host=_reg.ssh_host,
+                    ssh_port=_reg.ssh_port,
+                    http_port=_reg.http_port,
+                    verification_evidence={},
+                    completion_timestamp=_reg.completion_timestamp,
+                )
+                if status is None:
+                    status = "completed"
+                _result_from_registry = True
         # I1: error is the authoritative terminal signal and is evaluated BEFORE instance_id.
         # A result with both instance_id and error set (instance_id identifies the rolled-back
         # VM for tracing) is FAILED — instance_id alone must never mask a failure.
@@ -745,6 +844,11 @@ class ProvisioningChatService:
                 _updates["phase"] = SessionPhase.COMPLETED
             if _updates:
                 session = self.sessions.save(session.with_updates(**_updates))
+            # Upsert to durable registry when Redis has the live result (not when we
+            # already reconstructed it from the registry — upsert is idempotent but
+            # skipping avoids an unnecessary write on every inventory query).
+            if not _result_from_registry:
+                self._upsert_managed_server(session, result)
         elif _runner_job_orphaned(session, status, self.job_queue):
             status = "failed"
             result = ProvisioningJobResult(
@@ -791,6 +895,18 @@ class ProvisioningChatService:
         }:
             target = SessionPhase.FAILED if status == "failed" else SessionPhase.COMPLETED
             session = self.sessions.save(session.with_updates(phase=target))
+        # Remove the registry record when AVA's own delete_vm operation completes.
+        # Runs after the upsert so the delete wins even if the provisioning result is
+        # still in Redis (upsert then delete → net: record gone).
+        if (
+            day2_result
+            and getattr(day2_result, "operation", None) == "delete_vm"
+            and getattr(day2_result, "status", None) == "completed"
+            and not getattr(day2_result, "error", None)
+        ):
+            _deleted_vm = getattr(day2_result, "instance_name", None) or getattr(day2_result, "instance_id", None)
+            if _deleted_vm:
+                self.managed_servers.delete_by_name(_deleted_vm)
         return {
             "job_id": job_id,
             "status": status,
@@ -824,7 +940,12 @@ class ProvisioningChatService:
                 session,
             )
         if not operation.requires_approval:
-            if operation.operation in {"verify", "nginx_logs", "open_ssh_console"}:
+            if operation.operation == "list_all_packages":
+                stored = self._find_stored_check_updates_result(session)
+                if stored:
+                    hostname = result.instance_name or result.instance_id
+                    return self._result(format_full_package_list(stored.evidence, hostname=hostname), session)
+            if operation.operation in {"verify", "nginx_logs", "open_ssh_console", "check_updates", "check_services", "list_all_packages"}:
                 live_operation = self._queue_live_read_only_operation(operation, session, runner, result)
                 if live_operation:
                     return live_operation
@@ -988,9 +1109,10 @@ class ProvisioningChatService:
         enqueue_operation = getattr(self.job_queue, "enqueue_day2_operation", None)
         if enqueue_operation is None:
             return None
+        enqueue_op_name = "check_updates" if operation.operation == "list_all_packages" else operation.operation
         day2_job = enqueue_operation(
             session_id=session.session_id,
-            operation=operation.operation,
+            operation=enqueue_op_name,
             target=operation.target,
             instance_id=result.instance_id,
             instance_name=result.instance_name,
@@ -1018,12 +1140,36 @@ class ProvisioningChatService:
                 return self._result(format_live_nginx_logs_response(operation_result, result=result), session)
             if operation.operation == "open_ssh_console":
                 return self._result(format_open_ssh_console_response(operation_result, result=result), session)
+            if operation.operation == "list_all_packages":
+                hostname = result.instance_name or result.instance_id
+                return self._result(format_full_package_list(operation_result.evidence, hostname=hostname), session)
+            if operation.operation == "check_updates":
+                return self._result(format_live_check_updates_response(operation_result, result=result), session)
+            if operation.operation == "check_services":
+                return self._result(format_live_check_services_response(operation_result, result=result), session)
             return self._result(format_live_verify_response(operation_result, result=result), session)
         if operation.operation == "nginx_logs":
             return self._result(format_live_nginx_logs_queued_response(day2_job.operation_id, result=result), session)
         if operation.operation == "open_ssh_console":
             return self._result(format_open_ssh_console_queued_response(day2_job.operation_id, result=result), session)
+        if operation.operation in {"check_updates", "list_all_packages"}:
+            return self._result(format_live_check_updates_queued_response(day2_job.operation_id, result=result), session)
+        if operation.operation == "check_services":
+            return self._result(format_live_check_services_queued_response(day2_job.operation_id, result=result), session)
         return self._result(format_live_verify_queued_response(day2_job.operation_id, result=result), session)
+
+    def _find_stored_check_updates_result(self, session) -> Any | None:
+        """Return the most recent completed check_updates result stored in the session, or None."""
+        op_ids = list(reversed((session.collected_answers or {}).get("day2_operation_ids") or []))
+        for op_id in op_ids:
+            r = self.job_queue.get_day2_result(op_id)
+            if (
+                r is not None
+                and getattr(r, "operation", None) == "check_updates"
+                and getattr(r, "status", None) == "completed"
+            ):
+                return r
+        return None
 
     def _wait_for_day2_result(self, operation_id: str, *, timeout_seconds: float) -> Any | None:
         deadline = time.monotonic() + timeout_seconds
@@ -1036,6 +1182,26 @@ class ProvisioningChatService:
                 return self.job_queue.get_day2_result(operation_id)
             time.sleep(0.5)
         return None
+
+    def _upsert_managed_server(self, session, result: ProvisioningJobResult) -> None:
+        vm_name = result.instance_name or result.instance_id
+        if not vm_name or not result.instance_id:
+            return
+        username = (session.collected_answers or {}).get("username") or "avaadmin"
+        self.managed_servers.upsert(
+            ManagedServerRecord(
+                vm_name=vm_name,
+                instance_id=result.instance_id,
+                role=session.role,
+                ssh_host=result.ssh_host,
+                ssh_port=result.ssh_port,
+                http_port=result.http_port,
+                username=username,
+                runner_key_reference=session.credential_id,
+                completion_timestamp=result.completion_timestamp or _utc_now(),
+                session_id=session.session_id,
+            )
+        )
 
     def _result(self, message: str, session, *, approval_id: str | None = None) -> ProvisioningServingResult:
         metadata = {

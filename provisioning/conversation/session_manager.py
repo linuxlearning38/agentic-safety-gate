@@ -68,6 +68,137 @@ class ProvisioningSession:
         return replace(self, updated_at=_utc_now(), **changes)
 
 
+@dataclass(slots=True)
+class ManagedServerRecord:
+    """Durable record of an AVA-provisioned VM — survives container rebuilds."""
+
+    vm_name: str
+    instance_id: str
+    role: str | None
+    ssh_host: str | None
+    ssh_port: int | None
+    http_port: int | None
+    username: str | None
+    runner_key_reference: str | None
+    completion_timestamp: str
+    session_id: str | None = None
+
+
+class ManagedServerRegistry:
+    """Durable SQLite registry of AVA-managed VMs; survives container rebuilds.
+
+    Records are written on provisioning completion and removed only when AVA
+    successfully deletes that VM.  The existence authority for whether a VM is
+    *present* is always the live VirtualBox inventory — this registry is
+    annotation + creds only.
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = Path(db_path)
+        self._init_schema()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_schema(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS managed_servers (
+                    vm_name               TEXT PRIMARY KEY,
+                    instance_id           TEXT NOT NULL,
+                    role                  TEXT,
+                    ssh_host              TEXT,
+                    ssh_port              INTEGER,
+                    http_port             INTEGER,
+                    username              TEXT,
+                    runner_key_reference  TEXT,
+                    completion_timestamp  TEXT NOT NULL,
+                    session_id            TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_managed_servers_instance_id "
+                "ON managed_servers(instance_id)"
+            )
+
+    def upsert(self, record: ManagedServerRecord) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO managed_servers (
+                    vm_name, instance_id, role, ssh_host, ssh_port, http_port,
+                    username, runner_key_reference, completion_timestamp, session_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(vm_name) DO UPDATE SET
+                    instance_id          = excluded.instance_id,
+                    role                 = excluded.role,
+                    ssh_host             = excluded.ssh_host,
+                    ssh_port             = excluded.ssh_port,
+                    http_port            = excluded.http_port,
+                    username             = excluded.username,
+                    runner_key_reference = excluded.runner_key_reference,
+                    completion_timestamp = excluded.completion_timestamp,
+                    session_id           = excluded.session_id
+                """,
+                (
+                    record.vm_name,
+                    record.instance_id,
+                    record.role,
+                    record.ssh_host,
+                    record.ssh_port,
+                    record.http_port,
+                    record.username,
+                    record.runner_key_reference,
+                    record.completion_timestamp,
+                    record.session_id,
+                ),
+            )
+
+    def get_by_name(self, vm_name: str) -> ManagedServerRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM managed_servers WHERE vm_name = ?", (vm_name,)
+            ).fetchone()
+        return self._from_row(row) if row else None
+
+    def get_by_instance_id(self, instance_id: str) -> ManagedServerRecord | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM managed_servers WHERE instance_id = ?", (instance_id,)
+            ).fetchone()
+        return self._from_row(row) if row else None
+
+    def list_all(self) -> list[ManagedServerRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM managed_servers ORDER BY vm_name"
+            ).fetchall()
+        return [self._from_row(row) for row in rows]
+
+    def delete_by_name(self, vm_name: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM managed_servers WHERE vm_name = ?", (vm_name,))
+
+    def _from_row(self, row: sqlite3.Row) -> ManagedServerRecord:
+        return ManagedServerRecord(
+            vm_name=row["vm_name"],
+            instance_id=row["instance_id"],
+            role=row["role"],
+            ssh_host=row["ssh_host"],
+            ssh_port=int(row["ssh_port"]) if row["ssh_port"] is not None else None,
+            http_port=int(row["http_port"]) if row["http_port"] is not None else None,
+            username=row["username"],
+            runner_key_reference=row["runner_key_reference"],
+            completion_timestamp=row["completion_timestamp"],
+            session_id=row["session_id"],
+        )
+
+
 class SessionManager:
     """Small SQLite store for resumable v2 provisioning sessions."""
 
