@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import ssl
 import time
@@ -22,7 +23,10 @@ from collections import Counter
 
 
 BASE_URL = "https://localhost:5443"
-LOGIN_PAYLOAD = {"username": "admin", "password": "<YOUR_ADMIN_PASSWORD>"}
+LOGIN_PAYLOAD = {
+    "username": os.getenv("AVA_TEST_USERNAME", "admin"),
+    "password": os.getenv("AVA_TEST_PASSWORD", "changeme"),
+}
 
 
 def _ctx() -> ssl.SSLContext:
