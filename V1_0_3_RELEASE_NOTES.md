@@ -18,7 +18,7 @@ identified in post-v1.0.2 audit. No code changes. No new features.
 ### Security Documentation
 
 - Removed hardcoded default password from README curl example
-- Replaced `<YOUR_ADMIN_PASSWORD>` with `<YOUR_ADMIN_PASSWORD>` placeholder
+- Replaced hardcoded admin password with `<YOUR_ADMIN_PASSWORD>` placeholder
 - Added note to change credentials before any non-local deployment
 
 ### Repository Hygiene
