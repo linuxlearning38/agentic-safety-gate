@@ -1,44 +1,115 @@
-# AVA v1.0.4 - Local DevOps Knowledge Assistant
+# AVA — Air-Gapped AI DevOps Agent
 
-AVA is a local-first DevOps assistant focused on grounded answers, safe operations, and approval-aware execution.
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![LangGraph](https://img.shields.io/badge/LangGraph-Agent-1C3C3C)
+![Ollama](https://img.shields.io/badge/Ollama-Qwen2.5--14B-000000)
+![OPA](https://img.shields.io/badge/Open%20Policy%20Agent-Governance-7D4698?logo=openpolicyagent&logoColor=white)
+![Vault](https://img.shields.io/badge/HashiCorp%20Vault-Secrets-FFEC6E?logo=vault&logoColor=black)
+![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED?logo=docker&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
 
-## Current Stable Scope (Master Branch)
+A self-hosted AI agent that executes DevOps operations under enforced security governance — running entirely on local infrastructure with **no cloud dependency and no data leaving the network**.
 
-Master is intentionally scoped to the v1.0 product boundary:
+AVA answers DevOps questions grounded in a local knowledge base and performs real operational tasks, but only through a policy gate: every action is checked against explicit rules, cryptographically signed, and written to a tamper-evident audit log. It's built to prove that autonomous infrastructure tooling can be **governed**, not just powerful.
 
-- Grounded DevOps Q&A over local ChromaDB knowledge.
-- Safe operational inspection (system, Docker, services, ports, disk, memory).
-- Deterministic destructive-action blocking.
-- Approval-required handling for medium/high-risk actions.
-- JWT auth, RBAC, OPA policy checks, and audit logging.
+---
 
-Not included on master:
+## Why it's interesting
 
-- Linux VM provisioning and VirtualBox orchestration.
-- Unattended installer automation.
-- In-guest nginx bootstrap pipeline.
+Most "AI agents" call external APIs and execute freely. AVA is the opposite: fully offline LLM inference, fail-closed policy enforcement on every action, and an audit trail you can't quietly edit. The engineering focus is **security and governance of an autonomous system**, not just wiring up a model.
 
-Those capabilities are preserved on `provisioning-v0.1-experimental`.
+---
 
-## Architecture Summary
+## Security posture — enforced, not claimed
 
-- Model: `qwen2.5:14b` via Ollama (local).
-- Retrieval: ChromaDB (runtime count exposed by AVA self-introduction).
-- API/UI: Flask + Gunicorn over HTTPS (`:5443`).
-- Security: OPA policy, JWT, RBAC, rate limiting, tamper-evident audit log.
+Every guardrail is continuously verified and surfaced in the security dashboard:
 
-## Quick Start
+![Security dashboard](docs/01-security-dashboard.png)
+
+Zero-trust-aligned local hardening: OPA-gated action decisions, hash-chained tamper-evident audit log, read-only container root filesystem, proxied Docker access, admin-protected security telemetry, and shared-storage rate limiting.
+
+---
+
+## Approval-gated execution
+
+High-impact actions never execute silently. AVA builds a plan, surfaces it with an approval ID, and blocks until it's explicitly approved.
+
+*No infrastructure is created until the approval is accepted — the agent proposes, the human decides.*
+
+---
+
+## Console
+
+Read-only diagnostics, guardrail status, and grounded DevOps Q&A in one interface.
+
+---
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[User request] --> B[LangGraph agent]
+    B --> C{OPA policy gate}
+    C -->|Denied| D[Blocked + audited]
+    C -->|Needs approval| E[Approval required]
+    C -->|Allowed| F[HMAC-signed command]
+    F --> G[Execute tool]
+    G --> H[Hash-chained audit log]
+    E -->|Approved| F
+    B -.retrieval.-> I[(ChromaDB<br/>knowledge base)]
+    B -.inference.-> J[Qwen2.5-14B<br/>via Ollama - local GPU]
+
+    style C fill:#7D4698,color:#fff
+    style D fill:#c0392b,color:#fff
+    style H fill:#27ae60,color:#fff
+```
+
+The key property: **nothing executes without passing the policy gate**, and every decision — allowed, denied, or approved — is permanently recorded in a tamper-evident log.
+
+---
+
+## Key features
+
+- **Fail-closed policy enforcement** — every action passes an Open Policy Agent (OPA) gate; nothing runs unless policy explicitly allows it.
+- **Tamper-evident audit log** — hash-chained records of every command, so history can't be silently altered.
+- **Signed command envelopes** — HMAC-signed operations prevent tampering between request and execution.
+- **Approval-gated execution** — medium/high-risk actions require explicit approval; destructive actions are deterministically blocked.
+- **Hardened runtime** — read-only container root filesystem, Docker access via socket proxy, secrets through HashiCorp Vault.
+- **Grounded answers** — retrieval-augmented Q&A over a local ChromaDB knowledge base, not open-ended generation.
+- **Fully local inference** — Qwen2.5-14B via Ollama on local GPU; no external API calls.
+- **Auth & access control** — JWT authentication, role-based access control, rate limiting.
+
+---
+
+## Architecture
+
+| Layer | Technology |
+|---|---|
+| LLM | Qwen2.5-14B via Ollama (local, GPU-accelerated) |
+| Agent orchestration | LangGraph |
+| Retrieval | ChromaDB knowledge base |
+| Policy / governance | Open Policy Agent (OPA), HMAC signing, hash-chained audit log |
+| Secrets | HashiCorp Vault |
+| Data | PostgreSQL, Redis |
+| API / UI | Flask + Gunicorn over HTTPS |
+| Auth | JWT, RBAC, rate limiting |
+| Packaging | Docker, hardened read-only container, Docker socket proxy |
+
+---
+
+## Quick start
 
 ```bash
 docker compose up -d --build ava
 curl -sk https://localhost:5443/health
 ```
 
-Get a token:
+<details>
+<summary><b>Authentication & example requests</b></summary>
 
-> **Note:** Replace `<YOUR_ADMIN_PASSWORD>` with your actual admin password.
-> Default credentials are set in `.env` and **must** be changed before any
-> non-local deployment.
+<br>
+
+Get a token (set your admin password in `.env` first — see `.env.example`):
 
 ```bash
 curl -sk https://localhost:5443/auth/login \
@@ -55,33 +126,31 @@ curl -sk https://localhost:5443/ask \
   -d '{"query":"check docker"}'
 ```
 
-## Core Endpoints
+</details>
 
-- `GET /health`
-- `POST /auth/login`
-- `POST /ask`
-- `POST /tools/<tool_name>/run`
-- `POST /react/run`
-- `GET /security/stats`
-- `GET /security/audit`
+<details>
+<summary><b>Core endpoints</b></summary>
 
-## Release Notes
+<br>
 
-Current release line:
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Service health check |
+| `POST /auth/login` | Obtain JWT token |
+| `POST /ask` | Grounded DevOps Q&A |
+| `POST /tools/<tool_name>/run` | Run a governed tool |
+| `POST /react/run` | ReAct agent loop |
+| `GET /security/stats` | Security posture summary |
+| `GET /security/audit` | Audit log access |
 
-- `V1_0_RELEASE_NOTES.md`
-- `V1_0_1_RELEASE_NOTES.md`
-- `V1_0_2_RELEASE_NOTES.md`
-- `V1_0_3_RELEASE_NOTES.md`
-- `V1_0_4_RELEASE_NOTES.md`
+</details>
 
-Current capabilities reference:
+---
 
-- `docs/AVA_V1_CURRENT_CAPABILITIES.md`
+## Project status
 
-## Experimental Provisioning Branch
+Actively developed. Core agent, security governance, and grounded Q&A are stable; VM provisioning and orchestration are in progress.
 
-Provisioning work is preserved separately:
+## License
 
-- Branch: `provisioning-v0.1-experimental`
-- Marker doc: `PROVISIONING_BRANCH_README.md` (on that branch)
+MIT

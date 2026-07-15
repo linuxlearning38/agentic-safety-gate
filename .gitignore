@@ -59,7 +59,8 @@ Thumbs.db
 scan_output.txt
 security_audit.json
 test-results/
-docs/
+docs/*
+!docs/01-security-dashboard.png
 .env
 
 # Runtime data (should never be tracked)
