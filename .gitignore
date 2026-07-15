@@ -60,7 +60,7 @@ scan_output.txt
 security_audit.json
 test-results/
 docs/*
-!docs/01-security-dashboard.png
+!docs/*.png
 .env
 
 # Runtime data (should never be tracked)

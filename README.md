@@ -32,7 +32,34 @@ Zero-trust-aligned local hardening: OPA-gated action decisions, hash-chained tam
 
 ## Approval-gated execution
 
-High-impact actions never execute silently. AVA builds a plan, surfaces it with an approval ID, and blocks until it's explicitly approved. No infrastructure is created until the approval is accepted — the agent proposes, the human decides.
+High-impact actions never execute silently. AVA builds a plan, surfaces it with an approval ID, and blocks until it's explicitly approved:
+
+![Approval-gated provisioning](docs/02-approval-gated-provisioning.png)
+
+No infrastructure is created until the approval is accepted — the agent proposes, the human decides.
+
+---
+
+## Console
+
+![AVA console](docs/03-console-overview.png)
+
+Read-only diagnostics, guardrail status, and grounded DevOps Q&A in one interface.
+
+<details>
+<summary><b>More screenshots</b></summary>
+
+<br>
+
+**Grounded system verification** — real command execution with governed output:
+
+![System verification](docs/04-system-verification.png)
+
+**Embedded web console** — in-browser terminal access to AVA-managed hosts:
+
+![Web console](docs/05-web-console.png)
+
+</details>
 
 ---
 
