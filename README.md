@@ -32,15 +32,7 @@ Zero-trust-aligned local hardening: OPA-gated action decisions, hash-chained tam
 
 ## Approval-gated execution
 
-High-impact actions never execute silently. AVA builds a plan, surfaces it with an approval ID, and blocks until it's explicitly approved.
-
-*No infrastructure is created until the approval is accepted — the agent proposes, the human decides.*
-
----
-
-## Console
-
-Read-only diagnostics, guardrail status, and grounded DevOps Q&A in one interface.
+High-impact actions never execute silently. AVA builds a plan, surfaces it with an approval ID, and blocks until it's explicitly approved. No infrastructure is created until the approval is accepted — the agent proposes, the human decides.
 
 ---
 
@@ -99,7 +91,10 @@ The key property: **nothing executes without passing the policy gate**, and ever
 
 ## Quick start
 
+Create the admin user before the first build — `users.json` is baked into the image at build time and isn't shipped in the repo:
+
 ```bash
+python3 manage_users.py add admin <YOUR_ADMIN_PASSWORD> admin
 docker compose up -d --build ava
 curl -sk https://localhost:5443/health
 ```
@@ -109,7 +104,7 @@ curl -sk https://localhost:5443/health
 
 <br>
 
-Get a token (set your admin password in `.env` first — see `.env.example`):
+Get a token:
 
 ```bash
 curl -sk https://localhost:5443/auth/login \
